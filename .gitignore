@@ -1,0 +1,24 @@
+# Credentials & secrets
+.env
+credential.json
+drive_token.json
+drive_oauth_client.json
+
+# Output files
+output/
+*.xlsx
+*.docx
+
+# Logs
+logs/
+*.log
+
+# Target data
+data-*.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
