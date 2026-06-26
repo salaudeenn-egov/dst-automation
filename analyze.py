@@ -368,7 +368,7 @@ def _aggregate(task_hits, name_map, hh_name_map, target_map, cfg):
                 drug1=0, drug2=0, absent=0, refused=0,
                 ineligible=0, referred=0, died=0, migrated=0,
                 redose=0, age_over59=0, age_zero=0,
-                missing_hh=0, missing_child=0, duplicates=0,
+                missing_hh=0, missing_child=0, missing_gender=0, duplicates=0,
                 delivery_comments=0, missing_lat_lon=0,
                 wards=set(), seen_keys=set(),
             )
@@ -386,6 +386,8 @@ def _aggregate(task_hits, name_map, hh_name_map, target_map, cfg):
             m["missing_child"] += 1
         if not hh_head:
             m["missing_hh"] += 1
+        if not add.get("gender"):
+            m["missing_gender"] += 1
 
         if age is None:
             pass
@@ -419,16 +421,10 @@ def _aggregate(task_hits, name_map, hh_name_map, target_map, cfg):
         )
         if is_treated:
             m["treated"] += 1
-            if drug_type == "SPAQ":
-                if qty == 1:
-                    m["drug2"] += 1   # SPAQ2 (3-11m)
-                else:
-                    m["drug1"] += 1   # SPAQ1 (12-59m)
+            if age is not None and age <= 11:
+                m["drug2"] += 1   # SPAQ1 (3-11m) / AZM 1-11m
             else:
-                if age is not None and age <= 11:
-                    m["drug2"] += 1   # AZM 1-11m
-                else:
-                    m["drug1"] += 1   # AZM 12-59m
+                m["drug1"] += 1   # SPAQ2 (12-59m) / AZM 12-59m
 
         # dedup: (hh_head, child_name, ward, age)
         if child_name and age is not None:
@@ -479,6 +475,7 @@ def _aggregate(task_hits, name_map, hh_name_map, target_map, cfg):
             "age_zero":         m["age_zero"],
             "missing_hh":       m["missing_hh"],
             "missing_child":    m["missing_child"],
+            "missing_gender":   m["missing_gender"],
             "duplicates":       m["duplicates"],
             "delivery_comments":m["delivery_comments"],
             "wards":            ", ".join(sorted(m["wards"])),
@@ -491,13 +488,13 @@ def _aggregate(task_hits, name_map, hh_name_map, target_map, cfg):
 # ── Excel writing ──────────────────────────────────────────────────────────────
 
 def _col_headers(drug_type):
-    d1 = "SPAQ1 (12-59m)" if drug_type == "SPAQ" else "AZM 12-59m"
-    d2 = "SPAQ2 (3-11m)"  if drug_type == "SPAQ" else "AZM 1-11m"
+    d1 = "SPAQ2 (12-59m)" if drug_type == "SPAQ" else "AZM 12-59m"
+    d2 = "SPAQ1 (3-11m)"  if drug_type == "SPAQ" else "AZM 1-11m"
     return [
         "#", "LGA", "Health Facility", "Daily Target", "Records", "Treated",
         "Not Treated", d1, d2, "Coverage %", "Status",
         "Absent", "Refused", "Ineligible", "Referred", "Died", "Migrated",
-        "Redose", "Age>59", "Age=0", "Missing HH", "Missing Child",
+        "Redose", "Age>59", "Age=0", "Missing HH", "Missing Child", "Missing Gender",
         "Duplicates", "Delivery Comments", "Wards",
     ]
 
@@ -508,7 +505,7 @@ def _row_values(r, idx):
         r["not_treated"], r["drug1"], r["drug2"], r["coverage"], r["status"],
         r["absent"], r["refused"], r["ineligible"], r["referred"], r["died"],
         r["migrated"], r["redose"], r["age_over59"], r["age_zero"],
-        r["missing_hh"], r["missing_child"], r["duplicates"],
+        r["missing_hh"], r["missing_child"], r["missing_gender"], r["duplicates"],
         r["delivery_comments"], r["wards"],
     ]
 
@@ -519,8 +516,8 @@ def _totals(rows, drug_type):
     total_rec  = s("records")
     total_tr   = s("treated")
     cov = f"{total_tr/total_tgt*100:.1f}%" if total_tgt else "N/A"
-    d1 = "SPAQ1 (12-59m)" if drug_type == "SPAQ" else "AZM 12-59m"
-    d2 = "SPAQ2 (3-11m)"  if drug_type == "SPAQ" else "AZM 1-11m"
+    d1 = "SPAQ2 (12-59m)" if drug_type == "SPAQ" else "AZM 12-59m"
+    d2 = "SPAQ1 (3-11m)"  if drug_type == "SPAQ" else "AZM 1-11m"
     return {
         "lga": "", "fac": "GRAND TOTAL",
         "daily_target": total_tgt, "records": total_rec, "treated": total_tr,
@@ -530,6 +527,7 @@ def _totals(rows, drug_type):
         "referred": s("referred"), "died": s("died"), "migrated": s("migrated"),
         "redose": s("redose"), "age_over59": s("age_over59"), "age_zero": s("age_zero"),
         "missing_hh": s("missing_hh"), "missing_child": s("missing_child"),
+        "missing_gender": s("missing_gender"),
         "duplicates": s("duplicates"), "delivery_comments": s("delivery_comments"),
         "wards": "", "rate": 0,
     }

@@ -171,7 +171,7 @@ def _load_perf(path, drug_type):
 
     lga_d = defaultdict(lambda: dict(
         hfs=0, target=0, treated=0, records=0,
-        dups=0, missing_hh=0, missing_child=0,
+        dups=0, missing_hh=0, missing_child=0, missing_gender=0,
         age59=0, age0=0,
         absent=0, refused=0, inelig=0, referred=0, died=0, migrated=0,
         drug1=0, drug2=0,
@@ -184,7 +184,7 @@ def _load_perf(path, drug_type):
         #            age59, age0, missing_hh, missing_child, dups, del_com, wards
         num, lga, fac, tgt, rec, treated, not_treated, drug1, drug2, cov, status = row[:11]
         (absent, refused, inelig, referred, died, migrated, redose,
-         age59, age0, missing_hh, missing_child, dups, del_com) = row[11:24]
+         age59, age0, missing_hh, missing_child, missing_gender, dups, del_com) = row[11:25]
 
         def i(v): return int(v or 0)
 
@@ -197,8 +197,9 @@ def _load_perf(path, drug_type):
         L["treated"]      += i(treated)
         L["records"]      += i(rec)
         L["dups"]         += i(dups)
-        L["missing_hh"]   += i(missing_hh)
-        L["missing_child"]+= i(missing_child)
+        L["missing_hh"]      += i(missing_hh)
+        L["missing_child"]   += i(missing_child)
+        L["missing_gender"]  += i(missing_gender)
         L["age59"]        += i(age59)
         L["age0"]         += i(age0)
         L["absent"]       += i(absent)
@@ -664,8 +665,9 @@ def _dq_table(doc, lga_d):
 def _fac_perf_table(doc, facilities, perf_link=""):
     """
     LOW coverage (<70%) and Low Activity (<10 records) facilities.
-    Pop. Coverage = Records / Daily Target.
-    Treatment Coverage = Treated / Records.
+    Target Achievement % = Treated / Daily Target * 100.
+    Pop. Coverage        = Records / Daily Target * 100.
+    Daily Treatment Coverage = Treated / Records * 100.
     Cells colour-coded: >=95% green, 70-95% amber, <70% red.
     """
     low_facs = [
@@ -684,31 +686,42 @@ def _fac_perf_table(doc, facilities, perf_link=""):
         run = note_p.add_run("Full list in performance Excel.")
         run.font.name = FONT; run.font.size = Pt(9); run.font.color.rgb = GREY_RGB
 
+    formula_lines = (
+        "Target Achievement % = Treated ÷ Daily Target × 100    |    "
+        "Pop. Coverage = Records ÷ Daily Target × 100    |    "
+        "Daily Treatment Coverage = Treated ÷ Records × 100"
+    )
+    add_para(doc, formula_lines, size=8, color=GREY_RGB)
+
     if not low_facs:
         add_para(doc, "No LOW or Low Activity facilities on this day.")
         return
 
     header = ["#", "District", "Health Facility", "Daily Target", "Records",
-              "Treated", "Not Treated", "Pop. Coverage", "Treatment Coverage"]
+              "Treated", "Not Treated", "Target Achievement %",
+              "Pop. Coverage", "Daily Treatment Coverage"]
     table  = doc.add_table(rows=1, cols=len(header))
     table.style = "Table Grid"
     for ci, h in enumerate(header):
         hdr(table.cell(0, ci), h)
 
     for ri, f in enumerate(low_facs[:20], 1):
+        achv_pct = f["treated"] / f["tgt"] * 100 if f["tgt"] else None
         pop_pct  = f["rec"]     / f["tgt"] * 100 if f["tgt"] else None
         trt_pct  = f["treated"] / f["rec"] * 100 if f["rec"] else None
+        achv_str = f"{achv_pct:.1f}%" if achv_pct is not None else "N/A"
         pop_str  = f"{pop_pct:.1f}%"  if pop_pct  is not None else "N/A"
         trt_str  = f"{trt_pct:.1f}%"  if trt_pct  is not None else "N/A"
         not_trt  = f["rec"] - f["treated"]
 
-        pop_band = _cov_band(pop_pct) if pop_pct is not None else "NO TARGET"
-        trt_band = _cov_band(trt_pct) if trt_pct is not None else "NO TARGET"
+        achv_band = _cov_band(achv_pct) if achv_pct is not None else "NO TARGET"
+        pop_band  = _cov_band(pop_pct)  if pop_pct  is not None else "NO TARGET"
+        trt_band  = _cov_band(trt_pct)  if trt_pct  is not None else "NO TARGET"
 
         row = table.add_row()
         alt = ri % 2 == 1
         vals = [ri, f["lga"], f["fac"], f"{f['tgt']:,}", f"{f['rec']:,}",
-                f"{f['treated']:,}", f"{not_trt:,}", pop_str, trt_str]
+                f"{f['treated']:,}", f"{not_trt:,}", achv_str, pop_str, trt_str]
 
         for ci, val in enumerate(vals):
             cell = row.cells[ci]
@@ -719,11 +732,13 @@ def _fac_perf_table(doc, facilities, perf_link=""):
             p.clear()
             r = p.add_run(str(val))
             r.font.name = FONT; r.font.size = Pt(9)
-            # coloured text only on the two coverage columns
             if ci == 7:
                 r.bold = True
-                if STATUS_COLOR.get(pop_band): r.font.color.rgb = STATUS_COLOR[pop_band]
+                if STATUS_COLOR.get(achv_band): r.font.color.rgb = STATUS_COLOR[achv_band]
             if ci == 8:
+                r.bold = True
+                if STATUS_COLOR.get(pop_band): r.font.color.rgb = STATUS_COLOR[pop_band]
+            if ci == 9:
                 r.bold = True
                 if STATUS_COLOR.get(trt_band): r.font.color.rgb = STATUS_COLOR[trt_band]
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT if ci in (1, 2) else WD_ALIGN_PARAGRAPH.CENTER
@@ -780,6 +795,7 @@ def _dq_summary_table(doc, g):
         ("Duplicate Records",    g["dups"]),
         ("Missing HH Name",      g["missing_hh"]),
         ("Missing Child Name",   g["missing_child"]),
+        ("Missing Gender",       g["missing_gender"]),
         ("Age = 0",              g["age0"]),
         ("Age > 59 months",      g["age59"]),
     ]
@@ -850,14 +866,15 @@ def run(cfg):
         raise FileNotFoundError(f"Performance Excel not found: {perf_path}")
 
     drug_type  = cfg["drug_type"]
-    d1_label   = "SPAQ1 (12-59m)" if drug_type == "SPAQ" else "AZM 12-59m"
-    d2_label   = "SPAQ2 (3-11m)"  if drug_type == "SPAQ" else "AZM 1-11m"
+    d1_label   = "SPAQ2 (12-59m)" if drug_type == "SPAQ" else "AZM 12-59m"
+    d2_label   = "SPAQ1 (3-11m)"  if drug_type == "SPAQ" else "AZM 1-11m"
 
     lga_d, facilities          = _load_perf(perf_path, drug_type)
     sync_rows, sync_time_stats = _load_sync_summary(sync_path)
     g                          = _grand_totals(lga_d)
     cov_pct           = _cov_str(g["treated"], g["target"])
     hfs_active        = len({f["lga"] for f in facilities})
+    lgas_total        = cfg.get("lgas_total") or len(lga_d)
 
     log.info(f"  {len(facilities)} facilities, {len(lga_d)} LGAs, coverage {cov_pct}")
 
@@ -958,7 +975,7 @@ def run(cfg):
         ("Date",                          cfg['DATE_LABEL']),
         ("Data Extract Timestamp",        f"{cfg['DATE_LABEL']}, {datetime.now().strftime('%H:%M')}"),
         ("Campaign Dates",                f"{cfg['START_LABEL']} to {cfg['END_LABEL']}"),
-        ("LGAs / Districts Covered",      f"{hfs_active} of {cfg['hfs_total']}"),
+        ("LGAs / Districts Covered",      f"{hfs_active} of {lgas_total}"),
         # ── Coverage ───────────────────────────────────────────────────────
         ("Daily Population Target",       f"{g['target']:,}"),
         ("Total Records Submitted",       f"{g['records']:,}"),

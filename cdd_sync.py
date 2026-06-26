@@ -225,7 +225,7 @@ def _count_synced_by_cutoff(cfg, cutoff_hour):
             {"term":  {"Data.campaignNumber.keyword": cfg["campaign_number"]}},
             {"term":  {"Data.role.keyword": "DISTRIBUTOR"}},
             {"terms": {"Data.taskDates": [today]}},
-            {"range": {"auditDetails.createdTime": {"lte": cutoff_ms}}},
+            {"range": {"Data.createdTime": {"lte": cutoff_ms}}},
         ]
         agg_field = "Data.syncedUserName.keyword"
     else:
@@ -233,7 +233,7 @@ def _count_synced_by_cutoff(cfg, cutoff_hour):
             {"term":  {"Data.projectTypeId.keyword": cfg["project_type_id"]}},
             {"term":  {"Data.role.keyword": "DISTRIBUTOR"}},
             {"terms": {"Data.taskDates": [today]}},
-            {"range": {"auditDetails.createdTime": {"lte": cutoff_ms}}},
+            {"range": {"Data.createdTime": {"lte": cutoff_ms}}},
         ]
         agg_field = "Data.syncedUserId.keyword"
 

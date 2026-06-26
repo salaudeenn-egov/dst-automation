@@ -156,6 +156,7 @@ def build(row):
         "target_csv":      str(row.get("target_csv", "")).strip(),
         "hfs_total":       int(row.get("hfs_total", 0) or 0),
         "flws_total":      int(row.get("flws_total", 0) or 0),
+        "lgas_total":      int(row.get("lgas_total", 0) or 0),
 
         # output
         "out_dir":         out_dir,
