@@ -207,18 +207,17 @@ def _load_syncs_project(cfg, uid_list):
 
 # ── time-cutoff sync count ────────────────────────────────────────────────────
 
-def _count_synced_by_cutoff(cfg, cutoff_hour):
+def _count_synced_by_cutoff(cfg, cutoff_hour, cutoff_min=0):
     """
-    Count unique CDDs who synced TODAY before cutoff_hour:00 UTC.
-    Uses auditDetails.createdTime (epoch ms) as the server receipt timestamp.
+    Count unique CDDs who synced TODAY before cutoff_hour:cutoff_min UTC.
+    Uses Data.createdTime (epoch ms) as the server receipt timestamp.
     Returns int count, or None if query fails.
     """
     today = cfg["extract_date"].isoformat()
-
-    # epoch ms for today at cutoff_hour:00:00 UTC
-    from datetime import timezone
-    cutoff_dt  = datetime.strptime(f"{today}T{cutoff_hour:02d}:00:00", "%Y-%m-%dT%H:%M:%S")
-    cutoff_ms  = int(cutoff_dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
+    cutoff_dt = datetime.strptime(
+        f"{today}T{cutoff_hour:02d}:{cutoff_min:02d}:00", "%Y-%m-%dT%H:%M:%S"
+    )
+    cutoff_ms = int(cutoff_dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
 
     if cfg["is_admin_console"]:
         must_filter = [
@@ -249,10 +248,52 @@ def _count_synced_by_cutoff(cfg, cutoff_hour):
         )
         r.raise_for_status()
         count = r.json()["aggregations"]["unique_synced"]["value"]
-        log.info(f"  synced by {cutoff_hour:02d}:00 UTC: {count:,}")
+        log.info(f"  synced by {cutoff_hour:02d}:{cutoff_min:02d} UTC: {count:,}")
         return count
     except Exception as e:
         log.warning(f"  time-cutoff query failed (non-fatal): {e}")
+        return None
+
+
+def _get_synced_keys_by_cutoff(cfg, cutoff_hour=17, cutoff_min=30):
+    """
+    Return set of CDD keys (lowercased) who synced TODAY before cutoff_hour:cutoff_min UTC.
+    Admin console: keys are syncedUserName.lower().
+    Project: keys are syncedUserId.lower().
+    Returns set, or None if query fails.
+    """
+    today = cfg["extract_date"].isoformat()
+    cutoff_dt = datetime.strptime(
+        f"{today}T{cutoff_hour:02d}:{cutoff_min:02d}:00", "%Y-%m-%dT%H:%M:%S"
+    )
+    cutoff_ms = int(cutoff_dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+    if cfg["is_admin_console"]:
+        must_filter = [
+            {"term":  {"Data.campaignNumber.keyword": cfg["campaign_number"]}},
+            {"term":  {"Data.role.keyword": "DISTRIBUTOR"}},
+            {"terms": {"Data.taskDates": [today]}},
+            {"range": {"Data.createdTime": {"lte": cutoff_ms}}},
+        ]
+        agg_sources = [{"key": {"terms": {"field": "Data.syncedUserName.keyword"}}}]
+    else:
+        must_filter = [
+            {"term":  {"Data.projectTypeId.keyword": cfg["project_type_id"]}},
+            {"term":  {"Data.role.keyword": "DISTRIBUTOR"}},
+            {"terms": {"Data.taskDates": [today]}},
+            {"range": {"Data.createdTime": {"lte": cutoff_ms}}},
+        ]
+        agg_sources = [{"key": {"terms": {"field": "Data.syncedUserId.keyword"}}}]
+
+    try:
+        buckets = _composite_agg(
+            cfg["es_url"], cfg["ES_INDEX_SYNC"], must_filter, agg_sources, cfg["es_auth"]
+        )
+        synced = {b["key"]["key"].lower() for b in buckets}
+        log.info(f"  synced by {cutoff_hour:02d}:{cutoff_min:02d} UTC: {len(synced):,} CDDs")
+        return synced
+    except Exception as e:
+        log.warning(f"  cutoff key query failed (non-fatal): {e}")
         return None
 
 
@@ -396,8 +437,11 @@ def run(cfg):
         if col not in df_all.columns:
             df_all[col] = ""
 
-    # Time-based sync count — how many CDDs synced by 17:00 today
-    synced_by_1700 = _count_synced_by_cutoff(cfg, 17)
+    # Time-based sync counts
+    synced_by_1700 = _count_synced_by_cutoff(cfg, 17, 0)
+    synced_by_1730 = _count_synced_by_cutoff(cfg, 17, 30)
+    # Keys of CDDs who synced by 17:30 — used for the NOT SYNCED tab
+    synced_keys_1730 = _get_synced_keys_by_cutoff(cfg, 17, 30)
 
     from openpyxl import Workbook as _WB
     wb = _WB()
@@ -414,6 +458,9 @@ def run(cfg):
     if synced_by_1700 is not None:
         pct = f"{synced_by_1700/total_cdds_count*100:.1f}%" if total_cdds_count else "-"
         time_rows.append(("Synced by 17:00 today (UTC)", synced_by_1700, pct))
+    if synced_by_1730 is not None:
+        pct = f"{synced_by_1730/total_cdds_count*100:.1f}%" if total_cdds_count else "-"
+        time_rows.append(("Synced by 17:30 today (UTC)", synced_by_1730, pct))
     for i, (label, count, pct) in enumerate(time_rows):
         r = last_row + i
         ws_sum.cell(r, 1, label)
@@ -445,6 +492,21 @@ def run(cfg):
     df_low.insert(0, "#", range(1, len(df_low) + 1))
     ws_low = wb.create_sheet("LOW SYNCED")
     _write_df(ws_low, df_low)
+
+    # NOT SYNCED BY 17:30 — CDDs who had no sync record before 17:30 UTC today
+    if synced_keys_1730 is not None:
+        lookup_key = "Username" if is_admin else "User ID"
+        not_synced = [
+            r for r in all_rows
+            if r[lookup_key].lower() not in synced_keys_1730
+        ]
+        df_ns = pd.DataFrame(not_synced)[
+            ["LGA", "Health Facility", "Username", "User ID"]
+        ].reset_index(drop=True)
+        df_ns.insert(0, "#", range(1, len(df_ns) + 1))
+        ws_ns = wb.create_sheet("NOT SYNCED BY 17:30")
+        _write_df(ws_ns, df_ns)
+        log.info(f"  not synced by 17:30 UTC: {len(not_synced):,} CDDs")
 
     out = cfg["sync_xlsx"]
     wb.save(out)

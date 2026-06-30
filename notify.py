@@ -161,11 +161,11 @@ def run(cfg, docx_path, slack_text):
         return
 
     try:
-        from datetime import datetime
+        from datetime import datetime, timezone
         message = slack_text
         if drive_link:
             message = f"{slack_text}\n\nFull report: {drive_link}"
-        message += f"\n\nData extracted at {datetime.now().strftime('%H:%M')} on {cfg['DATE_LABEL']}."
+        message += f"\n\nData extracted at {datetime.now(timezone.utc).strftime('%H:%M')} UTC on {cfg['DATE_LABEL']}."
         message += "\n[Beta] This report is auto-generated. Please verify before acting on the data."
         _slack_post(channel, message, token)
         log.info(f"[notify] Slack post done → {channel}")

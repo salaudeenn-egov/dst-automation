@@ -1144,6 +1144,18 @@ def run(cfg):
     add_heading(doc, "6.  Conclusion", 4)
     add_para(doc, conclusion, size=10)
 
+    # Disclaimer footer
+    from datetime import datetime, timezone
+    extracted_at = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    doc.add_paragraph()
+    disclaimer = (
+        f"Note:  Data snapshot as at {cfg['DATE_LABEL']}, {extracted_at}. "
+        f"Figures in the AI-generated narrative are approximations — refer to the DIGIT HCM dashboard for verified values."
+    )
+    p = add_para(doc, disclaimer, size=8, color=GREY_RGB)
+    p.paragraph_format.left_indent  = Pt(0)
+    p.paragraph_format.space_before = Pt(4)
+
     out = cfg["docx_path"]
     doc.save(out)
     log.info(f"[report] saved -> {out}")
