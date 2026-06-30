@@ -25,10 +25,8 @@ _SCOPES = [
 
 
 def _creds():
-    path = os.getenv("GOOGLE_CREDENTIALS_PATH")
-    if not path or not os.path.exists(path):
-        raise FileNotFoundError(f"credential.json not found: {path}")
-    return Credentials.from_service_account_file(path, scopes=_SCOPES)
+    from pipeline.config import _resolve_creds_path
+    return Credentials.from_service_account_file(_resolve_creds_path(), scopes=_SCOPES)
 
 
 def _drive_creds():

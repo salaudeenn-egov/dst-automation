@@ -26,13 +26,25 @@ _MONTH_MAP = {
 }
 
 
+def _resolve_creds_path():
+    """Return credential.json path — falls back to file in project root if env path is wrong OS."""
+    configured = os.getenv("GOOGLE_CREDENTIALS_PATH", "")
+    if configured and os.path.exists(configured):
+        return configured
+    # Fall back: credential.json next to run.py (project root, one level above pipeline/)
+    fallback = os.path.join(os.path.dirname(__file__), "..", "credential.json")
+    fallback = os.path.abspath(fallback)
+    if os.path.exists(fallback):
+        log.info(f"[config] GOOGLE_CREDENTIALS_PATH not found; using fallback: {fallback}")
+        return fallback
+    raise FileNotFoundError(
+        f"credential.json not found. Tried:\n  {configured}\n  {fallback}\n"
+        f"Set GOOGLE_CREDENTIALS_PATH in .env to the correct path."
+    )
+
+
 def _gs_client():
-    creds_path = os.getenv("GOOGLE_CREDENTIALS_PATH")
-    if not creds_path or not os.path.exists(creds_path):
-        raise FileNotFoundError(
-            f"GOOGLE_CREDENTIALS_PATH not set or missing: {creds_path}"
-        )
-    creds = Credentials.from_service_account_file(creds_path, scopes=_SCOPES)
+    creds = Credentials.from_service_account_file(_resolve_creds_path(), scopes=_SCOPES)
     return gspread.Client(auth=creds)
 
 
