@@ -7,10 +7,11 @@ import os
 from google_auth_oauthlib.flow import InstalledAppFlow
 from dotenv import load_dotenv
 
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
+_ROOT = os.path.dirname(os.path.dirname(__file__))   # D:\DST\automation
+load_dotenv(dotenv_path=os.path.join(_ROOT, ".env"))
 
-CLIENT_SECRETS = os.path.join(os.path.dirname(__file__), "drive_oauth_client.json")
-TOKEN_PATH     = os.path.join(os.path.dirname(__file__), "drive_token.json")
+CLIENT_SECRETS = os.path.join(_ROOT, "drive_oauth_client.json")
+TOKEN_PATH     = os.path.join(_ROOT, "drive_token.json")
 SCOPES         = ["https://www.googleapis.com/auth/drive"]
 
 flow  = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRETS, SCOPES)

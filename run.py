@@ -3,9 +3,23 @@ run.py — Daily campaign report orchestrator
 Usage: python run.py
 Reads all active rows from the Google Sheet, runs the full pipeline per row.
 """
-import logging
-import os
+import subprocess
 import sys
+import os
+
+
+def _ensure_deps():
+    try:
+        import dotenv, gspread, openpyxl, anthropic, requests, pandas, docx, matplotlib
+    except ImportError:
+        print("[bootstrap] Installing missing dependencies ...")
+        req = os.path.join(os.path.dirname(__file__), "requirements.txt")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", req, "-q"])
+        print("[bootstrap] Done.")
+
+_ensure_deps()
+
+import logging
 from datetime import date
 
 from dotenv import load_dotenv
@@ -27,11 +41,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-import config
-import analyze
-import cdd_sync
-import report
-import notify
+from pipeline import config, analyze, cdd_sync, report, notify
 
 
 def _update_sheet_status(cfg, status, step_failed="", error_msg="", drive_link=""):

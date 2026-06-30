@@ -20,9 +20,23 @@ Usage (Jupyter cell — stop):
 The schedule is reloaded from the sheet every midnight, so you can update times
 in the sheet without restarting.
 """
-import logging
-import os
+import subprocess
 import sys
+import os
+
+
+def _ensure_deps():
+    try:
+        import dotenv, gspread, openpyxl, anthropic, requests, pandas, docx, matplotlib, schedule
+    except ImportError:
+        print("[bootstrap] Installing missing dependencies ...")
+        req = os.path.join(os.path.dirname(__file__), "requirements.txt")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", req, "-q"])
+        print("[bootstrap] Done.")
+
+_ensure_deps()
+
+import logging
 import time
 from datetime import datetime
 
@@ -52,7 +66,7 @@ log = logging.getLogger("scheduler")
 # ── pipeline ───────────────────────────────────────────────────────────────────
 
 def _run_campaign(raw_row):
-    import config, analyze, cdd_sync, report, notify
+    from pipeline import config, analyze, cdd_sync, report, notify
 
     state = raw_row.get("state_name", "?")
     log.info(f"[{state}] pipeline triggered at {datetime.now().strftime('%H:%M')}")
@@ -91,7 +105,7 @@ def _run_campaign(raw_row):
 # ── schedule builder ───────────────────────────────────────────────────────────
 
 def _reload_schedule():
-    import config as cfg_module
+    from pipeline import config as cfg_module
 
     try:
         rows = cfg_module.get_active_rows()
