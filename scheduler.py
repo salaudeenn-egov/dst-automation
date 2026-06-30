@@ -65,6 +65,14 @@ log = logging.getLogger("scheduler")
 
 # ── pipeline ───────────────────────────────────────────────────────────────────
 
+def _run_campaign_thread(raw_row):
+    """Wrapper that runs _run_campaign in a background thread so parallel schedules don't block."""
+    import threading
+    t = threading.Thread(target=_run_campaign, args=(raw_row,), daemon=True,
+                         name=f"dst-{raw_row.get('state_name','?')}")
+    t.start()
+
+
 def _run_campaign(raw_row):
     from pipeline import config, analyze, cdd_sync, report, notify
 
@@ -127,7 +135,7 @@ def _reload_schedule():
             log.warning(f"[{state}] report_times not set — no jobs scheduled"); continue
         for t in times:
             try:
-                schedule.every().day.at(t).do(_run_campaign, raw_row=row)
+                schedule.every().day.at(t).do(_run_campaign_thread, raw_row=row)
                 log.info(f"  scheduled [{state}] at {t}")
                 job_count += 1
             except Exception as e:

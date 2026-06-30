@@ -30,26 +30,32 @@ _BORDER      = Border(left=_thin, right=_thin, top=_thin, bottom=_thin)
 
 def _scroll_all(url, index, query, auth, label):
     hits = []
-    r = requests.post(f"{url}/{index}/_search?scroll=5m",
-                      json=query, auth=auth, verify=False, timeout=120)
-    r.raise_for_status()
-    data  = r.json()
-    sid   = data["_scroll_id"]
-    batch = data["hits"]["hits"]
-    hits.extend(batch)
-    total = data["hits"]["total"]["value"]
-    log.info(f"  {label}: ~{total:,} docs ...")
-    while batch:
-        r = requests.post(f"{url}/_search/scroll",
-                          json={"scroll": "5m", "scroll_id": sid},
-                          auth=auth, verify=False, timeout=120)
+    sid  = None
+    try:
+        r = requests.post(f"{url}/{index}/_search?scroll=10m",
+                          json=query, auth=auth, verify=False, timeout=120)
         r.raise_for_status()
         data  = r.json()
         sid   = data["_scroll_id"]
         batch = data["hits"]["hits"]
         hits.extend(batch)
-    requests.delete(f"{url}/_search/scroll",
-                    json={"scroll_id": sid}, auth=auth, verify=False, timeout=30)
+        total = data["hits"]["total"]["value"]
+        log.info(f"  {label}: ~{total:,} docs ...")
+        while batch:
+            r = requests.post(f"{url}/_search/scroll",
+                              json={"scroll": "10m", "scroll_id": sid},
+                              auth=auth, verify=False, timeout=120)
+            r.raise_for_status()
+            data  = r.json()
+            sid   = data["_scroll_id"]
+            batch = data["hits"]["hits"]
+            hits.extend(batch)
+            if len(hits) % 50_000 < len(batch):
+                log.info(f"  {label}: {len(hits):,} / ~{total:,} fetched ...")
+    finally:
+        if sid:
+            requests.delete(f"{url}/_search/scroll",
+                            json={"scroll_id": sid}, auth=auth, verify=False, timeout=30)
     log.info(f"  {label}: {len(hits):,} docs")
     return hits
 

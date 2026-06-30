@@ -39,29 +39,70 @@ _WORKERS = 8
 # ── ES helpers ─────────────────────────────────────────────────────────────────
 
 def _scroll_all(url, index, query, auth, label):
+    """Scroll ES index and return all hits as a list. Use _scroll_batches for large datasets."""
     hits = []
-    r = requests.post(f"{url}/{index}/_search?scroll=10m",
-                      json=query, auth=auth, verify=False, timeout=120)
-    r.raise_for_status()
-    data = r.json()
-    sid  = data["_scroll_id"]
-    batch = data["hits"]["hits"]
-    hits.extend(batch)
-    total = data["hits"]["total"]["value"]
-    log.info(f"  {label}: ~{total:,} docs, fetching ...")
-    while batch:
-        r = requests.post(f"{url}/_search/scroll",
-                          json={"scroll": "10m", "scroll_id": sid},
-                          auth=auth, verify=False, timeout=120)
+    sid  = None
+    try:
+        r = requests.post(f"{url}/{index}/_search?scroll=10m",
+                          json=query, auth=auth, verify=False, timeout=120)
         r.raise_for_status()
         data  = r.json()
         sid   = data["_scroll_id"]
         batch = data["hits"]["hits"]
         hits.extend(batch)
-    requests.delete(f"{url}/_search/scroll",
-                    json={"scroll_id": sid}, auth=auth, verify=False, timeout=30)
+        total = data["hits"]["total"]["value"]
+        log.info(f"  {label}: ~{total:,} docs, fetching ...")
+        while batch:
+            r = requests.post(f"{url}/_search/scroll",
+                              json={"scroll": "10m", "scroll_id": sid},
+                              auth=auth, verify=False, timeout=120)
+            r.raise_for_status()
+            data  = r.json()
+            sid   = data["_scroll_id"]
+            batch = data["hits"]["hits"]
+            hits.extend(batch)
+            if len(hits) % 50_000 < len(batch):
+                log.info(f"  {label}: {len(hits):,} / ~{total:,} fetched ...")
+    finally:
+        if sid:
+            requests.delete(f"{url}/_search/scroll",
+                            json={"scroll_id": sid}, auth=auth, verify=False, timeout=30)
     log.info(f"  {label}: {len(hits):,} docs fetched")
     return hits
+
+
+def _scroll_batches(url, index, query, auth, label):
+    """
+    Generator that yields one ES scroll page at a time.
+    Never accumulates all docs — safe for millions of records.
+    """
+    sid = None
+    try:
+        r = requests.post(f"{url}/{index}/_search?scroll=10m",
+                          json=query, auth=auth, verify=False, timeout=120)
+        r.raise_for_status()
+        data  = r.json()
+        sid   = data["_scroll_id"]
+        batch = data["hits"]["hits"]
+        total = data["hits"]["total"]["value"]
+        log.info(f"  {label}: ~{total:,} docs, streaming in batches ...")
+        processed = 0
+        while batch:
+            yield batch
+            processed += len(batch)
+            if processed % 100_000 < len(batch):
+                log.info(f"  {label}: {processed:,} / ~{total:,} streamed ...")
+            r = requests.post(f"{url}/_search/scroll",
+                              json={"scroll": "10m", "scroll_id": sid},
+                              auth=auth, verify=False, timeout=120)
+            r.raise_for_status()
+            data  = r.json()
+            sid   = data["_scroll_id"]
+            batch = data["hits"]["hits"]
+    finally:
+        if sid:
+            requests.delete(f"{url}/_search/scroll",
+                            json={"scroll_id": sid}, auth=auth, verify=False, timeout=30)
 
 
 def _build_campaign_filters(cfg):
@@ -360,6 +401,162 @@ def _band(treat_rate, daily_target, records, drug_type):
     return "LOW"
 
 
+def _aggregate_batch(task_hits, name_map, hh_name_map, fac_data, cfg):
+    """
+    Process one batch of task hits, updating the running fac_data dict in-place.
+    Uses integer hash keys for dedup to keep memory ~7x lower than storing full tuples.
+    """
+    drug_type = cfg["drug_type"]
+    min_age   = 3 if drug_type == "SPAQ" else 1
+
+    for h in task_hits:
+        doc  = h["_source"]["Data"]
+        bh   = doc.get("boundaryHierarchy") or {}
+        lga  = str(bh.get("lga",            "") or "").strip()
+        ward = str(bh.get("ward",           "") or "").strip()
+        fac  = str(bh.get("healthFacility", "") or "").strip()
+        if not fac:
+            continue
+
+        ind_id     = doc.get("individualId", "") or ""
+        adm        = doc.get("administrationStatus", "") or ""
+        add        = doc.get("additionalDetails") or {}
+        lat        = add.get("latitude")
+        lon        = add.get("longitude")
+        del_com    = str(add.get("deliveryComments") or doc.get("deliveryComments") or "").strip()
+        hh_head    = hh_name_map.get(ind_id, "")
+        child_name = name_map.get(ind_id, "") if ind_id else ""
+
+        age_raw = doc.get("age")
+        try:
+            age = int(float(age_raw)) if age_raw not in (None, "") else None
+        except Exception:
+            age = None
+
+        qty_raw = doc.get("quantity")
+        try:
+            qty = int(float(qty_raw)) if qty_raw not in (None, "") else 0
+        except Exception:
+            qty = 0
+
+        inelig_status = adm in ("BENEFICIARY_INELIGIBLE", "INELIGIBLE")
+        ref_status    = adm == "BENEFICIARY_REFERRED"
+
+        if fac not in fac_data:
+            fac_data[fac] = dict(
+                lga=lga, fac=fac, records=0, treated=0,
+                drug1=0, drug2=0, absent=0, refused=0,
+                ineligible=0, referred=0, died=0, migrated=0,
+                redose=0, age_over59=0, age_zero=0,
+                missing_hh=0, missing_child=0, missing_gender=0, duplicates=0,
+                delivery_comments=0, missing_lat_lon=0,
+                wards=set(), seen_keys=set(),
+            )
+
+        m = fac_data[fac]
+        m["records"] += 1
+
+        if ward:
+            m["wards"].add(ward)
+        if (lat is None or lat == "") or (lon is None or lon == ""):
+            m["missing_lat_lon"] += 1
+        if del_com:
+            m["delivery_comments"] += 1
+        if not child_name:
+            m["missing_child"] += 1
+        if not hh_head:
+            m["missing_hh"] += 1
+        if not add.get("gender"):
+            m["missing_gender"] += 1
+
+        if age is None:
+            pass
+        elif age == 0:
+            m["age_zero"] += 1
+        elif age > 59:
+            m["age_over59"] += 1
+
+        if   adm == "BENEFICIARY_ABSENT":                         m["absent"]    += 1
+        elif adm == "BENEFICIARY_REFUSED":                        m["refused"]   += 1
+        elif adm in ("BENEFICIARY_INELIGIBLE", "INELIGIBLE"):    m["ineligible"] += 1
+        elif adm == "BENEFICIARY_REFERRED":                       m["referred"]  += 1
+        elif adm == "BENEFICIARY_DIED":                           m["died"]      += 1
+        elif adm == "BENEFICIARY_MIGRATED":                       m["migrated"]  += 1
+
+        if adm == "VISITED" and qty >= 1:
+            m["redose"] += 1
+
+        is_treated = (
+            age is not None and min_age <= age <= 59
+            and not inelig_status and not ref_status
+            and qty >= 1 and adm != "VISITED"
+        )
+        if is_treated:
+            m["treated"] += 1
+            if age is not None and age <= 11:
+                m["drug2"] += 1
+            else:
+                m["drug1"] += 1
+
+        # dedup: store hash(tuple) — uses ~28 bytes vs ~200 bytes for full tuple
+        if child_name and age is not None:
+            key_hash = hash((hh_head.lower(), child_name.lower(), ward.lower(), age))
+            if key_hash in m["seen_keys"]:
+                m["duplicates"] += 1
+            else:
+                m["seen_keys"].add(key_hash)
+
+
+def _finalize_fac_data(fac_data, target_map, cfg):
+    """Convert running fac_data dict into the final sorted results list."""
+    results = []
+    for fac, m in sorted(fac_data.items(), key=lambda x: (x[1]["lga"], x[0])):
+        tgt_entry   = target_map.get(fac.lower(), {"4day": 0, "daily": 0})
+        daily_tgt   = tgt_entry["daily"]
+        records     = m["records"]
+        treated     = m["treated"]
+        not_treated = records - treated
+
+        if daily_tgt > 0:
+            rate = treated / daily_tgt * 100
+            cov  = f"{rate:.1f}%"
+        else:
+            rate = 0.0
+            cov  = "NO TARGET"
+
+        flag = _band(rate, daily_tgt, records, cfg["drug_type"])
+
+        results.append({
+            "lga":               m["lga"],
+            "fac":               fac,
+            "daily_target":      daily_tgt,
+            "records":           records,
+            "treated":           treated,
+            "not_treated":       not_treated,
+            "drug1":             m["drug1"],
+            "drug2":             m["drug2"],
+            "coverage":          cov,
+            "status":            flag,
+            "absent":            m["absent"],
+            "refused":           m["refused"],
+            "ineligible":        m["ineligible"],
+            "referred":          m["referred"],
+            "died":              m["died"],
+            "migrated":          m["migrated"],
+            "redose":            m["redose"],
+            "age_over59":        m["age_over59"],
+            "age_zero":          m["age_zero"],
+            "missing_hh":        m["missing_hh"],
+            "missing_child":     m["missing_child"],
+            "missing_gender":    m["missing_gender"],
+            "duplicates":        m["duplicates"],
+            "delivery_comments": m["delivery_comments"],
+            "wards":             ", ".join(sorted(m["wards"])),
+            "rate":              rate,
+        })
+    return results
+
+
 def _aggregate(task_hits, name_map, hh_name_map, target_map, cfg):
     drug_type    = cfg["drug_type"]
     campaign_days = cfg["campaign_days"]
@@ -643,45 +840,54 @@ BANDS = ["LOW", "MODERATE", "HIGH", "NO TARGET", "LOW ACTIVITY"]
 
 
 def run(cfg):
-    log.info(f"[analyze] {cfg['state_name']} Day {cfg['DAY']} — fetching task docs ...")
+    log.info(f"[analyze] {cfg['state_name']} Day {cfg['DAY']} — streaming task docs ...")
 
-    task_hits = _fetch_task_docs(cfg)
+    target_map = _load_targets(cfg)
+    fac_data   = {}
 
-    # Step 2: child names from individual-index (always — never from additionalDetails)
-    ind_ids  = list({
-        h["_source"]["Data"].get("individualId", "")
-        for h in task_hits
-        if h["_source"]["Data"].get("individualId", "")
-    })
-    name_map = _fetch_individual_names(cfg, ind_ids)   # {ind_id: child_name}
+    _source    = [
+        "Data.boundaryHierarchy", "Data.age", "Data.individualId",
+        "Data.quantity", "Data.administrationStatus", "Data.additionalDetails",
+    ]
+    date_field  = cfg.get("task_date_field", "taskDates")
+    date_filter = {"range": {f"Data.{date_field}": {"gte": cfg["GTE"], "lte": cfg["LTE"]}}}
+    campaign_f  = _build_campaign_filters(cfg)
+    base        = [date_filter] + campaign_f
 
-    # Step 4: ind_id → hh_clref_id via household-member index
-    ind_hh_map = _fetch_hh_member_map(cfg, ind_ids)    # {ind_id: hh_clref_id}
+    treatment_filters = base + [
+        {"terms": {"Data.administrationStatus.keyword": ["ADMINISTRATION_SUCCESS", "VISITED"]}},
+    ]
+    if cfg.get("dose_index_filter"):
+        treatment_filters.append({"term": {"Data.additionalDetails.doseIndex.keyword": "1"}})
 
-    # Step 5: hh_clref_id → head_ind_id (isHeadOfHousehold=True)
-    hh_clref_ids    = list(set(ind_hh_map.values()))
-    hh_head_ind_map = _fetch_hh_head_map(cfg, hh_clref_ids)  # {hh_clref_id: head_ind_id}
+    nonadmin_filters = base + [
+        {"terms": {"Data.administrationStatus.keyword": [
+            "BENEFICIARY_INELIGIBLE", "INELIGIBLE", "BENEFICIARY_REFERRED",
+            "BENEFICIARY_DIED", "BENEFICIARY_ABSENT", "BENEFICIARY_MIGRATED",
+            "BENEFICIARY_REFUSED",
+        ]}},
+    ]
 
-    # Step 6: fetch head names only for IDs not already in name_map
-    head_ind_ids         = list(set(hh_head_ind_map.values()))
-    missing_head_ids     = [i for i in head_ind_ids if i not in name_map]
-    head_name_lookup     = _fetch_individual_names(cfg, missing_head_ids)  # {ind_id: name}
+    queries = [
+        ("task-treatment", {"size": _BATCH, "query": {"bool": {"filter": treatment_filters}}, "_source": _source}),
+        ("task-nonadmin",  {"size": _BATCH, "query": {"bool": {"filter": nonadmin_filters}},  "_source": _source}),
+    ]
 
-    # Step 7: build {child_ind_id: head_name} — same lookup chain as Togo
-    head_ids_set = set(head_ind_ids)
-    hh_name_map  = {}
-    for ind_id in ind_ids:
-        if ind_id in head_ids_set:
-            continue  # individual IS the head — no separate HH head name needed
-        hh_id       = ind_hh_map.get(ind_id, "")
-        head_ind_id = hh_head_ind_map.get(hh_id, "")
-        if head_ind_id in name_map:
-            hh_name_map[ind_id] = name_map[head_ind_id]
-        else:
-            hh_name_map[ind_id] = head_name_lookup.get(head_ind_id, "")
+    total_processed = 0
+    for label, query in queries:
+        for batch in _scroll_batches(cfg["es_url"], cfg["ES_INDEX_TASK"], query, cfg["es_auth"], label):
+            # Fetch individual names only for this batch — never accumulate all IDs
+            batch_ind_ids = list({
+                h["_source"]["Data"].get("individualId", "")
+                for h in batch
+                if h["_source"]["Data"].get("individualId", "")
+            })
+            name_map = _fetch_individual_names(cfg, batch_ind_ids)
+            _aggregate_batch(batch, name_map, {}, fac_data, cfg)
+            total_processed += len(batch)
 
-    target_map  = _load_targets(cfg)
-    rows        = _aggregate(task_hits, name_map, hh_name_map, target_map, cfg)
+    log.info(f"[analyze] {total_processed:,} records processed across {len(fac_data)} facilities")
+    rows = _finalize_fac_data(fac_data, target_map, cfg)
 
     drug_type = cfg["drug_type"]
     headers   = _col_headers(drug_type)
