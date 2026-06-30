@@ -1,8 +1,9 @@
 # Credentials & secrets
 .env
 credential.json
-drive_token.json
+credential.backup.json
 drive_oauth_client.json
+drive_token.json
 
 # Output files
 output/

@@ -7,15 +7,15 @@ import logging
 from datetime import date, timedelta, datetime
 
 import gspread
-from oauth2client.service_account import ServiceAccountCredentials
+from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
 log = logging.getLogger(__name__)
 
-_SCOPE = [
-    "https://spreadsheets.google.com/feeds",
+_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
 
@@ -32,8 +32,8 @@ def _gs_client():
         raise FileNotFoundError(
             f"GOOGLE_CREDENTIALS_PATH not set or missing: {creds_path}"
         )
-    creds = ServiceAccountCredentials.from_json_keyfile_name(creds_path, _SCOPE)
-    return gspread.authorize(creds)
+    creds = Credentials.from_service_account_file(creds_path, scopes=_SCOPES)
+    return gspread.Client(auth=creds)
 
 
 def _parse_date(val):
@@ -147,10 +147,28 @@ def build(row):
         "ES_INDEX_IND":       f"{tenant}-individual-index-v1",
         "ES_INDEX_HH_MEMBER": f"{tenant}-household-member-index-v1",
 
-        # CDD sync variant
+        # Campaign identifier — drives ES filter in analyze.py and cdd_sync.py
+        # is_admin_console=TRUE  → filter by campaignNumber (Nigeria, Chad admin)
+        # is_admin_console=FALSE → filter by projectTypeId (Togo) OR projectType+cycleIndex (AZM Nigeria/Congo)
         "is_admin_console":  _bool(row.get("is_admin_console", "TRUE")),
         "campaign_number":   str(row.get("campaign_number", "")).strip(),
         "project_type_id":   str(row.get("project_type_id", "")).strip(),
+        "project_type":      str(row.get("project_type", "")).strip(),
+        "cycle_index":       str(row.get("cycle_index", "")).strip(),
+
+        # ES date range field: "taskDates" (default) or "@timestamp"
+        "task_date_field":   str(row.get("task_date_field", "taskDates")).strip() or "taskDates",
+
+        # Whether analyze.py adds doseIndex=1 to treatment query
+        # FALSE for all Nigeria SMC states (extraction scripts confirm doseIndex not used)
+        # FALSE for AZM. TRUE only if your task docs require it.
+        "dose_index_filter": _bool(row.get("dose_index_filter", "FALSE")),
+
+        # Whether analyze.py adds campaign filter (campaignNumber/projectTypeId/projectType)
+        # to the task index query. FALSE for all Nigeria SMC states — date range alone
+        # isolates the campaign. TRUE only for AZM/non-admin where multiple project types
+        # share the same tenant and date range.
+        "task_campaign_filter": _bool(row.get("task_campaign_filter", "FALSE")),
 
         # targets / counts
         "target_csv":      str(row.get("target_csv", "")).strip(),
@@ -160,6 +178,7 @@ def build(row):
 
         # output
         "out_dir":         out_dir,
+        "google_sheet_id": str(row.get("google_sheet_id", "")).strip(),
         "slack_channel":   str(row.get("slack_channel", "")).strip(),
 
         # scheduler — comma-separated 24h times e.g. "11:00,14:00,17:00,20:00"

@@ -64,32 +64,71 @@ def _scroll_all(url, index, query, auth, label):
     return hits
 
 
+def _build_campaign_filters(cfg):
+    """
+    Build ES filter clauses that identify this specific campaign in the task index.
+
+    Only applied when task_campaign_filter=TRUE (opt-in).
+    - Nigeria SMC states: FALSE — date range alone isolates the campaign.
+    - AZM/non-admin (multiple project types share same tenant+date): TRUE.
+
+    Priority (first match wins):
+      1. is_admin_console=TRUE  → campaignNumber  (Nigeria admin, Chad admin)
+      2. project_type_id set    → projectTypeId   (Togo non-admin)
+      3. project_type set       → projectType     (AZM Nigeria/Congo)
+      Appends cycleIndex filter if cycle_index is set (regardless of above).
+    """
+    if not cfg.get("task_campaign_filter", False):
+        return []
+
+    filters = []
+    if cfg.get("is_admin_console") and cfg.get("campaign_number"):
+        filters.append({"term": {"Data.campaignNumber.keyword": cfg["campaign_number"]}})
+    elif cfg.get("project_type_id"):
+        filters.append({"term": {"Data.projectTypeId.keyword": cfg["project_type_id"]}})
+    elif cfg.get("project_type"):
+        filters.append({"term": {"Data.projectType.keyword": cfg["project_type"]}})
+
+    if cfg.get("cycle_index"):
+        filters.append({"term": {"Data.additionalDetails.cycleIndex.keyword": cfg["cycle_index"]}})
+
+    return filters
+
+
 def _fetch_task_docs(cfg):
     _source = [
         "Data.boundaryHierarchy", "Data.age", "Data.individualId",
         "Data.quantity", "Data.administrationStatus",
         "Data.additionalDetails",
     ]
-    date_filter = {"range": {"Data.taskDates": {"gte": cfg["GTE"], "lte": cfg["LTE"]}}}
+    date_field  = cfg.get("task_date_field", "taskDates")
+    date_filter = {"range": {f"Data.{date_field}": {"gte": cfg["GTE"], "lte": cfg["LTE"]}}}
+    campaign_f  = _build_campaign_filters(cfg)
 
-    # Query 1: treatment records — doseIndex=1 only (excludes dose 2/3 DELIVERED)
+    # Base filters shared by both queries
+    base = [date_filter] + campaign_f
+
+    # Query 1: treatment records
+    treatment_filters = base + [
+        {"terms": {"Data.administrationStatus.keyword": [
+            "ADMINISTRATION_SUCCESS", "VISITED",
+        ]}},
+    ]
+    # doseIndex=1 filter: opt-in only (dose_index_filter=TRUE).
+    # FALSE for all Nigeria SMC states and AZM — extraction scripts confirm doseIndex unused.
+    if cfg.get("dose_index_filter"):
+        treatment_filters.append({"term": {"Data.additionalDetails.doseIndex.keyword": "1"}})
+
     q_treatment = {
         "size": _BATCH,
-        "query": {"bool": {"filter": [
-            date_filter,
-            {"terms": {"Data.administrationStatus.keyword": [
-                "ADMINISTRATION_SUCCESS", "VISITED",
-            ]}},
-            {"term": {"Data.additionalDetails.doseIndex.keyword": "1"}},
-        ]}},
+        "query": {"bool": {"filter": treatment_filters}},
         "_source": _source,
     }
 
     # Query 2: non-admin records — no doseIndex filter (absent/refused/etc. have no doseIndex)
     q_nonadmin = {
         "size": _BATCH,
-        "query": {"bool": {"filter": [
-            date_filter,
+        "query": {"bool": {"filter": base + [
             {"terms": {"Data.administrationStatus.keyword": [
                 "BENEFICIARY_INELIGIBLE", "INELIGIBLE",
                 "BENEFICIARY_REFERRED", "BENEFICIARY_DIED",
@@ -255,7 +294,7 @@ def _load_targets(cfg):
     if csv_path.startswith("https://docs.google.com/spreadsheets/"):
         import re
         import gspread
-        from oauth2client.service_account import ServiceAccountCredentials
+        from google.oauth2.service_account import Credentials
         from dotenv import load_dotenv
         load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
@@ -267,12 +306,14 @@ def _load_targets(cfg):
         gid_m = re.search(r"[#&]gid=(\d+)", csv_path)
 
         creds_path = os.getenv("GOOGLE_CREDENTIALS_PATH")
-        creds = ServiceAccountCredentials.from_json_keyfile_name(
+        creds = Credentials.from_service_account_file(
             creds_path,
-            ["https://spreadsheets.google.com/feeds",
-             "https://www.googleapis.com/auth/drive"],
+            scopes=[
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive",
+            ],
         )
-        client = gspread.authorize(creds)
+        client = gspread.Client(auth=creds)
         spreadsheet = client.open_by_key(sheet_id)
         if gid_m:
             ws = next(

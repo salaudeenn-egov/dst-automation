@@ -38,18 +38,19 @@ def _update_sheet_status(cfg, status, step_failed="", error_msg="", drive_link="
     """Append a row to the Run Log tab in the config Google Sheet."""
     from datetime import datetime
     import gspread
-    from oauth2client.service_account import ServiceAccountCredentials
+    from google.oauth2.service_account import Credentials
 
     try:
         creds_path = os.getenv("GOOGLE_CREDENTIALS_PATH")
         sheet_id   = os.getenv("GOOGLE_SHEET_ID")
         if not creds_path or not sheet_id:
             return
-        creds = ServiceAccountCredentials.from_json_keyfile_name(
+        creds = Credentials.from_service_account_file(
             creds_path,
-            ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"],
+            scopes=["https://www.googleapis.com/auth/spreadsheets",
+                    "https://www.googleapis.com/auth/drive"],
         )
-        ws  = gspread.authorize(creds).open_by_key(sheet_id).worksheet("Run Log")
+        ws  = gspread.Client(auth=creds).open_by_key(sheet_id).worksheet("Run Log")
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         row = [
             now,

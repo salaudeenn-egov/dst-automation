@@ -4,7 +4,7 @@ requests>=2.31
 urllib3>=2.0
 pandas>=2.0
 gspread>=6.0
-oauth2client
+google-auth>=2.0
 google-api-python-client>=2.100
 anthropic>=0.30
 python-dotenv
