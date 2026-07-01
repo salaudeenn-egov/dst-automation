@@ -510,7 +510,7 @@ def run(cfg):
             ["LGA", "Health Facility", "Username", "User ID"]
         ].reset_index(drop=True)
         df_ns.insert(0, "#", range(1, len(df_ns) + 1))
-        ws_ns = wb.create_sheet("NOT SYNCED BY 17:30")
+        ws_ns = wb.create_sheet("NOT SYNCED BY 1730")
         _write_df(ws_ns, df_ns)
         log.info(f"  not synced by 17:30 UTC: {len(not_synced):,} CDDs")
 

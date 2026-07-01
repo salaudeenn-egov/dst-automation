@@ -397,7 +397,6 @@ def _read_previous_report(cfg):
     Returns the full paragraph text, or empty string if nothing found.
     """
     import glob as _glob
-    from datetime import datetime
 
     state  = str(cfg.get("state_name", "")).strip().replace(" ", "_")
     day    = cfg["DAY"]
@@ -897,7 +896,7 @@ def run(cfg):
     perf_link = ""
     sync_link = ""
     try:
-        import notify as _notify
+        from pipeline import notify as _notify
         _now_hm    = datetime.now().strftime("%H:%M")
         perf_title = f"{cfg['state_name']} Day {cfg['DAY']} Performance Data — {cfg['DATE_LABEL']} {_now_hm}"
         sync_title = f"{cfg['state_name']} Day {cfg['DAY']} CDD Sync Data — {cfg['DATE_LABEL']} {_now_hm}"
@@ -1144,17 +1143,22 @@ def run(cfg):
     add_heading(doc, "6.  Conclusion", 4)
     add_para(doc, conclusion, size=10)
 
-    # Disclaimer footer
-    from datetime import datetime, timezone
+    # Disclaimer — page footer (appears on every page)
+    from datetime import timezone
     extracted_at = datetime.now(timezone.utc).strftime("%H:%M UTC")
-    doc.add_paragraph()
     disclaimer = (
-        f"Note:  Data snapshot as at {cfg['DATE_LABEL']}, {extracted_at}. "
-        f"Figures in the AI-generated narrative are approximations — refer to the DIGIT HCM dashboard for verified values."
+        f"Data extracted from DIGIT HCM as at {cfg['DATE_LABEL']}, {extracted_at}. "
+        f"Figures are subject to change as field teams synchronise — refer to the DIGIT HCM dashboard for current data."
     )
-    p = add_para(doc, disclaimer, size=8, color=GREY_RGB)
-    p.paragraph_format.left_indent  = Pt(0)
-    p.paragraph_format.space_before = Pt(4)
+    section = doc.sections[0]
+    section.footer_distance = Cm(0.8)
+    footer_para = section.footer.paragraphs[0]
+    footer_para.clear()
+    footer_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = footer_para.add_run(disclaimer)
+    run.font.size = Pt(7)
+    run.font.color.rgb = GREY_RGB
+    run.font.name = FONT
 
     out = cfg["docx_path"]
     doc.save(out)
