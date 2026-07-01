@@ -104,10 +104,16 @@ def build(row):
             f"[{row.get('state_name')}] campaign_start / campaign_end missing or unparseable"
         )
 
+    if not os.getenv("ES_URL"):
+        raise ValueError("ES_URL not set in .env — cannot connect to Elasticsearch")
+
     today = extract_date
     in_window = campaign_start <= extract_date <= campaign_end
 
-    campaign_days_cfg = int(row.get("campaign_days", 4) or 4)
+    try:
+        campaign_days_cfg = int(float(row.get("campaign_days", 4) or 4))
+    except (ValueError, TypeError):
+        campaign_days_cfg = 4
     day = (today - campaign_start).days + 1
     day = max(1, min(day, campaign_days_cfg))
 
@@ -184,9 +190,9 @@ def build(row):
 
         # targets / counts
         "target_csv":      str(row.get("target_csv", "")).strip(),
-        "hfs_total":       int(row.get("hfs_total", 0) or 0),
-        "flws_total":      int(row.get("flws_total", 0) or 0),
-        "lgas_total":      int(row.get("lgas_total", 0) or 0),
+        "hfs_total":       int(float(row.get("hfs_total", 0) or 0)),
+        "flws_total":      int(float(row.get("flws_total", 0) or 0)),
+        "lgas_total":      int(float(row.get("lgas_total", 0) or 0)),
 
         # output
         "out_dir":         out_dir,

@@ -346,9 +346,9 @@ def _load_targets(cfg):
         sheet_id = m.group(1)
         gid_m = re.search(r"[#&]gid=(\d+)", csv_path)
 
-        creds_path = os.getenv("GOOGLE_CREDENTIALS_PATH")
+        from pipeline.config import _resolve_creds_path
         creds = Credentials.from_service_account_file(
-            creds_path,
+            _resolve_creds_path(),
             scopes=[
                 "https://www.googleapis.com/auth/spreadsheets",
                 "https://www.googleapis.com/auth/drive",
@@ -498,13 +498,13 @@ def _aggregate_batch(task_hits, name_map, hh_name_map, fac_data, cfg):
             else:
                 m["drug1"] += 1
 
-        # dedup: store hash(tuple) — uses ~28 bytes vs ~200 bytes for full tuple
+        # dedup: full-string key avoids hash collisions
         if child_name and age is not None:
-            key_hash = hash((hh_head.lower(), child_name.lower(), ward.lower(), age))
-            if key_hash in m["seen_keys"]:
+            dedup_key = f"{hh_head.lower()}|{child_name.lower()}|{ward.lower()}|{age}"
+            if dedup_key in m["seen_keys"]:
                 m["duplicates"] += 1
             else:
-                m["seen_keys"].add(key_hash)
+                m["seen_keys"].add(dedup_key)
 
 
 def _finalize_fac_data(fac_data, target_map, cfg):

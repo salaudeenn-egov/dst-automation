@@ -506,7 +506,9 @@ def run(cfg):
             r for r in all_rows
             if r[lookup_key].lower() not in synced_keys_1730
         ]
-        df_ns = pd.DataFrame(not_synced)[
+        df_ns = pd.DataFrame(not_synced if not_synced else [],
+                             columns=["LGA", "Health Facility", "Username", "User ID",
+                                      "Days Synced", "Sync Dates", "Status"])[
             ["LGA", "Health Facility", "Username", "User ID"]
         ].reset_index(drop=True)
         df_ns.insert(0, "#", range(1, len(df_ns) + 1))

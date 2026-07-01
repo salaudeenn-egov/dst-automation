@@ -177,11 +177,17 @@ def run(cfg, docx_path, slack_text, partner_docx_path=None):
     # Partner channel — report without DQ sections (if configured)
     partner_channel = cfg.get("slack_channel_partners", "")
     if partner_channel and partner_docx_path and os.path.exists(partner_docx_path):
+        # Upload and post in separate try blocks so Slack post fires even if Drive fails
+        partner_link = ""
         try:
             from datetime import datetime as _dt2
             partner_title = (f"{cfg['state_name']} Day {cfg['DAY']} Report — "
                              f"{cfg['DATE_LABEL']} {_dt2.now().strftime('%H:%M')}")
             partner_link = _upload_to_drive(partner_docx_path, partner_title)
+        except Exception as e:
+            log.warning(f"[notify] Partner Drive upload failed (non-fatal): {e}")
+
+        try:
             partner_msg = slack_text
             if partner_link:
                 partner_msg = f"{slack_text}\n\nFull report: {partner_link}"

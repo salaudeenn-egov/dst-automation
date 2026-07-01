@@ -65,11 +65,14 @@ log = logging.getLogger("scheduler")
 
 # ── pipeline ───────────────────────────────────────────────────────────────────
 
+import threading as _threading
+_campaign_locks = {}   # state_name -> Lock — prevents overlapping runs for same campaign
+
+
 def _run_campaign_thread(raw_row):
     """Wrapper that runs _run_campaign in a background thread so parallel schedules don't block."""
-    import threading
-    t = threading.Thread(target=_run_campaign, args=(raw_row,), daemon=True,
-                         name=f"dst-{raw_row.get('state_name','?')}")
+    t = _threading.Thread(target=_run_campaign, args=(raw_row,), daemon=True,
+                          name=f"dst-{raw_row.get('state_name','?')}")
     t.start()
 
 
@@ -77,10 +80,16 @@ def _run_campaign(raw_row):
     from pipeline import config, analyze, cdd_sync, report, notify
 
     state = raw_row.get("state_name", "?")
-    log.info(f"[{state}] pipeline triggered at {datetime.now().strftime('%H:%M')}")
+
+    # Per-campaign lock — skip this run if the previous one is still in progress
+    lock = _campaign_locks.setdefault(state, _threading.Lock())
+    if not lock.acquire(blocking=False):
+        log.warning(f"[{state}] previous run still in progress — skipping this trigger")
+        return
+
     try:
-        # Re-fetch row from sheet so any config changes (channel, number, active)
-        # are picked up at every run without waiting for midnight reload
+        log.info(f"[{state}] pipeline triggered at {datetime.now().strftime('%H:%M')}")
+        # Re-fetch row from sheet so any config changes are picked up without restart
         try:
             fresh_rows = config.get_active_rows()
             match = next(
@@ -96,18 +105,31 @@ def _run_campaign(raw_row):
         except Exception as e:
             log.warning(f"[{state}] sheet refresh failed (using cached): {e}")
 
-        cfg = config.build(raw_row)
+        try:
+            cfg = config.build(raw_row)
+        except Exception as e:
+            log.error(f"[{state}] config build FAILED: {e}", exc_info=True)
+            return
+
         if not cfg["active"]:
             log.info(f"[{state}] inactive — skip"); return
         if not cfg["in_campaign_window"]:
             log.info(f"[{state}] outside campaign window — skip"); return
+
         analyze.run(cfg)
-        cdd_sync.run(cfg)
+
+        try:
+            cdd_sync.run(cfg)
+        except Exception as e:
+            log.error(f"[{state}] cdd_sync FAILED (non-fatal — continuing to report): {e}", exc_info=True)
+
         docx, partner_docx, slack_text = report.run(cfg)
         notify.run(cfg, docx, slack_text, partner_docx_path=partner_docx)
         log.info(f"[{state}] pipeline complete")
     except Exception as e:
         log.error(f"[{state}] FAILED: {e}", exc_info=True)
+    finally:
+        lock.release()
 
 
 # ── schedule builder ───────────────────────────────────────────────────────────
@@ -119,7 +141,10 @@ def _reload_schedule():
         rows = cfg_module.get_active_rows()
     except Exception as e:
         log.error(f"Failed to read Google Sheet — keeping existing schedule: {e}")
-        return  # keep existing jobs, try again next hour
+        # ensure the hourly reload job survives even if this call came from start()
+        if not any(j.job_func.func == _reload_schedule for j in schedule.get_jobs()):
+            schedule.every(1).hours.do(_reload_schedule)
+        return
 
     # Only clear and rebuild after a successful Sheet read
     schedule.clear()

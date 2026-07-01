@@ -36,7 +36,7 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)s  %(message)s",
     handlers=[
         logging.FileHandler(_log_file, encoding="utf-8"),
-        logging.StreamHandler(open(sys.stdout.fileno(), mode="w", encoding="utf-8", closefd=False)),
+        logging.StreamHandler(sys.stdout),
     ],
 )
 log = logging.getLogger(__name__)
@@ -60,7 +60,12 @@ def _update_sheet_status(cfg, status, step_failed="", error_msg="", drive_link="
             scopes=["https://www.googleapis.com/auth/spreadsheets",
                     "https://www.googleapis.com/auth/drive"],
         )
-        ws  = gspread.Client(auth=creds).open_by_key(sheet_id).worksheet("Run Log")
+        spreadsheet = gspread.Client(auth=creds).open_by_key(sheet_id)
+        try:
+            ws = spreadsheet.worksheet("Run Log")
+        except gspread.WorksheetNotFound:
+            ws = spreadsheet.add_worksheet("Run Log", rows=1000, cols=10)
+            ws.append_row(["Timestamp","State","Campaign","Day","Time","Status","Step Failed","Error","Drive Link"])
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         row = [
             now,
@@ -100,8 +105,13 @@ def _slack_error(cfg_or_channel, state, step, error):
 
 
 def run_campaign(row):
-    cfg = config.build(row)
-    state = cfg["state_name"]
+    state = str(row.get("state_name", "unknown")).strip()
+    try:
+        cfg = config.build(row)
+    except Exception as e:
+        log.error(f"[{state}] config build FAILED: {e}", exc_info=True)
+        _slack_error(os.getenv("SLACK_CHANNEL", ""), state, "config", e)
+        return
 
     if not cfg["active"]:
         log.info(f"[{state}] active=FALSE — skipped")

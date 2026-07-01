@@ -162,6 +162,9 @@ def add_para(doc, text, style="Normal", size=None, color=None, bold=False):
 
 def _load_perf(path, drug_type):
     wb = openpyxl.load_workbook(path, read_only=True)
+    if "ALL FACILITIES" not in wb.sheetnames:
+        wb.close()
+        raise FileNotFoundError(f"'ALL FACILITIES' tab missing in {path} — analyze.py may have failed mid-write")
     ws = wb["ALL FACILITIES"]
     rows_raw = [
         r for r in ws.iter_rows(min_row=3, values_only=True)
@@ -446,6 +449,9 @@ def _claude(prompt, max_tokens=400):
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],
         )
+        if not resp.content:
+            log.warning("Claude API returned empty content list")
+            return "[Narrative not generated — empty response]"
         return resp.content[0].text.strip()
     except Exception as e:
         log.warning(f"Claude API call failed (non-fatal): {e}")
@@ -457,8 +463,8 @@ def _conclusion_prompt(cfg, g, cov_pct, lga_d, sync_rows, sync_time_stats, prev_
                     if lga_d[l]["target"] else 0, default="N/A")
     worst_lga = min(lga_d, key=lambda l: lga_d[l]["treated"] / lga_d[l]["target"] * 100
                     if lga_d[l]["target"] else 100, default="N/A")
-    total_cdds  = sum(int(r[2] or 0) for r in sync_rows if r[2])
-    synced_cdds = sum(int(r[3] or 0) for r in sync_rows if r[3])
+    total_cdds  = sum(int(r[2] or 0) for r in sync_rows if len(r) > 2 and r[2])
+    synced_cdds = sum(int(r[3] or 0) for r in sync_rows if len(r) > 3 and r[3])
     sync_pct    = f"{synced_cdds/total_cdds*100:.1f}%" if total_cdds else "N/A"
     by_17_str   = ""
     if sync_time_stats:
@@ -492,9 +498,9 @@ Rules: formal tone, plain text only, no bullet points, no headings, no emojis.""
 
 
 def _issues_prompt(cfg, g, cov_pct, lga_d, facilities, sync_rows, sync_time_stats, prev_report):
-    total_cdds  = sum(int(r[2] or 0) for r in sync_rows if r[2])
-    synced_cdds = sum(int(r[3] or 0) for r in sync_rows if r[3])
-    never       = sum(int(r[6] or 0) for r in sync_rows if r[6])
+    total_cdds  = sum(int(r[2] or 0) for r in sync_rows if len(r) > 2 and r[2])
+    synced_cdds = sum(int(r[3] or 0) for r in sync_rows if len(r) > 3 and r[3])
+    never       = sum(int(r[6] or 0) for r in sync_rows if len(r) > 6 and r[6])
     sync_pct    = f"{synced_cdds/total_cdds*100:.1f}%" if total_cdds else "N/A"
 
     worst_sync = sorted(
@@ -572,8 +578,8 @@ def _claude_issues(cfg, g, cov_pct, lga_d, facilities, sync_rows, sync_time_stat
 
 
 def _slack_prompt(cfg, g, cov_pct, docx_name, sync_rows, sync_time_stats, prev_report):
-    total_cdds  = sum(int(r[2] or 0) for r in sync_rows if r[2])
-    synced_cdds = sum(int(r[3] or 0) for r in sync_rows if r[3])
+    total_cdds  = sum(int(r[2] or 0) for r in sync_rows if len(r) > 2 and r[2])
+    synced_cdds = sum(int(r[3] or 0) for r in sync_rows if len(r) > 3 and r[3])
     sync_pct    = f"{synced_cdds/total_cdds*100:.1f}%" if total_cdds else "N/A"
     by_17_str = ""
     if sync_time_stats:
@@ -812,9 +818,9 @@ def _dq_summary_table(doc, g):
 
 
 def _sync_table(doc, sync_rows, cfg, sync_time_stats=None):
-    total_cdds  = sum(int(r[2] or 0) for r in sync_rows if r[2])
-    synced_cdds = sum(int(r[3] or 0) for r in sync_rows if r[3])
-    never       = sum(int(r[6] or 0) for r in sync_rows if r[6])
+    total_cdds  = sum(int(r[2] or 0) for r in sync_rows if len(r) > 2 and r[2])
+    synced_cdds = sum(int(r[3] or 0) for r in sync_rows if len(r) > 3 and r[3])
+    never       = sum(int(r[6] or 0) for r in sync_rows if len(r) > 6 and r[6])
     sync_pct    = f"{synced_cdds/total_cdds*100:.1f}%" if total_cdds else "N/A"
 
     add_heading(doc, "5.1  FLW Sync Summary", 5)
@@ -893,9 +899,9 @@ def _build_doc(cfg, *, g, cov_pct, lga_d, facilities, hfs_active, lgas_total,
     doc.add_paragraph()
 
     # Sync totals needed for overview table
-    total_cdds  = sum(int(r[2] or 0) for r in sync_rows if r[2])
-    synced_cdds = sum(int(r[3] or 0) for r in sync_rows if r[2])
-    never_cdds  = sum(int(r[6] or 0) for r in sync_rows if r[6])
+    total_cdds  = sum(int(r[2] or 0) for r in sync_rows if len(r) > 2 and r[2])
+    synced_cdds = sum(int(r[3] or 0) for r in sync_rows if len(r) > 2 and r[2])
+    never_cdds  = sum(int(r[6] or 0) for r in sync_rows if len(r) > 6 and r[6])
     sync_pct_ov = f"{synced_cdds/total_cdds*100:.1f}%" if total_cdds else "N/A"
     by_17_val   = "—"
     if sync_time_stats:
