@@ -191,7 +191,8 @@ def build(row):
         # output
         "out_dir":         out_dir,
         "google_sheet_id": str(row.get("google_sheet_id", "")).strip(),
-        "slack_channel":   str(row.get("slack_channel", "")).strip(),
+        "slack_channel":          str(row.get("slack_channel", "")).strip(),
+        "slack_channel_partners": str(row.get("slack_channel_partners", "")).strip(),
 
         # scheduler — comma-separated 24h times e.g. "11:00,14:00,17:00,20:00"
         "report_times": [
@@ -205,4 +206,7 @@ def build(row):
         "docx_path":  os.path.join(out_dir,
                                    f"{str(row.get('state_name','')).strip().replace(' ','_')}"
                                    f"_Day{day}_Report_{datetime.now().strftime('%H%M')}.docx"),
+        "partner_docx_path": os.path.join(out_dir,
+                                          f"{str(row.get('state_name','')).strip().replace(' ','_')}"
+                                          f"_Day{day}_PartnerReport_{datetime.now().strftime('%H%M')}.docx"),
     }

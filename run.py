@@ -132,7 +132,7 @@ def run_campaign(row):
         # non-fatal — continue to report with no sync data
 
     try:
-        docx_path, slack_text = report.run(cfg)
+        docx_path, partner_docx_path, slack_text = report.run(cfg)
     except Exception as e:
         log.error(f"[{state}] report FAILED: {e}", exc_info=True)
         _slack_error(cfg, state, "report", e)
@@ -141,7 +141,8 @@ def run_campaign(row):
 
     drive_link = ""
     try:
-        drive_link = notify.run(cfg, docx_path, slack_text) or ""
+        drive_link = notify.run(cfg, docx_path, slack_text,
+                                partner_docx_path=partner_docx_path) or ""
     except Exception as e:
         log.error(f"[{state}] notify FAILED: {e}", exc_info=True)
         _slack_error(cfg, state, "notify", e)

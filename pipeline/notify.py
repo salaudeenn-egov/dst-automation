@@ -136,11 +136,11 @@ def upload_file(path, title):
 
 # ── public entry point ─────────────────────────────────────────────────────────
 
-def run(cfg, docx_path, slack_text):
+def run(cfg, docx_path, slack_text, partner_docx_path=None):
     token   = os.getenv("SLACK_TOKEN")
     channel = cfg.get("slack_channel", "")
 
-    # Upload report to Drive
+    # Upload main report to Drive
     drive_link = None
     if docx_path and os.path.exists(docx_path):
         try:
@@ -158,17 +158,38 @@ def run(cfg, docx_path, slack_text):
         log.warning("[notify] slack_channel not set — skipping Slack")
         return
 
+    from datetime import datetime, timezone
+    ts = f"{datetime.now(timezone.utc).strftime('%H:%M')} UTC on {cfg['DATE_LABEL']}"
+
+    # Main channel — full report
     try:
-        from datetime import datetime, timezone
         message = slack_text
         if drive_link:
             message = f"{slack_text}\n\nFull report: {drive_link}"
-        message += f"\n\nData extracted at {datetime.now(timezone.utc).strftime('%H:%M')} UTC on {cfg['DATE_LABEL']}."
+        message += f"\n\nData extracted at {ts}."
         message += "\n[Beta] This report is auto-generated. Please verify before acting on the data."
         _slack_post(channel, message, token)
-        log.info(f"[notify] Slack post done → {channel}")
+        log.info(f"[notify] Slack post done -> {channel}")
     except Exception as e:
         log.error(f"[notify] Slack failed: {e}")
         raise
+
+    # Partner channel — report without DQ sections (if configured)
+    partner_channel = cfg.get("slack_channel_partners", "")
+    if partner_channel and partner_docx_path and os.path.exists(partner_docx_path):
+        try:
+            from datetime import datetime as _dt2
+            partner_title = (f"{cfg['state_name']} Day {cfg['DAY']} Report — "
+                             f"{cfg['DATE_LABEL']} {_dt2.now().strftime('%H:%M')}")
+            partner_link = _upload_to_drive(partner_docx_path, partner_title)
+            partner_msg = slack_text
+            if partner_link:
+                partner_msg = f"{slack_text}\n\nFull report: {partner_link}"
+            partner_msg += f"\n\nData extracted at {ts}."
+            partner_msg += "\n[Beta] This report is auto-generated. Please verify before acting on the data."
+            _slack_post(partner_channel, partner_msg, token)
+            log.info(f"[notify] Partner Slack post done -> {partner_channel}")
+        except Exception as e:
+            log.warning(f"[notify] Partner channel post failed (non-fatal): {e}")
 
     return drive_link

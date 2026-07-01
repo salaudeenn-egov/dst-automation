@@ -103,8 +103,8 @@ def _run_campaign(raw_row):
             log.info(f"[{state}] outside campaign window — skip"); return
         analyze.run(cfg)
         cdd_sync.run(cfg)
-        docx, slack_text = report.run(cfg)
-        notify.run(cfg, docx, slack_text)
+        docx, partner_docx, slack_text = report.run(cfg)
+        notify.run(cfg, docx, slack_text, partner_docx_path=partner_docx)
         log.info(f"[{state}] pipeline complete")
     except Exception as e:
         log.error(f"[{state}] FAILED: {e}", exc_info=True)

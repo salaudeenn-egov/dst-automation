@@ -853,77 +853,14 @@ def _sync_table(doc, sync_rows, cfg, sync_time_stats=None):
                 dat(tr.cells[ci], val, alt=alt)
 
 
-# ── public entry point ─────────────────────────────────────────────────────────
+# ── document builder ──────────────────────────────────────────────────────────
 
-def run(cfg):
-    log.info(f"[report] {cfg['state_name']} Day {cfg['DAY']} ...")
-
-    perf_path = cfg["perf_xlsx"]
-    sync_path = cfg["sync_xlsx"]
-
-    if not os.path.exists(perf_path):
-        raise FileNotFoundError(f"Performance Excel not found: {perf_path}")
-
-    drug_type  = cfg["drug_type"]
-    d1_label   = "SPAQ2 (12-59m)" if drug_type == "SPAQ" else "AZM 12-59m"
-    d2_label   = "SPAQ1 (3-11m)"  if drug_type == "SPAQ" else "AZM 1-11m"
-
-    lga_d, facilities          = _load_perf(perf_path, drug_type)
-    sync_rows, sync_time_stats = _load_sync_summary(sync_path)
-    g                          = _grand_totals(lga_d)
-    cov_pct           = _cov_str(g["treated"], g["target"])
-    hfs_active        = len({f["lga"] for f in facilities})
-    lgas_total        = cfg.get("lgas_total") or len(lga_d)
-
-    log.info(f"  {len(facilities)} facilities, {len(lga_d)} LGAs, coverage {cov_pct}")
-
-    # Load day-by-day totals for cumulative stats + chart
-    days_data   = _load_all_days_perf(cfg)
-    cum_records = sum(d["records"] for d in days_data)
-    cum_treated = sum(d["treated"] for d in days_data)
-    cum_target  = sum(d["target"]  for d in days_data)
-    cum_cov     = f"{cum_treated/cum_target*100:.1f}%" if cum_target else "N/A"
-    chart_path  = _generate_progress_chart(days_data, cfg)
-
-    # Read previous report for trend context
-    prev_report = _read_previous_report(cfg)
-    if prev_report:
-        log.info(f"  previous report loaded ({len(prev_report)} chars)")
-    else:
-        log.info("  no previous report — first extract today")
-
-    # Upload raw Excel files to Drive so rows in the issues table can link to them
-    perf_link = ""
-    sync_link = ""
-    try:
-        from pipeline import notify as _notify
-        _now_hm    = datetime.now().strftime("%H:%M")
-        perf_title = f"{cfg['state_name']} Day {cfg['DAY']} Performance Data — {cfg['DATE_LABEL']} {_now_hm}"
-        sync_title = f"{cfg['state_name']} Day {cfg['DAY']} CDD Sync Data — {cfg['DATE_LABEL']} {_now_hm}"
-        log.info("  uploading performance Excel to Drive ...")
-        perf_link = _notify.upload_file(perf_path, perf_title)
-        if sync_path and os.path.exists(sync_path):
-            log.info("  uploading CDD sync Excel to Drive ...")
-            sync_link = _notify.upload_file(sync_path, sync_title)
-    except Exception as e:
-        log.warning(f"  Drive upload of Excels failed (non-fatal): {e}")
-
-    # Claude calls
-    log.info("  calling Claude for issues log ...")
-    issues_data = _claude_issues(cfg, g, cov_pct, lga_d, facilities,
-                                 sync_rows, sync_time_stats, prev_report)
-    log.info(f"  {len(issues_data)} issues generated")
-    log.info("  calling Claude for conclusion ...")
-    conclusion = _claude(_conclusion_prompt(cfg, g, cov_pct, lga_d, sync_rows, sync_time_stats, prev_report),
-                         max_tokens=500)
-    log.info("  calling Claude for Slack text ...")
-    slack_text = _claude(
-        _slack_prompt(cfg, g, cov_pct, os.path.basename(cfg["docx_path"]),
-                      sync_rows, sync_time_stats, prev_report),
-        max_tokens=300,
-    )
-
-    # ── Build document ────────────────────────────────────────────────────────
+def _build_doc(cfg, *, g, cov_pct, lga_d, facilities, hfs_active, lgas_total,
+               d1_label, d2_label, days_data, cum_records, cum_treated,
+               cum_target, cum_cov, sync_rows, sync_time_stats, issues_data,
+               conclusion, perf_link, sync_link, perf_path, sync_path,
+               chart_path, partner=False):
+    """Build and return a Document. partner=True omits DQ sections 3.2 and 3.5."""
     doc = Document()
     for section in doc.sections:
         section.top_margin    = Cm(1.8)
@@ -1067,22 +1004,27 @@ def run(cfg):
     _perf_table(doc, lga_d)
     doc.add_paragraph()
 
-    add_heading(doc, "3.2  Data Quality by LGA", 5)
-    _dq_table(doc, lga_d)
-    doc.add_paragraph()
+    if not partner:
+        add_heading(doc, "3.2  Data Quality by LGA", 5)
+        _dq_table(doc, lga_d)
+        doc.add_paragraph()
 
-    add_heading(doc, "3.3  Facility Performance Analysis", 5)
+    fac_sec     = "3.3" if not partner else "3.2"
+    nonadmin_sec = "3.4" if not partner else "3.3"
+
+    add_heading(doc, f"{fac_sec}  Facility Performance Analysis", 5)
     add_para(doc, "LOW coverage (<70%) and Low Activity (<10 records) facilities. Sorted by Population Coverage ascending.", size=9, bold=True)
     _fac_perf_table(doc, facilities, perf_link=perf_link)
     doc.add_paragraph()
 
-    add_heading(doc, "3.4  Non-Administration Analysis", 5)
+    add_heading(doc, f"{nonadmin_sec}  Non-Administration Analysis", 5)
     _non_admin_table(doc, g)
     doc.add_paragraph()
 
-    add_heading(doc, "3.5  Data Quality Summary", 5)
-    _dq_summary_table(doc, g)
-    doc.add_paragraph()
+    if not partner:
+        add_heading(doc, "3.5  Data Quality Summary", 5)
+        _dq_summary_table(doc, g)
+        doc.add_paragraph()
 
     # Section 4 — Campaign Progress (day-by-day)
     add_heading(doc, f"4.  Campaign Progress  —  Days 1 to {cfg['DAY']}", 4)
@@ -1160,7 +1102,106 @@ def run(cfg):
     run.font.color.rgb = GREY_RGB
     run.font.name = FONT
 
+    return doc
+
+
+# ── public entry point ─────────────────────────────────────────────────────────
+
+def run(cfg):
+    log.info(f"[report] {cfg['state_name']} Day {cfg['DAY']} ...")
+
+    perf_path = cfg["perf_xlsx"]
+    sync_path = cfg["sync_xlsx"]
+
+    if not os.path.exists(perf_path):
+        raise FileNotFoundError(f"Performance Excel not found: {perf_path}")
+
+    drug_type  = cfg["drug_type"]
+    d1_label   = "SPAQ2 (12-59m)" if drug_type == "SPAQ" else "AZM 12-59m"
+    d2_label   = "SPAQ1 (3-11m)"  if drug_type == "SPAQ" else "AZM 1-11m"
+
+    lga_d, facilities          = _load_perf(perf_path, drug_type)
+    sync_rows, sync_time_stats = _load_sync_summary(sync_path)
+    g                          = _grand_totals(lga_d)
+    cov_pct           = _cov_str(g["treated"], g["target"])
+    hfs_active        = len({f["lga"] for f in facilities})
+    lgas_total        = cfg.get("lgas_total") or len(lga_d)
+
+    log.info(f"  {len(facilities)} facilities, {len(lga_d)} LGAs, coverage {cov_pct}")
+
+    # Load day-by-day totals for cumulative stats + chart
+    days_data   = _load_all_days_perf(cfg)
+    cum_records = sum(d["records"] for d in days_data)
+    cum_treated = sum(d["treated"] for d in days_data)
+    cum_target  = sum(d["target"]  for d in days_data)
+    cum_cov     = f"{cum_treated/cum_target*100:.1f}%" if cum_target else "N/A"
+    chart_path  = _generate_progress_chart(days_data, cfg)
+
+    # Read previous report for trend context
+    prev_report = _read_previous_report(cfg)
+    if prev_report:
+        log.info(f"  previous report loaded ({len(prev_report)} chars)")
+    else:
+        log.info("  no previous report — first extract today")
+
+    # Upload raw Excel files to Drive so rows in the issues table can link to them
+    perf_link = ""
+    sync_link = ""
+    try:
+        from pipeline import notify as _notify
+        _now_hm    = datetime.now().strftime("%H:%M")
+        perf_title = f"{cfg['state_name']} Day {cfg['DAY']} Performance Data — {cfg['DATE_LABEL']} {_now_hm}"
+        sync_title = f"{cfg['state_name']} Day {cfg['DAY']} CDD Sync Data — {cfg['DATE_LABEL']} {_now_hm}"
+        log.info("  uploading performance Excel to Drive ...")
+        perf_link = _notify.upload_file(perf_path, perf_title)
+        if sync_path and os.path.exists(sync_path):
+            log.info("  uploading CDD sync Excel to Drive ...")
+            sync_link = _notify.upload_file(sync_path, sync_title)
+    except Exception as e:
+        log.warning(f"  Drive upload of Excels failed (non-fatal): {e}")
+
+    # Claude calls
+    log.info("  calling Claude for issues log ...")
+    issues_data = _claude_issues(cfg, g, cov_pct, lga_d, facilities,
+                                 sync_rows, sync_time_stats, prev_report)
+    log.info(f"  {len(issues_data)} issues generated")
+    log.info("  calling Claude for conclusion ...")
+    conclusion = _claude(_conclusion_prompt(cfg, g, cov_pct, lga_d, sync_rows, sync_time_stats, prev_report),
+                         max_tokens=500)
+    log.info("  calling Claude for Slack text ...")
+    slack_text = _claude(
+        _slack_prompt(cfg, g, cov_pct, os.path.basename(cfg["docx_path"]),
+                      sync_rows, sync_time_stats, prev_report),
+        max_tokens=300,
+    )
+
+    # Bundle render params — shared between main + partner docs
+    _render = dict(
+        g=g, cov_pct=cov_pct, lga_d=lga_d, facilities=facilities,
+        hfs_active=hfs_active, lgas_total=lgas_total,
+        d1_label=d1_label, d2_label=d2_label,
+        days_data=days_data, cum_records=cum_records, cum_treated=cum_treated,
+        cum_target=cum_target, cum_cov=cum_cov,
+        sync_rows=sync_rows, sync_time_stats=sync_time_stats,
+        issues_data=issues_data, conclusion=conclusion,
+        perf_link=perf_link, sync_link=sync_link,
+        perf_path=perf_path, sync_path=sync_path,
+        chart_path=chart_path,
+    )
+
+    # Main report (full — includes all sections)
+    doc = _build_doc(cfg, **_render, partner=False)
     out = cfg["docx_path"]
     doc.save(out)
     log.info(f"[report] saved -> {out}")
-    return out, slack_text
+
+    # Partner report (omits DQ sections 3.2 and 3.5)
+    partner_docx_path = None
+    if cfg.get("slack_channel_partners"):
+        partner_doc = _build_doc(cfg, **_render, partner=True)
+        partner_out = cfg["partner_docx_path"]
+        partner_doc.save(partner_out)
+        log.info(f"[report] partner doc saved -> {partner_out}")
+        partner_docx_path = partner_out
+
+    return out, partner_docx_path, slack_text
