@@ -449,15 +449,16 @@ def _read_previous_report(cfg):
 
 # ── Claude API ─────────────────────────────────────────────────────────────────
 
-def _claude(prompt, max_tokens=400):
+def _claude(prompt, max_tokens=300):
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         log.warning("ANTHROPIC_API_KEY not set — returning placeholder text")
         return "[Narrative not generated — ANTHROPIC_API_KEY missing]"
+    model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
     try:
         client = anthropic.Anthropic(api_key=api_key)
         resp = client.messages.create(
-            model="claude-sonnet-4-6",
+            model=model,
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -470,6 +471,18 @@ def _claude(prompt, max_tokens=400):
         return "[Narrative not generated — Claude API error]"
 
 
+def _extract_prev_stats(prev_report):
+    """Extract only the conclusion paragraph from a previous report to minimise input tokens."""
+    if not prev_report:
+        return ""
+    lines = [l.strip() for l in prev_report.split("\n") if l.strip()]
+    for i, line in enumerate(lines):
+        if line.startswith("6.") and "Conclusion" in line:
+            snippet = " ".join(lines[i + 1: i + 5])
+            return snippet[:400]
+    return prev_report[:300]
+
+
 def _conclusion_prompt(cfg, g, cov_pct, lga_d, sync_rows, sync_time_stats, prev_report):
     best_lga  = max(lga_d, key=lambda l: lga_d[l]["treated"] / lga_d[l]["target"] * 100
                     if lga_d[l]["target"] else 0, default="N/A")
@@ -478,35 +491,23 @@ def _conclusion_prompt(cfg, g, cov_pct, lga_d, sync_rows, sync_time_stats, prev_
     total_cdds  = sum(int(r[2] or 0) for r in sync_rows if len(r) > 2 and r[2])
     synced_cdds = sum(int(r[3] or 0) for r in sync_rows if len(r) > 3 and r[3])
     sync_pct    = f"{synced_cdds/total_cdds*100:.1f}%" if total_cdds else "N/A"
-    by_17_str   = ""
+    by17 = ""
     if sync_time_stats:
-        for label, (count, pct) in sync_time_stats.items():
-            by_17_str = f"\n- Synced by 17:00: {count:,} ({pct})"
+        for _, (count, pct) in sync_time_stats.items():
+            by17 = f", {count:,} by 17:00 ({pct})"
+    prev = _extract_prev_stats(prev_report)
 
-    prev_block = ""
-    if prev_report:
-        prev_block = (f"\n--- PREVIOUS REPORT (compare — show progress) ---\n"
-                      f"{prev_report}\n--- END ---\n")
-
-    return f"""You are writing the conclusion of a formal health campaign daily report.
-Campaign: {cfg['campaign_name']} — {cfg['state_name']}
-Day {cfg['DAY']} of {cfg['campaign_days']} ({cfg['DATE_LABEL']})
-Drug: {cfg['drug_type']}
-{prev_block}
-Statistics:
-- Daily target: {g['target']:,} | Records: {g['records']:,} | Treated: {g['treated']:,} | Coverage: {cov_pct}
-- Best LGA: {best_lga} | Weakest LGA: {worst_lga}
-- Duplicates: {g['dups']:,} | Missing child: {g['missing_child']:,}
-- FLW sync: {synced_cdds:,}/{total_cdds:,} ({sync_pct}){by_17_str}
-
-Write a conclusion paragraph of EXACTLY 5 sentences:
-1. Overall coverage vs daily target{"— compare to previous report" if prev_report else ""}.
-2. Best-performing LGA with specific numbers.
-3. Weakest LGA and operational implication.
-4. Main data quality concern and recommended action.
-5. FLW sync status and outlook for the next extract.
-
-Rules: formal tone, plain text only, no bullet points, no headings, no emojis."""
+    return (
+        f"{cfg['campaign_name']} {cfg['state_name']} Day {cfg['DAY']}/{cfg['campaign_days']} {cfg['DATE_LABEL']} {cfg['drug_type']}\n"
+        f"Coverage:{cov_pct} Treated:{g['treated']:,} Target:{g['target']:,} Records:{g['records']:,}\n"
+        f"BestLGA:{best_lga} WorstLGA:{worst_lga}\n"
+        f"Dups:{g['dups']:,} MissingChild:{g['missing_child']:,}\n"
+        f"Sync:{synced_cdds:,}/{total_cdds:,}({sync_pct}){by17}\n"
+        + (f"PrevReport:{prev}\n" if prev else "")
+        + "Write 5-sentence formal conclusion: (1)coverage vs target"
+        + (" vs previous" if prev else "")
+        + " (2)best LGA numbers (3)worst LGA implication (4)data quality action (5)sync outlook. Plain text only."
+    )
 
 
 def _issues_prompt(cfg, g, cov_pct, lga_d, facilities, sync_rows, sync_time_stats, prev_report):
@@ -514,62 +515,37 @@ def _issues_prompt(cfg, g, cov_pct, lga_d, facilities, sync_rows, sync_time_stat
     synced_cdds = sum(int(r[3] or 0) for r in sync_rows if len(r) > 3 and r[3])
     never       = sum(int(r[6] or 0) for r in sync_rows if len(r) > 6 and r[6])
     sync_pct    = f"{synced_cdds/total_cdds*100:.1f}%" if total_cdds else "N/A"
-
-    worst_sync = sorted(
+    worst_sync  = sorted(
         [(str(r[1]), int(r[6] or 0), int(r[2] or 0))
          for r in sync_rows if r[1] and int(r[2] or 0) > 0],
         key=lambda x: -x[1],
     )
-    worst_sync_str = (
-        f"{worst_sync[0][0]} worst: {worst_sync[0][1]} of {worst_sync[0][2]} never synced"
-        if worst_sync else "N/A"
-    )
-    by_17_str = ""
+    worst_str = (f"{worst_sync[0][0]}:{worst_sync[0][1]}/{worst_sync[0][2]} never synced"
+                 if worst_sync else "N/A")
+    by17 = ""
     if sync_time_stats:
-        for label, (count, pct) in sync_time_stats.items():
-            by_17_str = f"  Synced by 17:00: {count:,} ({pct})"
-
+        for _, (count, pct) in sync_time_stats.items():
+            by17 = f" by17:{count:,}({pct})"
     low_act = [f for f in facilities if f["rec"] < 10]
+    prev = _extract_prev_stats(prev_report)
     is_last = cfg["DAY"] == cfg["campaign_days"]
-    prev_block = (f"\n--- PREVIOUS REPORT (compare — mark issues RESOLVED if fixed) ---\n"
-                  f"{prev_report}\n--- END ---\n") if prev_report else ""
 
-    return f"""You are generating a structured issues log for a health campaign operations report.
-
-Campaign: {cfg['campaign_name']} — {cfg['state_name']}
-Day {cfg['DAY']} of {cfg['campaign_days']} ({'FINAL day' if is_last else 'ongoing'}) — {cfg['DATE_LABEL']}
-{prev_block}
-KEY METRICS:
-- Coverage: {cov_pct} ({g['treated']:,} treated / {g['target']:,} target)
-- CDDs: {total_cdds:,} total | {synced_cdds:,} synced ({sync_pct}) | {never:,} never synced
-{by_17_str}
-- {worst_sync_str}
-- Low activity facilities (<10 records): {len(low_act)}
-- Duplicates: {g['dups']:,} | Missing child: {g['missing_child']:,}
-
-Generate 3-5 issues. Return ONLY a JSON array — no markdown, no explanation:
-[
-  {{
-    "observation": "Concise fact with specific numbers and LGA names",
-    "status": "ACTIVE",
-    "priority": "High",
-    "notes": "Specific action for field supervisor or coordinator",
-    "data_type": "perf"
-  }}
-]
-
-Rules:
-- status: "ACTIVE" unless previous report shows issue resolved → "RESOLVED"
-- priority: "High" (blocks target), "Moderate" (needs attention), "Low" (monitor)
-- data_type: "sync" for CDD/sync issues, "perf" for coverage/facility/data-quality issues
-- observation: include specific numbers, LGA names, percentages
-- notes: actionable, field-level instruction"""
+    return (
+        f"{cfg['campaign_name']} {cfg['state_name']} Day {cfg['DAY']}/{cfg['campaign_days']} {'FINAL' if is_last else ''} {cfg['DATE_LABEL']}\n"
+        f"Coverage:{cov_pct} Treated:{g['treated']:,}/{g['target']:,}\n"
+        f"Sync:{synced_cdds:,}/{total_cdds:,}({sync_pct}) Never:{never:,}{by17} Worst:{worst_str}\n"
+        f"LowActivity(<10):{len(low_act)} Dups:{g['dups']:,} MissingChild:{g['missing_child']:,}\n"
+        + (f"PrevReport:{prev}\n" if prev else "")
+        + 'Return ONLY a JSON array of 3-5 issues, no markdown:\n'
+          '[{"observation":"...with numbers+LGA","status":"ACTIVE|RESOLVED","priority":"High|Moderate|Low",'
+          '"notes":"actionable field instruction","data_type":"perf|sync"}]'
+    )
 
 
 def _claude_issues(cfg, g, cov_pct, lga_d, facilities, sync_rows, sync_time_stats, prev_report):
     import json
     prompt = _issues_prompt(cfg, g, cov_pct, lga_d, facilities, sync_rows, sync_time_stats, prev_report)
-    raw = _claude(prompt, max_tokens=900)
+    raw = _claude(prompt, max_tokens=500)
     try:
         text = raw.strip()
         if text.startswith("```"):
@@ -593,29 +569,22 @@ def _slack_prompt(cfg, g, cov_pct, docx_name, sync_rows, sync_time_stats, prev_r
     total_cdds  = sum(int(r[2] or 0) for r in sync_rows if len(r) > 2 and r[2])
     synced_cdds = sum(int(r[3] or 0) for r in sync_rows if len(r) > 3 and r[3])
     sync_pct    = f"{synced_cdds/total_cdds*100:.1f}%" if total_cdds else "N/A"
-    by_17_str = ""
+    by17 = ""
     if sync_time_stats:
-        for label, (count, pct) in sync_time_stats.items():
-            by_17_str = f"  Synced by 17:00: {count:,} ({pct})"
+        for _, (count, pct) in sync_time_stats.items():
+            by17 = f" by17:{count:,}({pct})"
+    prev = _extract_prev_stats(prev_report)
 
-    prev_block = (f"\n--- PREVIOUS REPORT ---\n{prev_report}\n--- END ---\n") if prev_report else ""
-
-    return f"""You are writing a Slack notification for a health campaign operations team.
-
-Campaign: {cfg['campaign_name']} — {cfg['state_name']}
-Day {cfg['DAY']} of {cfg['campaign_days']}, {cfg['DATE_LABEL']}
-{prev_block}
-Stats: Target={g['target']:,} | Records={g['records']:,} | Treated={g['treated']:,} | Coverage={cov_pct}
-Data quality: Dups={g['dups']:,} | Missing child={g['missing_child']:,}
-Sync: {synced_cdds:,}/{total_cdds:,} ({sync_pct}){by_17_str}
-
-Write the Slack message in EXACTLY this format:
-Hi Team,
-
-[Line 1: coverage result and treated count — one sentence{"— compare to previous report" if prev_report else ""}]
-[Line 2: FLW sync status including synced-by-17:00 figure and most urgent action — one sentence]
-
-Rules: plain text only, no emojis, no bullet points, no asterisks, no headings. The link and footer are appended automatically — do not include them."""
+    return (
+        f"{cfg['campaign_name']} {cfg['state_name']} Day {cfg['DAY']}/{cfg['campaign_days']} {cfg['DATE_LABEL']}\n"
+        f"Coverage:{cov_pct} Treated:{g['treated']:,} Target:{g['target']:,}\n"
+        f"Sync:{synced_cdds:,}/{total_cdds:,}({sync_pct}){by17}\n"
+        + (f"Prev:{prev}\n" if prev else "")
+        + "Write Slack message exactly:\nHi Team,\n\n"
+          "[1 sentence: coverage" + (" vs previous" if prev else "") + "]\n"
+          "[1 sentence: sync status + urgent action]\n\n"
+          "Plain text only, no emojis, no bullets, no asterisks."
+    )
 
 
 # ── document builder ───────────────────────────────────────────────────────────
@@ -1192,12 +1161,12 @@ def run(cfg):
     log.info(f"  {len(issues_data)} issues generated")
     log.info("  calling Claude for conclusion ...")
     conclusion = _claude(_conclusion_prompt(cfg, g, cov_pct, lga_d, sync_rows, sync_time_stats, prev_report),
-                         max_tokens=500)
+                         max_tokens=250)
     log.info("  calling Claude for Slack text ...")
     slack_text = _claude(
         _slack_prompt(cfg, g, cov_pct, os.path.basename(cfg["docx_path"]),
                       sync_rows, sync_time_stats, prev_report),
-        max_tokens=300,
+        max_tokens=120,
     )
 
     # Bundle render params — shared between main + partner docs
