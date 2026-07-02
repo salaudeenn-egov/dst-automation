@@ -223,6 +223,40 @@ def _load_perf(path, drug_type):
     return lga_d, facilities
 
 
+def _load_ors_summary(path, secondary_product):
+    """
+    Read ORS-ZINC tab from performance Excel.
+    Returns (total, {lga: count}, {facility_name_lower: count}).
+    """
+    if not path or not secondary_product or not os.path.exists(path):
+        return 0, {}, {}
+    try:
+        wb = openpyxl.load_workbook(path, read_only=True)
+        if "ORS-ZINC" not in wb.sheetnames:
+            wb.close()
+            return 0, {}, {}
+        ws    = wb["ORS-ZINC"]
+        total = 0
+        lga_d = defaultdict(int)
+        fac_d = {}
+        for row in ws.iter_rows(min_row=3, values_only=True):
+            if not row or not row[2]:
+                continue
+            lga = str(row[0] or "").strip()
+            fac = str(row[1] or "").strip()
+            cnt = int(row[2] or 0)
+            if fac and fac.upper() not in ("TOTAL", "GRAND TOTAL"):
+                if lga:
+                    lga_d[lga] += cnt
+                fac_d[fac.lower()] = cnt
+                total += cnt
+        wb.close()
+        return total, dict(lga_d), fac_d
+    except Exception as e:
+        log.warning(f"[report] ORS summary load failed (non-fatal): {e}")
+        return 0, {}, {}
+
+
 def _load_sync_summary(path):
     """Returns (lga_rows, time_stats) where time_stats = {label: (count, pct)}."""
     if not path or not os.path.exists(path):
@@ -648,14 +682,17 @@ def _dq_table(doc, lga_d):
             dat(row.cells[ci], val, alt=alt)
 
 
-def _fac_perf_table(doc, facilities, perf_link=""):
+def _fac_perf_table(doc, facilities, perf_link="", secondary_product=""):
     """
     LOW coverage (<70%) and Low Activity (<10 records) facilities.
     Target Achievement % = Treated / Daily Target * 100.
     Pop. Coverage        = Records / Daily Target * 100.
     Daily Treatment Coverage = Treated / Records * 100.
+    If secondary_product set, appends an ORS-Zinc count column.
     Cells colour-coded: >=95% green, 70-95% amber, <70% red.
     """
+    show_ors = bool(secondary_product and any(f.get("ors_count", 0) for f in facilities))
+
     low_facs = [
         f for f in facilities
         if f["status"] in ("LOW", "LOW ACTIVITY") and f["tgt"] > 0
@@ -677,6 +714,8 @@ def _fac_perf_table(doc, facilities, perf_link=""):
         "Pop. Coverage = Records ÷ Daily Target × 100    |    "
         "Daily Treatment Coverage = Treated ÷ Records × 100"
     )
+    if show_ors:
+        formula_lines += f"    |    {secondary_product} = successful deliveries age 3-59m"
     add_para(doc, formula_lines, size=8, color=GREY_RGB)
 
     if not low_facs:
@@ -686,6 +725,9 @@ def _fac_perf_table(doc, facilities, perf_link=""):
     header = ["#", "District", "Health Facility", "Daily Target", "Records",
               "Treated", "Not Treated", "Target Achievement %",
               "Pop. Coverage", "Daily Treatment Coverage"]
+    if show_ors:
+        header.append(secondary_product)
+
     table  = doc.add_table(rows=1, cols=len(header))
     table.style = "Table Grid"
     for ci, h in enumerate(header):
@@ -708,6 +750,8 @@ def _fac_perf_table(doc, facilities, perf_link=""):
         alt = ri % 2 == 1
         vals = [ri, f["lga"], f["fac"], f"{f['tgt']:,}", f"{f['rec']:,}",
                 f"{f['treated']:,}", f"{not_trt:,}", achv_str, pop_str, trt_str]
+        if show_ors:
+            vals.append(f.get("ors_count", 0))
 
         for ci, val in enumerate(vals):
             cell = row.cells[ci]
@@ -846,7 +890,7 @@ def _build_doc(cfg, *, g, cov_pct, lga_d, facilities, hfs_active, lgas_total,
                d1_label, d2_label, days_data, cum_records, cum_treated,
                cum_target, cum_cov, sync_rows, sync_time_stats, issues_data,
                conclusion, perf_link, sync_link, perf_path, sync_path,
-               chart_path, partner=False):
+               chart_path, ors_total=0, partner=False):
     """Build and return a Document. partner=True omits DQ sections 3.2 and 3.5."""
     doc = Document()
     for section in doc.sections:
@@ -912,6 +956,12 @@ def _build_doc(cfg, *, g, cov_pct, lga_d, facilities, hfs_active, lgas_total,
         (d1_label,                        f"{g['drug1']:,}"),
         (d2_label,                        f"{g['drug2']:,}"),
         ("Not Administered",              f"{not_admin:,}"),
+    ]
+    if ors_total:
+        overview_rows.append(
+            (f"{cfg.get('secondary_product','ORS-Zinc')} Distributed (3-59m)", f"{ors_total:,}")
+        )
+    overview_rows += [
         # ── Sync ───────────────────────────────────────────────────────────
         ("CDDs Registered",               f"{total_cdds:,}"),
         ("CDDs Synced",                   f"{synced_cdds:,}  ({sync_pct_ov})"),
@@ -1008,7 +1058,8 @@ def _build_doc(cfg, *, g, cov_pct, lga_d, facilities, hfs_active, lgas_total,
 
     add_heading(doc, f"{fac_sec}  Facility Performance Analysis", 5)
     add_para(doc, "LOW coverage (<70%) and Low Activity (<10 records) facilities. Sorted by Population Coverage ascending.", size=9, bold=True)
-    _fac_perf_table(doc, facilities, perf_link=perf_link)
+    _fac_perf_table(doc, facilities, perf_link=perf_link,
+                    secondary_product=cfg.get("secondary_product", ""))
     doc.add_paragraph()
 
     add_heading(doc, f"{nonadmin_sec}  Non-Administration Analysis", 5)
@@ -1116,6 +1167,11 @@ def run(cfg):
 
     lga_d, facilities          = _load_perf(perf_path, drug_type)
     sync_rows, sync_time_stats = _load_sync_summary(sync_path)
+    ors_total, _, ors_fac      = _load_ors_summary(perf_path, cfg.get("secondary_product"))
+    # Stamp per-facility ORS count onto each facility dict
+    if ors_fac:
+        for f in facilities:
+            f["ors_count"] = ors_fac.get(f["fac"].lower(), 0)
     g                          = _grand_totals(lga_d)
     cov_pct           = _cov_str(g["treated"], g["target"])
     hfs_active        = len({f["lga"] for f in facilities})
@@ -1180,7 +1236,7 @@ def run(cfg):
         issues_data=issues_data, conclusion=conclusion,
         perf_link=perf_link, sync_link=sync_link,
         perf_path=perf_path, sync_path=sync_path,
-        chart_path=chart_path,
+        chart_path=chart_path, ors_total=ors_total,
     )
 
     # Main report (full — includes all sections)

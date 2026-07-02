@@ -188,6 +188,9 @@ def build(row):
         # share the same tenant and date range.
         "task_campaign_filter": _bool(row.get("task_campaign_filter", "FALSE")),
 
+        # secondary product (e.g. "ORS-Zinc" for Kebbi) — empty = disabled
+        "secondary_product": str(row.get("secondary_product", "")).strip(),
+
         # targets / counts
         "target_csv":      str(row.get("target_csv", "")).strip(),
         "hfs_total":       int(float(row.get("hfs_total", 0) or 0)),

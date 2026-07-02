@@ -723,6 +723,80 @@ def _aggregate(task_hits, name_map, hh_name_map, target_map, cfg):
     return results
 
 
+# ── secondary product (ORS-Zinc etc.) ─────────────────────────────────────────
+
+def _fetch_secondary_counts(cfg):
+    """
+    Count secondary product deliveries per facility.
+    Filters: productName = cfg["secondary_product"], age 3-59, ADMINISTRATION_SUCCESS.
+    Only called when secondary_product is set — Kebbi ORS-Zinc, not active for other states.
+    """
+    product    = cfg["secondary_product"]
+    date_field = cfg.get("task_date_field", "taskDates")
+    query = {
+        "size": _BATCH,
+        "query": {"bool": {"filter": [
+            {"range": {f"Data.{date_field}": {"gte": cfg["GTE"], "lte": cfg["LTE"]}}},
+            {"term":  {"Data.productName.keyword": product}},
+            {"term":  {"Data.administrationStatus.keyword": "ADMINISTRATION_SUCCESS"}},
+            {"range": {"Data.age": {"gte": 3, "lte": 59}}},
+        ]}},
+        "_source": ["Data.boundaryHierarchy", "Data.age"],
+    }
+    fac_counts = defaultdict(lambda: {"lga": "", "count": 0})
+    for batch in _scroll_batches(cfg["es_url"], cfg["ES_INDEX_TASK"], query,
+                                 cfg["es_auth"], f"secondary-{product}"):
+        for h in batch:
+            doc = h["_source"]["Data"]
+            bh  = doc.get("boundaryHierarchy") or {}
+            fac = str(bh.get("healthFacility", "") or "").strip()
+            lga = str(bh.get("lga",            "") or "").strip()
+            if fac:
+                fac_counts[fac]["lga"]    = lga
+                fac_counts[fac]["count"] += 1
+
+    return sorted(
+        [{"lga": v["lga"], "fac": k, "count": v["count"]}
+         for k, v in fac_counts.items()],
+        key=lambda x: (x["lga"], x["fac"]),
+    )
+
+
+def _write_secondary_tab(wb, rows, cfg):
+    """Write ORS-ZINC tab: LGA | Health Facility | Count."""
+    product = cfg["secondary_product"]
+    ws      = wb.create_sheet("ORS-ZINC")
+    total   = sum(r["count"] for r in rows)
+    banner  = f"{product} Distribution — Day {cfg['DAY']}  |  Total: {total:,}  |  Age 3-59 months"
+
+    ws.merge_cells("A1:C1")
+    c = ws["A1"]
+    c.value = banner
+    c.fill  = _BANNER_FILL
+    c.font  = Font(bold=True, color="FFFFFF", size=10, name="Calibri")
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 20
+
+    for ci, h in enumerate(["LGA", "Health Facility", f"{product} Count"], 1):
+        cell = ws.cell(row=2, column=ci, value=h)
+        _style_cell(cell, fill=_HDR_FILL, bold=True, color="FFFFFF")
+
+    for ri, r in enumerate(rows, 1):
+        for ci, val in enumerate([r["lga"], r["fac"], r["count"]], 1):
+            cell = ws.cell(row=ri + 2, column=ci, value=val)
+            _style_cell(cell, fill=_WHITE_FILL)
+
+    # totals row
+    tr = len(rows) + 3
+    for ci, val in enumerate(["", "TOTAL", total], 1):
+        cell = ws.cell(row=tr, column=ci, value=val)
+        _style_cell(cell, fill=_TOTAL_FILL, bold=True)
+
+    ws.column_dimensions["A"].width = 20
+    ws.column_dimensions["B"].width = 35
+    ws.column_dimensions["C"].width = 18
+
+
 # ── Excel writing ──────────────────────────────────────────────────────────────
 
 def _col_headers(drug_type):
@@ -911,6 +985,13 @@ def run(cfg):
         band_rows = [r for r in rows if r["status"] == band]
         ws = wb.create_sheet(band)
         _write_tab(ws, band_rows, headers, drug_type, cfg, banner_text)
+
+    # Secondary product tab (ORS-Zinc for Kebbi — no-op for all other states)
+    if cfg.get("secondary_product"):
+        log.info(f"[analyze] fetching {cfg['secondary_product']} counts ...")
+        ors_rows = _fetch_secondary_counts(cfg)
+        _write_secondary_tab(wb, ors_rows, cfg)
+        log.info(f"[analyze] {cfg['secondary_product']}: {sum(r['count'] for r in ors_rows):,} records across {len(ors_rows)} facilities")
 
     out = cfg["perf_xlsx"]
     wb.save(out)
