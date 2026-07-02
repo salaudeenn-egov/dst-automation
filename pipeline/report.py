@@ -334,7 +334,11 @@ def _load_all_days_perf(cfg):
 
 
 def _generate_progress_chart(days_data, cfg):
-    """Single-panel daily coverage % bar chart."""
+    """
+    Cumulative coverage vs total campaign target bar chart.
+    Formula: Cumulative Coverage % = Cumulative Treated (Days 1–N) ÷ Total Campaign Target × 100
+    Total Campaign Target = Daily Target × Campaign Days.
+    """
     if not days_data:
         return None
     try:
@@ -342,8 +346,16 @@ def _generate_progress_chart(days_data, cfg):
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
 
-        labels   = [f"Day {d['day']}\n{d['date']}" for d in days_data]
-        coverage = [d["cov_pct"] for d in days_data]
+        campaign_days = cfg["campaign_days"]
+        labels        = [f"Day {d['day']}\n{d['date']}" for d in days_data]
+
+        # Build cumulative coverage against total target
+        cum_treated = 0
+        coverage    = []
+        for d in days_data:
+            cum_treated   += d["treated"]
+            total_target   = d["target"] * campaign_days if d["target"] else 0
+            coverage.append(cum_treated / total_target * 100 if total_target else 0)
 
         def bar_color(c):
             if c >= 95: return "#1A7A1A"
@@ -355,9 +367,9 @@ def _generate_progress_chart(days_data, cfg):
 
         colors = [bar_color(c) for c in coverage]
         bars   = ax.bar(labels, coverage, color=colors, width=0.5, zorder=3)
-        ax.set_title(f"{cfg['state_name']} — Daily Coverage %",
+        ax.set_title(f"{cfg['state_name']} — Cumulative Coverage vs Total Campaign Target",
                      fontsize=11, fontweight="bold", pad=10)
-        ax.set_ylabel("Coverage (%)", fontsize=9)
+        ax.set_ylabel("Cumulative Coverage (%)", fontsize=9)
         ax.set_ylim(0, 115)
         ax.axhline(95, color="#1A7A1A", linestyle="--", linewidth=1, alpha=0.6, label="HIGH (95%)")
         ax.axhline(70, color="#E06000", linestyle="--", linewidth=1, alpha=0.6, label="MODERATE (70%)")
@@ -941,6 +953,13 @@ def _build_doc(cfg, *, g, cov_pct, lga_d, facilities, hfs_active, lgas_total,
 
     # Coverage chart — directly under Section 1 overview table
     if chart_path and os.path.exists(chart_path):
+        formula_p = add_para(
+            doc,
+            "Formula:  Cumulative Coverage % = Cumulative Treated (Days 1–N)  ÷  Total Campaign Target × 100"
+            f"   |   Total Campaign Target = Daily Target × {cfg['campaign_days']} days",
+            size=8, color=GREY_RGB,
+        )
+        formula_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         doc.add_picture(chart_path, width=Inches(5.5))
         doc.add_paragraph()
 
