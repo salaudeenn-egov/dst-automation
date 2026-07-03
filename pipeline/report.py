@@ -662,7 +662,7 @@ def _slack_prompt(cfg, g, cov_pct, docx_name, sync_rows, sync_time_stats, prev_r
         f"Coverage:{cov_pct} Treated:{g['treated']:,} Target:{g['target']:,}\n"
         f"Sync:{synced_cdds:,}/{total_cdds:,}({sync_pct}){by17}\n"
         + (f"Prev:{prev}\n" if prev else "")
-        + "Write Slack message exactly:\nHi Team,\n\n"
+        + "Write Slack message exactly:\n"
           "[1 sentence: coverage" + (" vs previous" if prev else "") + "]\n"
           "[1 sentence: sync status + urgent action]\n\n"
           "Plain text only, no emojis, no bullets, no asterisks."
