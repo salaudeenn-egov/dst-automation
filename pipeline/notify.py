@@ -136,13 +136,22 @@ def upload_file(path, title):
 
 # ── public entry point ─────────────────────────────────────────────────────────
 
-def run(cfg, docx_path, slack_text, partner_docx_path=None):
+def run(cfg, docx_path, slack_text, partner_docx_path=None, mode="both"):
+    """
+    mode:
+      "both"     — post internal (main channel) and partner report (default)
+      "internal" — post only the internal report to the main channel
+      "partner"  — post only the partner report to the partner channel
+    """
     token   = os.getenv("SLACK_TOKEN")
     channel = cfg.get("slack_channel", "")
 
-    # Upload main report to Drive
+    do_internal = mode in ("both", "internal")
+    do_partner  = mode in ("both", "partner")
+
+    # Upload main report to Drive (only when posting internally)
     drive_link = None
-    if docx_path and os.path.exists(docx_path):
+    if do_internal and docx_path and os.path.exists(docx_path):
         try:
             from datetime import datetime as _dt
             title      = f"{cfg['state_name']} Day {cfg['DAY']} Report — {cfg['DATE_LABEL']} {_dt.now().strftime('%H:%M')}"
@@ -156,7 +165,7 @@ def run(cfg, docx_path, slack_text, partner_docx_path=None):
         return
 
     # Main channel — full report (only if configured; a failure must not block the partner post)
-    if channel:
+    if do_internal and channel:
         try:
             message = slack_text
             if drive_link:
@@ -165,12 +174,12 @@ def run(cfg, docx_path, slack_text, partner_docx_path=None):
             log.info(f"[notify] Slack post done -> {channel}")
         except Exception as e:
             log.error(f"[notify] Slack failed (non-fatal): {e}")
-    else:
+    elif do_internal:
         log.warning("[notify] slack_channel not set — skipping main post (partner post still runs)")
 
     # Partner channel — report without DQ sections (if configured)
     partner_channel = cfg.get("slack_channel_partners", "")
-    if partner_channel and partner_docx_path and os.path.exists(partner_docx_path):
+    if do_partner and partner_channel and partner_docx_path and os.path.exists(partner_docx_path):
         # Upload and post in separate try blocks so Slack post fires even if Drive fails
         partner_link = ""
         try:

@@ -1,10 +1,16 @@
 #!/bin/bash
-# Check if the DST scheduler is running.
+# Check if the DST scheduler is running (detects ALL scheduler.py processes).
 
 cd "$(dirname "$0")"
 
-if [ -f scheduler.pid ] && kill -0 "$(cat scheduler.pid)" 2>/dev/null; then
-    echo "Scheduler: RUNNING (PID $(cat scheduler.pid))"
+PIDS=$(pgrep -f "scheduler.py" | tr '\n' ' ')
+if [ -n "$PIDS" ]; then
+    echo "Scheduler: RUNNING (PID(s): $PIDS)"
+    COUNT=$(pgrep -f "scheduler.py" | wc -l)
+    if [ "$COUNT" -gt 2 ]; then
+        echo "WARNING: $COUNT scheduler.py processes — expected 2 (watchdog + child)."
+        echo "Run 'bash stop.sh' then 'bash start.sh' for a clean single instance."
+    fi
     echo ""
     echo "Last 10 log lines:"
     tail -10 logs/scheduler_bg.log 2>/dev/null

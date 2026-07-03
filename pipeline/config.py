@@ -209,6 +209,15 @@ def build(row):
             if t.strip()
         ],
 
+        # partner report schedule — separate times for the partner-channel post.
+        # If empty, the partner report goes out together with the internal report
+        # at report_times (backward-compatible). If set, report_times becomes
+        # internal-only and these times drive the partner-only post.
+        "partner_report_times": [
+            t.strip() for t in str(row.get("partner_report_times", "")).split(",")
+            if t.strip()
+        ],
+
         # derived filenames
         "perf_xlsx":  os.path.join(out_dir, f"performance_day{day}.xlsx"),
         "sync_xlsx":  os.path.join(out_dir, f"cdd_sync_day{day}.xlsx"),

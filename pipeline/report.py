@@ -536,6 +536,11 @@ def _claude(prompt, max_tokens=300):
         if not resp.content:
             log.warning("Claude API returned empty content list")
             return "[Narrative not generated — empty response]"
+        if getattr(resp, "stop_reason", None) == "max_tokens":
+            log.warning(
+                f"Claude response hit max_tokens={max_tokens} — output likely "
+                f"truncated mid-sentence. Consider raising the cap for this call."
+            )
         return resp.content[0].text.strip()
     except Exception as e:
         log.warning(f"Claude API call failed (non-fatal): {e}")
@@ -1265,12 +1270,12 @@ def run(cfg):
     log.info(f"  {len(issues_data)} issues generated")
     log.info("  calling Claude for conclusion ...")
     conclusion = _claude(_conclusion_prompt(cfg, g, cov_pct, lga_d, sync_rows, sync_time_stats, prev_report),
-                         max_tokens=250)
+                         max_tokens=600)
     log.info("  calling Claude for Slack text ...")
     slack_text = _claude(
         _slack_prompt(cfg, g, cov_pct, os.path.basename(cfg["docx_path"]),
                       sync_rows, sync_time_stats, prev_report),
-        max_tokens=120,
+        max_tokens=300,
     )
 
     # Bundle render params — shared between main + partner docs

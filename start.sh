@@ -5,8 +5,11 @@
 cd "$(dirname "$0")"
 mkdir -p logs
 
-if [ -f scheduler.pid ] && kill -0 "$(cat scheduler.pid)" 2>/dev/null; then
-    echo "Scheduler is already running (PID $(cat scheduler.pid))"
+# Refuse to start a duplicate — check for ANY running scheduler.py process,
+# not just the saved PID (a stale/missing pidfile must not allow a second copy).
+if pgrep -f "scheduler.py" >/dev/null 2>&1; then
+    echo "Scheduler already running (PID(s): $(pgrep -f scheduler.py | tr '\n' ' '))"
+    echo "Run 'bash stop.sh' first for a clean restart."
     exit 0
 fi
 

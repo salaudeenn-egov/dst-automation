@@ -1,19 +1,18 @@
 #!/bin/bash
-# Stop the DST scheduler.
+# Stop the DST scheduler — kills the watchdog AND the spawned `--run` child.
+# The watchdog (scheduler.py) forks a child (scheduler.py --run); killing only
+# the saved PID would orphan the child, so we kill every scheduler.py process.
 
 cd "$(dirname "$0")"
 
-if [ ! -f scheduler.pid ]; then
-    echo "No scheduler.pid found — scheduler may not be running"
-    exit 0
-fi
-
-PID=$(cat scheduler.pid)
-if kill -0 "$PID" 2>/dev/null; then
-    kill "$PID"
-    rm scheduler.pid
-    echo "Scheduler stopped (PID $PID)"
+if pgrep -f "scheduler.py" >/dev/null 2>&1; then
+    pkill -f "scheduler.py"
+    sleep 1
+    # force-kill any stragglers that ignored SIGTERM
+    pkill -9 -f "scheduler.py" 2>/dev/null
+    rm -f scheduler.pid
+    echo "Scheduler stopped (all scheduler.py processes)"
 else
-    rm scheduler.pid
-    echo "Scheduler was not running (stale PID $PID removed)"
+    rm -f scheduler.pid
+    echo "No scheduler processes running"
 fi
