@@ -257,6 +257,43 @@ def _load_ors_summary(path, secondary_product):
         return 0, {}, {}
 
 
+def _make_partner_perf_xlsx(perf_path):
+    """
+    Write a partner-safe copy of the performance Excel with data-quality columns
+    stripped from every tab (Age>59, Age=0, Missing HH, Missing Child, Missing Gender,
+    Duplicates) — matching the DQ sections the partner report already omits.
+    Returns the new file path, or "" on failure.
+    """
+    from openpyxl.utils import get_column_letter
+    DQ_COLS    = {"Age>59", "Age=0", "Missing HH", "Missing Child", "Missing Gender", "Duplicates"}
+    HEADER_ROW = 2   # row 1 = banner, row 2 = column headers
+    if not perf_path or not os.path.exists(perf_path):
+        return ""
+    try:
+        wb = openpyxl.load_workbook(perf_path)
+        for ws in wb.worksheets:
+            headers = [c.value for c in ws[HEADER_ROW]]
+            to_del  = sorted([i + 1 for i, h in enumerate(headers) if h in DQ_COLS], reverse=True)
+            if not to_del:
+                continue
+            # unmerge the row-1 banner (spans all columns) before deleting, then re-merge
+            merges = [str(m) for m in list(ws.merged_cells.ranges) if m.min_row == 1]
+            for m in merges:
+                ws.unmerge_cells(m)
+            for ci in to_del:
+                ws.delete_cols(ci, 1)
+            if merges:
+                ws.merge_cells(f"A1:{get_column_letter(ws.max_column)}1")
+        base, ext = os.path.splitext(perf_path)
+        out = f"{base}_partner{ext}"
+        wb.save(out)
+        log.info(f"[report] partner performance Excel written -> {out}")
+        return out
+    except Exception as e:
+        log.warning(f"[report] partner perf Excel build failed (non-fatal): {e}")
+        return ""
+
+
 def _load_sync_summary(path):
     """Returns (lga_rows, time_stats) where time_stats = {label: (count, pct)}."""
     if not path or not os.path.exists(path):
@@ -579,7 +616,7 @@ def _issues_prompt(cfg, g, cov_pct, lga_d, facilities, sync_rows, sync_time_stat
 def _claude_issues(cfg, g, cov_pct, lga_d, facilities, sync_rows, sync_time_stats, prev_report):
     import json
     prompt = _issues_prompt(cfg, g, cov_pct, lga_d, facilities, sync_rows, sync_time_stats, prev_report)
-    raw = _claude(prompt, max_tokens=500)
+    raw = _claude(prompt, max_tokens=1500)
     try:
         text = raw.strip()
         if text.startswith("```"):
@@ -589,6 +626,17 @@ def _claude_issues(cfg, g, cov_pct, lga_d, facilities, sync_rows, sync_time_stat
                 text = text.rstrip()[:-3]
         return json.loads(text)
     except Exception as e:
+        # Salvage a truncated array: keep every complete {...} object up to the last one.
+        try:
+            t = text if text.startswith("[") else text[text.find("["):]
+            cut = t.rfind("}")
+            if cut != -1:
+                salvaged = json.loads(t[:cut + 1].rstrip().rstrip(",") + "]")
+                if isinstance(salvaged, list) and salvaged:
+                    log.warning(f"[report] issues JSON truncated ({e}) — salvaged {len(salvaged)} complete issue(s)")
+                    return salvaged
+        except Exception:
+            pass
         log.warning(f"[report] issues JSON parse failed: {e} — using raw text as single issue")
         return [{
             "observation": raw[:300] if raw else "No issues generated.",
@@ -1245,10 +1293,23 @@ def run(cfg):
     doc.save(out)
     log.info(f"[report] saved -> {out}")
 
-    # Partner report (omits DQ sections 3.2 and 3.5)
+    # Partner report (omits DQ sections 3.2 and 3.5, and links a DQ-stripped Excel)
     partner_docx_path = None
     if cfg.get("slack_channel_partners"):
-        partner_doc = _build_doc(cfg, **_render, partner=True)
+        partner_render = dict(_render)
+        # Build + upload a partner-safe performance Excel (DQ columns removed) so the
+        # partner report's "Full list in performance Excel" link never exposes DQ data.
+        partner_perf_path = _make_partner_perf_xlsx(perf_path)
+        if partner_perf_path:
+            partner_render["perf_path"] = partner_perf_path
+            try:
+                from pipeline import notify as _notify
+                p_title = (f"{cfg['state_name']} Day {cfg['DAY']} Performance Data — "
+                           f"{cfg['DATE_LABEL']} {datetime.now().strftime('%H:%M')}")
+                partner_render["perf_link"] = _notify.upload_file(partner_perf_path, p_title)
+            except Exception as e:
+                log.warning(f"  partner perf Excel upload failed (non-fatal): {e}")
+        partner_doc = _build_doc(cfg, **partner_render, partner=True)
         partner_out = cfg["partner_docx_path"]
         partner_doc.save(partner_out)
         log.info(f"[report] partner doc saved -> {partner_out}")

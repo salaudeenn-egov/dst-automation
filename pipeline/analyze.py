@@ -138,8 +138,9 @@ def _build_campaign_filters(cfg):
 
 def _fetch_task_docs(cfg):
     _source = [
-        "Data.boundaryHierarchy", "Data.age", "Data.individualId",
+        "Data.boundaryHierarchy", "Data.age", "Data.gender", "Data.individualId",
         "Data.quantity", "Data.administrationStatus",
+        "Data.latitude", "Data.longitude",
         "Data.additionalDetails",
     ]
     date_field  = cfg.get("task_date_field", "taskDates")
@@ -323,6 +324,37 @@ def _fetch_hh_head_map(cfg, hh_clref_ids):
     return head_map
 
 
+def _build_hh_head_name_map(cfg, child_ind_ids):
+    """
+    Resolve the household HEAD's name for each child individual (3-step DIGIT chain):
+      1. child individualClientReferenceId -> householdClientReferenceId
+         (household-member index)                              [_fetch_hh_member_map]
+      2. householdClientReferenceId -> head's individualClientReferenceId
+         (household-member index, isHeadOfHousehold=True)      [_fetch_hh_head_map]
+      3. head's individualClientReferenceId -> head name
+         (individual index)                                    [_fetch_individual_names]
+    Returns {child_ind_id: head_name}. A child is "Missing HH" only if the head name
+    cannot be resolved at any hop.
+    """
+    if not child_ind_ids:
+        return {}
+    member_map = _fetch_hh_member_map(cfg, child_ind_ids)          # child_ind -> hh_id
+    if not member_map:
+        return {}
+    hh_ids     = list({v for v in member_map.values() if v})
+    head_map   = _fetch_hh_head_map(cfg, hh_ids)                   # hh_id -> head_ind_id
+    head_ids   = list({v for v in head_map.values() if v})
+    head_names = _fetch_individual_names(cfg, head_ids)            # head_ind_id -> name
+
+    hh_name_map = {}
+    for child_ind, hh_id in member_map.items():
+        head_ind = head_map.get(hh_id, "")
+        name     = head_names.get(head_ind, "") if head_ind else ""
+        if name:
+            hh_name_map[child_ind] = name
+    return hh_name_map
+
+
 # ── aggregation ────────────────────────────────────────────────────────────────
 
 def _load_targets(cfg):
@@ -421,8 +453,9 @@ def _aggregate_batch(task_hits, name_map, hh_name_map, fac_data, cfg):
         ind_id     = doc.get("individualId", "") or ""
         adm        = doc.get("administrationStatus", "") or ""
         add        = doc.get("additionalDetails") or {}
-        lat        = add.get("latitude")
-        lon        = add.get("longitude")
+        # lat/lon: top-level Data.latitude (Nigeria states) with additionalDetails fallback (Togo)
+        lat        = doc.get("latitude")  if doc.get("latitude")  not in (None, "") else add.get("latitude")
+        lon        = doc.get("longitude") if doc.get("longitude") not in (None, "") else add.get("longitude")
         del_com    = str(add.get("deliveryComments") or doc.get("deliveryComments") or "").strip()
         hh_head    = hh_name_map.get(ind_id, "")
         child_name = name_map.get(ind_id, "") if ind_id else ""
@@ -576,9 +609,9 @@ def _aggregate(task_hits, name_map, hh_name_map, target_map, cfg):
         ind_id  = doc.get("individualId", "") or ""
         adm     = doc.get("administrationStatus", "") or ""
         add     = doc.get("additionalDetails") or {}
-        # lat/lon live in additionalDetails (Togo pattern)
-        lat     = add.get("latitude")
-        lon     = add.get("longitude")
+        # lat/lon: top-level Data.latitude (Nigeria states) with additionalDetails fallback (Togo)
+        lat     = doc.get("latitude")  if doc.get("latitude")  not in (None, "") else add.get("latitude")
+        lon     = doc.get("longitude") if doc.get("longitude") not in (None, "") else add.get("longitude")
         del_com = str(add.get("deliveryComments") or doc.get("deliveryComments") or "").strip()
         # hh_head keyed by child ind_id (built in run() via household-member index)
         hh_head = hh_name_map.get(ind_id, "")
@@ -920,8 +953,9 @@ def run(cfg):
     fac_data   = {}
 
     _source    = [
-        "Data.boundaryHierarchy", "Data.age", "Data.individualId",
-        "Data.quantity", "Data.administrationStatus", "Data.additionalDetails",
+        "Data.boundaryHierarchy", "Data.age", "Data.gender", "Data.individualId",
+        "Data.quantity", "Data.administrationStatus",
+        "Data.latitude", "Data.longitude", "Data.additionalDetails",
     ]
     date_field  = cfg.get("task_date_field", "taskDates")
     date_filter = {"range": {f"Data.{date_field}": {"gte": cfg["GTE"], "lte": cfg["LTE"]}}}
@@ -956,8 +990,12 @@ def run(cfg):
                 for h in batch
                 if h["_source"]["Data"].get("individualId", "")
             })
-            name_map = _fetch_individual_names(cfg, batch_ind_ids)
-            _aggregate_batch(batch, name_map, {}, fac_data, cfg)
+            name_map    = _fetch_individual_names(cfg, batch_ind_ids)
+            # Household HEAD name (3-step DIGIT chain):
+            #   child ind -> household id -> head member (isHeadOfHousehold) -> head name.
+            # "Missing HH" = head name unresolved at any hop.
+            hh_name_map = _build_hh_head_name_map(cfg, batch_ind_ids)
+            _aggregate_batch(batch, name_map, hh_name_map, fac_data, cfg)
             total_processed += len(batch)
 
     log.info(f"[analyze] {total_processed:,} records processed across {len(fac_data)} facilities")
