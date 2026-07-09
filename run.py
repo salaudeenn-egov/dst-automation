@@ -20,7 +20,7 @@ def _ensure_deps():
 _ensure_deps()
 
 import logging
-from datetime import date
+from datetime import date, datetime, timedelta
 
 from dotenv import load_dotenv
 
@@ -163,9 +163,156 @@ def run_campaign(row):
     log.info(f"[{state}] DONE")
 
 
-def main():
+def _parse_cli_date(s):
+    """
+    Parse a CLI date. Accepts YYYY-MM-DD, YYYYMMDD, DD/MM/YYYY, DD-MM-YYYY, DDMMYYYY.
+    For 8-digit input, YYYYMMDD is tried before DDMMYYYY (20260708 -> 2026-07-08;
+    08072026, invalid as YYYYMMDD, falls through to 2026-07-08). Returns date or None.
+    """
+    s = str(s).strip()
+    for fmt in ("%Y-%m-%d", "%Y%m%d", "%d/%m/%Y", "%d-%m-%Y", "%d%m%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def run_cumulative(row, end_date):
+    """
+    Build a cumulative / overall-target report for one campaign row.
+
+    Covers the WHOLE campaign (all distribution + mop-up days) from campaign_start
+    through end_date (inclusive). Coverage is measured against the FULL campaign
+    target (undivided), not a per-day target. Generates files locally only —
+    no Slack post and no Drive upload (no_upload=True, notify step skipped).
+    """
+    state = str(row.get("state_name", "unknown")).strip()
+    cfg   = config.build(row)
+
+    if not cfg["active"]:
+        log.info(f"[{state}] active=FALSE — skipped")
+        return None
+
+    start = cfg["campaign_start"]
+    end   = end_date or cfg["campaign_end"]
+    if end < start:
+        log.error(f"[{state}] end {end} is before start {start} — skipped")
+        return None
+
+    total_days = (end - start).days + 1
+    dates      = [(start + timedelta(days=i)).isoformat() for i in range(total_days)]
+
+    from pipeline.config import _date_label
+    cfg.update({
+        "cumulative":         True,
+        "no_upload":          False,      # DO upload the Excels to Drive (so the docs
+                                          # link to them); Slack is still never touched —
+                                          # run_cumulative never calls notify.run().
+        "DAY":                total_days,
+        "campaign_days":      total_days, # labels read "Days 1-N"; target math is
+                                          # decoupled from this via the cumulative flag
+        "GTE":                f"{start.isoformat()}T00:00:00.000Z",
+        "LTE":                f"{end.isoformat()}T23:59:59.999Z",
+        "CAMPAIGN_DATES":     dates,
+        "END_LABEL":          _date_label(end),
+        "in_campaign_window": True,
+    })
+
+    out_dir    = cfg["out_dir"]
+    hm         = datetime.now().strftime("%H%M")
+    state_slug = state.replace(" ", "_")
+    cfg["perf_xlsx"]         = os.path.join(out_dir, "performance_cumulative.xlsx")
+    cfg["sync_xlsx"]         = os.path.join(out_dir, "cdd_sync_cumulative.xlsx")
+    cfg["docx_path"]         = os.path.join(out_dir, f"{state_slug}_Cumulative_Campaign_Report_{hm}.docx")
+    cfg["partner_docx_path"] = os.path.join(out_dir, f"{state_slug}_Cumulative_PartnerReport_{hm}.docx")
+
+    log.info(f"[{state}] ── CUMULATIVE Days 1-{total_days}  ({start} to {end}) ─────────────")
+
+    analyze.run(cfg)
+
+    try:
+        cdd_sync.run(cfg)
+    except Exception as e:
+        log.error(f"[{state}] cdd_sync FAILED (non-fatal — continuing to report): {e}", exc_info=True)
+
+    # report.run already uploaded the performance + CDD-sync Excels to Drive and embedded
+    # those links inside both docs (no_upload=False); it stashes the links back on cfg.
+    docx_path, partner_docx_path, _slack_text = report.run(cfg)
+
+    # Upload the two Word reports to Drive too (Slack is NOT touched — cumulative never
+    # calls notify.run(), so nothing is posted to any channel).
+    hm2            = datetime.now().strftime("%H:%M")
+    internal_title = f"{state} Cumulative Days 1-{total_days} Report — {cfg['END_LABEL']} {hm2}"
+    partner_title  = f"{state} Cumulative Days 1-{total_days} Report (Partner) — {cfg['END_LABEL']} {hm2}"
+    internal_link  = notify.upload_file(docx_path, internal_title) if docx_path and os.path.exists(docx_path) else ""
+    partner_link   = (notify.upload_file(partner_docx_path, partner_title)
+                      if partner_docx_path and os.path.exists(partner_docx_path) else "")
+
+    # Collect the files actually written for the summary list
+    candidates = [
+        ("Performance Excel", cfg["perf_xlsx"]),
+        ("CDD Sync Excel",    cfg["sync_xlsx"]),
+        ("Internal Report",   docx_path),
+        ("Partner Report",    partner_docx_path),
+        ("Progress Chart",    os.path.join(out_dir, f"progress_chart_day{total_days}.png")),
+    ]
+    files = [(label, p) for label, p in candidates if p and os.path.exists(p)]
+
+    # Collect Drive links (internal + partner docs, and the Excels the docs link to)
+    link_items = [
+        ("Internal Report (Doc)",     internal_link),
+        ("Partner Report (Doc)",      partner_link),
+        ("Performance Excel (Sheet)", cfg.get("perf_drive_link", "")),
+        ("CDD Sync Excel (Sheet)",    cfg.get("sync_drive_link", "")),
+        ("Partner Perf Excel (Sheet)", cfg.get("partner_perf_drive_link", "")),
+    ]
+    links = [(label, url) for label, url in link_items if url]
+
+    log.info(f"[{state}] cumulative DONE — {len(files)} file(s), {len(links)} Drive link(s)")
+    return {"state": state, "days": total_days, "start": start, "end": end,
+            "files": files, "links": links}
+
+
+def _print_generated(generated):
     log.info("=" * 60)
-    log.info(f"DST Daily Report Run  —  {date.today().isoformat()}")
+    if not generated:
+        log.warning("No cumulative reports generated.")
+        return
+    print("\nCumulative reports generated:\n")
+    for res in generated:
+        print(f"  [{res['state']}]  Days 1-{res['days']}  ({res['start']} to {res['end']})")
+        print("    Local files:")
+        for label, p in res["files"]:
+            print(f"      {label:<18}: {p}")
+        if res.get("links"):
+            print("    Google Drive links:")
+            for label, url in res["links"]:
+                print(f"      {label:<28}: {url}")
+        print()
+
+
+def main(argv=None):
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="DST campaign report runner (daily by default, or --cumulative)."
+    )
+    parser.add_argument(
+        "--cumulative", nargs="?", const="", default=None, metavar="END_DATE",
+        help="Generate a cumulative overall-target report for the whole campaign "
+             "(all distribution + mop-up days). Optionally pass the LAST day "
+             "(inclusive) as YYYYMMDD or YYYY-MM-DD; defaults to the sheet's campaign_end.",
+    )
+    parser.add_argument("--end", default=None,
+                        help="Alias for the cumulative end date (YYYYMMDD or YYYY-MM-DD).")
+    parser.add_argument("--state", default=None,
+                        help="Only run this state_name (default: all active rows).")
+    args = parser.parse_args(argv)
+
+    is_cumulative = args.cumulative is not None
+
+    log.info("=" * 60)
+    log.info(f"DST {'CUMULATIVE' if is_cumulative else 'Daily'} Report Run  —  {date.today().isoformat()}")
     log.info("=" * 60)
 
     try:
@@ -176,6 +323,38 @@ def main():
 
     if not rows:
         log.warning("No rows returned from Google Sheet — nothing to do")
+        return
+
+    if args.state:
+        want = args.state.strip().lower()
+        rows = [r for r in rows if str(r.get("state_name", "")).strip().lower() == want]
+        if not rows:
+            log.error(f"No campaign row matching --state '{args.state}'")
+            sys.exit(1)
+
+    if is_cumulative:
+        raw_end  = (args.cumulative or args.end or "").strip()
+        end_date = _parse_cli_date(raw_end) if raw_end else None
+        if raw_end and not end_date:
+            log.error(f"Could not parse cumulative end date '{raw_end}' — use YYYYMMDD or YYYY-MM-DD")
+            sys.exit(1)
+        if end_date:
+            log.info(f"Cumulative end date (last day, inclusive): {end_date}")
+        else:
+            log.info("Cumulative end date not given — using each row's campaign_end")
+
+        generated = []
+        for row in rows:
+            state = str(row.get("state_name", "unknown")).strip()
+            try:
+                res = run_cumulative(row, end_date)
+                if res:
+                    generated.append(res)
+            except Exception as e:
+                log.error(f"[{state}] cumulative run failed: {e}", exc_info=True)
+        _print_generated(generated)
+        log.info("Cumulative run complete")
+        log.info("=" * 60)
         return
 
     for row in rows:

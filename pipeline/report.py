@@ -404,11 +404,14 @@ def _load_all_days_perf(cfg):
     return days
 
 
-def _generate_progress_chart(days_data, cfg):
+def _generate_progress_chart(days_data, cfg, overall_target=None):
     """
     Cumulative coverage vs total campaign target bar chart.
     Formula: Cumulative Coverage % = Cumulative Treated (Days 1–N) ÷ Total Campaign Target × 100
-    Total Campaign Target = Daily Target × Campaign Days.
+
+    Daily mode:      Total Campaign Target = Daily Target × Campaign Days (per-day file targets).
+    Cumulative mode: Total Campaign Target = overall_target (the full undivided campaign target),
+                     so each day's bar shows cumulative treated climbing toward the overall target.
     """
     if not days_data:
         return None
@@ -424,8 +427,11 @@ def _generate_progress_chart(days_data, cfg):
         cum_treated = 0
         coverage    = []
         for d in days_data:
-            cum_treated   += d["treated"]
-            total_target   = d["target"] * campaign_days if d["target"] else 0
+            cum_treated += d["treated"]
+            if cfg.get("cumulative") and overall_target:
+                total_target = overall_target
+            else:
+                total_target = d["target"] * campaign_days if d["target"] else 0
             coverage.append(cum_treated / total_target * 100 if total_target else 0)
 
         def bar_color(c):
@@ -572,15 +578,24 @@ def _conclusion_prompt(cfg, g, cov_pct, lga_d, sync_rows, sync_time_stats, prev_
         for _, (count, pct) in sync_time_stats.items():
             by17 = f", {count:,} by 17:00 ({pct})"
     prev = _extract_prev_stats(prev_report)
+    cum  = cfg.get("cumulative")
+    header = (
+        f"{cfg['campaign_name']} {cfg['state_name']} CUMULATIVE Days 1-{cfg['DAY']} "
+        f"({cfg['START_LABEL']} to {cfg['END_LABEL']}) {cfg['drug_type']}"
+        if cum else
+        f"{cfg['campaign_name']} {cfg['state_name']} Day {cfg['DAY']}/{cfg['campaign_days']} {cfg['DATE_LABEL']} {cfg['drug_type']}"
+    )
 
     return (
-        f"{cfg['campaign_name']} {cfg['state_name']} Day {cfg['DAY']}/{cfg['campaign_days']} {cfg['DATE_LABEL']} {cfg['drug_type']}\n"
-        f"Coverage:{cov_pct} Treated:{g['treated']:,} Target:{g['target']:,} Records:{g['records']:,}\n"
+        f"{header}\n"
+        f"Coverage:{cov_pct} Treated:{g['treated']:,} Target(overall):{g['target']:,} Records:{g['records']:,}\n"
         f"BestLGA:{best_lga} WorstLGA:{worst_lga}\n"
         f"Dups:{g['dups']:,} MissingChild:{g['missing_child']:,}\n"
         f"Sync:{synced_cdds:,}/{total_cdds:,}({sync_pct}){by17}\n"
         + (f"PrevReport:{prev}\n" if prev else "")
-        + "Write 5-sentence formal conclusion: (1)coverage vs target"
+        + ("Write 5-sentence formal end-of-campaign conclusion covering the WHOLE campaign (all distribution + mop-up days): "
+           if cum else "Write 5-sentence formal conclusion: ")
+        + "(1)overall coverage vs full campaign target"
         + (" vs previous" if prev else "")
         + " (2)best LGA numbers (3)worst LGA implication (4)data quality action (5)sync outlook. Plain text only."
     )
@@ -605,9 +620,16 @@ def _issues_prompt(cfg, g, cov_pct, lga_d, facilities, sync_rows, sync_time_stat
     low_act = [f for f in facilities if f["rec"] < 10]
     prev = _extract_prev_stats(prev_report)
     is_last = cfg["DAY"] == cfg["campaign_days"]
+    cum = cfg.get("cumulative")
+    header = (
+        f"{cfg['campaign_name']} {cfg['state_name']} CUMULATIVE Days 1-{cfg['DAY']} "
+        f"({cfg['START_LABEL']} to {cfg['END_LABEL']}) FINAL"
+        if cum else
+        f"{cfg['campaign_name']} {cfg['state_name']} Day {cfg['DAY']}/{cfg['campaign_days']} {'FINAL' if is_last else ''} {cfg['DATE_LABEL']}"
+    )
 
     return (
-        f"{cfg['campaign_name']} {cfg['state_name']} Day {cfg['DAY']}/{cfg['campaign_days']} {'FINAL' if is_last else ''} {cfg['DATE_LABEL']}\n"
+        f"{header}\n"
         f"Coverage:{cov_pct} Treated:{g['treated']:,}/{g['target']:,}\n"
         f"Sync:{synced_cdds:,}/{total_cdds:,}({sync_pct}) Never:{never:,}{by17} Worst:{worst_str}\n"
         f"LowActivity(<10):{len(low_act)} Dups:{g['dups']:,} MissingChild:{g['missing_child']:,}\n"
@@ -661,15 +683,25 @@ def _slack_prompt(cfg, g, cov_pct, docx_name, sync_rows, sync_time_stats, prev_r
         for _, (count, pct) in sync_time_stats.items():
             by17 = f" by17:{count:,}({pct})"
     prev = _extract_prev_stats(prev_report)
+    cum  = cfg.get("cumulative")
+    header = (
+        f"{cfg['campaign_name']} {cfg['state_name']} CUMULATIVE Days 1-{cfg['DAY']} "
+        f"({cfg['START_LABEL']} to {cfg['END_LABEL']})"
+        if cum else
+        f"{cfg['campaign_name']} {cfg['state_name']} Day {cfg['DAY']}/{cfg['campaign_days']} {cfg['DATE_LABEL']}"
+    )
 
     return (
-        f"{cfg['campaign_name']} {cfg['state_name']} Day {cfg['DAY']}/{cfg['campaign_days']} {cfg['DATE_LABEL']}\n"
-        f"Coverage:{cov_pct} Treated:{g['treated']:,} Target:{g['target']:,}\n"
+        f"{header}\n"
+        f"Coverage:{cov_pct} Treated:{g['treated']:,} Target(overall):{g['target']:,}\n"
         f"Sync:{synced_cdds:,}/{total_cdds:,}({sync_pct}){by17}\n"
         + (f"Prev:{prev}\n" if prev else "")
-        + "Write Slack message exactly:\n"
-          "[1 sentence: coverage" + (" vs previous" if prev else "") + "]\n"
-          "[1 sentence: sync status + urgent action]\n\n"
+        + ("Write Slack message exactly:\n"
+           "[1 sentence: overall campaign coverage vs full target across all distribution + mop-up days]\n"
+           if cum else
+           "Write Slack message exactly:\n"
+           "[1 sentence: coverage" + (" vs previous" if prev else "") + "]\n")
+        + "[1 sentence: sync status + urgent action]\n\n"
           "Plain text only, no emojis, no bullets, no asterisks."
     )
 
@@ -735,15 +767,18 @@ def _dq_table(doc, lga_d):
             dat(row.cells[ci], val, alt=alt)
 
 
-def _fac_perf_table(doc, facilities, perf_link="", secondary_product=""):
+def _fac_perf_table(doc, facilities, perf_link="", secondary_product="", cumulative=False):
     """
     LOW coverage (<70%) and Low Activity (<10 records) facilities.
-    Target Achievement % = Treated / Daily Target * 100.
-    Pop. Coverage        = Records / Daily Target * 100.
-    Daily Treatment Coverage = Treated / Records * 100.
+    Target Achievement % = Treated / Target * 100.
+    Pop. Coverage        = Records / Target * 100.
+    Treatment Coverage   = Treated / Records * 100.
+    Target = overall campaign target in cumulative mode, daily target otherwise.
     If secondary_product set, appends an ORS-Zinc count column.
     Cells colour-coded: >=95% green, 70-95% amber, <70% red.
     """
+    tgt_word = "Campaign Target" if cumulative else "Daily Target"
+    trt_word = "Treatment Coverage" if cumulative else "Daily Treatment Coverage"
     show_ors = bool(secondary_product and any(f.get("ors_count", 0) for f in facilities))
 
     low_facs = [
@@ -763,9 +798,9 @@ def _fac_perf_table(doc, facilities, perf_link="", secondary_product=""):
         run.font.name = FONT; run.font.size = Pt(9); run.font.color.rgb = GREY_RGB
 
     formula_lines = (
-        "Target Achievement % = Treated ÷ Daily Target × 100    |    "
-        "Pop. Coverage = Records ÷ Daily Target × 100    |    "
-        "Daily Treatment Coverage = Treated ÷ Records × 100"
+        f"Target Achievement % = Treated ÷ {tgt_word} × 100    |    "
+        f"Pop. Coverage = Records ÷ {tgt_word} × 100    |    "
+        f"{trt_word} = Treated ÷ Records × 100"
     )
     if show_ors:
         formula_lines += f"    |    {secondary_product} = successful deliveries age 3-59m"
@@ -775,9 +810,9 @@ def _fac_perf_table(doc, facilities, perf_link="", secondary_product=""):
         add_para(doc, "No LOW or Low Activity facilities on this day.")
         return
 
-    header = ["#", "District", "Health Facility", "Daily Target", "Records",
+    header = ["#", "District", "Health Facility", tgt_word, "Records",
               "Treated", "Not Treated", "Target Achievement %",
-              "Pop. Coverage", "Daily Treatment Coverage"]
+              "Pop. Coverage", trt_word]
     if show_ors:
         header.append(secondary_product)
 
@@ -945,6 +980,7 @@ def _build_doc(cfg, *, g, cov_pct, lga_d, facilities, hfs_active, lgas_total,
                conclusion, perf_link, sync_link, perf_path, sync_path,
                chart_path, ors_total=0, partner=False):
     """Build and return a Document. partner=True omits DQ sections 3.2 and 3.5."""
+    cum = cfg.get("cumulative", False)
     doc = Document()
     for section in doc.sections:
         section.top_margin    = Cm(1.8)
@@ -963,12 +999,19 @@ def _build_doc(cfg, *, g, cov_pct, lga_d, facilities, hfs_active, lgas_total,
     sub = doc.add_paragraph(style="Normal")
     sub.clear()
     sub.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    r2 = sub.add_run(f"{cfg['START_LABEL']} to {cfg['END_LABEL']}  —  Day {cfg['DAY']} of {cfg['campaign_days']}")
+    sub_text = (
+        f"{cfg['START_LABEL']} to {cfg['END_LABEL']}  —  Cumulative Campaign Report (Days 1 to {cfg['DAY']})"
+        if cum else
+        f"{cfg['START_LABEL']} to {cfg['END_LABEL']}  —  Day {cfg['DAY']} of {cfg['campaign_days']}"
+    )
+    r2 = sub.add_run(sub_text)
     r2.font.name = FONT; r2.font.size = Pt(14)
     r2.bold = True; r2.font.color.rgb = TITLE_RGB
 
+    _period = (f"Cumulative Days 1-{cfg['DAY']}  —  {cfg['START_LABEL']} to {cfg['END_LABEL']}"
+               if cum else f"Day {cfg['DAY']}  —  {cfg['DATE_LABEL']}")
     summary_line = (
-        f"Day {cfg['DAY']}  —  {cfg['DATE_LABEL']}  |  "
+        f"{_period}  |  "
         f"Extract: {cfg['DATE_LABEL']}, {datetime.now().strftime('%H:%M')}  |  "
         f"{hfs_active} LGAs  |  Coverage: {cov_pct}"
     )
@@ -988,28 +1031,48 @@ def _build_doc(cfg, *, g, cov_pct, lga_d, facilities, hfs_active, lgas_total,
     not_admin = g['absent'] + g['refused'] + g['inelig'] + g['referred'] + g['died'] + g['migrated']
 
     # Section 1
-    add_heading(doc, f"1.  Day {cfg['DAY']} Operational Overview", 4)
-    overview_rows = [
-        ("State / Country",               cfg['state_name']),
-        ("Activity",                      f"{cfg['drug_type']} Distribution  —  Day {cfg['DAY']} of {cfg['campaign_days']}"),
-        ("Date",                          cfg['DATE_LABEL']),
-        ("Data Extract Timestamp",        f"{cfg['DATE_LABEL']}, {datetime.now().strftime('%H:%M')}"),
-        ("Campaign Dates",                f"{cfg['START_LABEL']} to {cfg['END_LABEL']}"),
-        ("LGAs / Districts Covered",      f"{hfs_active} of {lgas_total}"),
-        # ── Coverage ───────────────────────────────────────────────────────
-        ("Daily Population Target",       f"{g['target']:,}"),
-        ("Total Records Submitted",       f"{g['records']:,}"),
-        ("Children Treated",              f"{g['treated']:,}"),
-        ("Coverage vs Daily Target",      cov_pct),
-        # ── Cumulative ─────────────────────────────────────────────────────
-        (f"Cumulative Records (Days 1–{cfg['DAY']})",  f"{cum_records:,}"),
-        (f"Cumulative Treated (Days 1–{cfg['DAY']})",  f"{cum_treated:,}"),
-        (f"Cumulative Coverage (Days 1–{cfg['DAY']})", cum_cov),
-        # ── Drug split ─────────────────────────────────────────────────────
-        (d1_label,                        f"{g['drug1']:,}"),
-        (d2_label,                        f"{g['drug2']:,}"),
-        ("Not Administered",              f"{not_admin:,}"),
-    ]
+    sec1_title = ("1.  Cumulative Campaign Overview" if cum
+                  else f"1.  Day {cfg['DAY']} Operational Overview")
+    add_heading(doc, sec1_title, 4)
+    if cum:
+        overview_rows = [
+            ("State / Country",           cfg['state_name']),
+            ("Activity",                  f"{cfg['drug_type']} Distribution  —  Cumulative (Days 1 to {cfg['DAY']})"),
+            ("Campaign Dates",            f"{cfg['START_LABEL']} to {cfg['END_LABEL']}"),
+            ("Data Extract Timestamp",    f"{cfg['DATE_LABEL']}, {datetime.now().strftime('%H:%M')}"),
+            ("LGAs / Districts Covered",  f"{hfs_active} of {lgas_total}"),
+            # ── Coverage vs overall campaign target ────────────────────────
+            ("Overall Campaign Target",   f"{g['target']:,}"),
+            ("Total Records Submitted",   f"{g['records']:,}"),
+            ("Total Children Treated",    f"{g['treated']:,}"),
+            ("Coverage vs Overall Target", cov_pct),
+            # ── Drug split ─────────────────────────────────────────────────
+            (d1_label,                    f"{g['drug1']:,}"),
+            (d2_label,                    f"{g['drug2']:,}"),
+            ("Not Administered",          f"{not_admin:,}"),
+        ]
+    else:
+        overview_rows = [
+            ("State / Country",               cfg['state_name']),
+            ("Activity",                      f"{cfg['drug_type']} Distribution  —  Day {cfg['DAY']} of {cfg['campaign_days']}"),
+            ("Date",                          cfg['DATE_LABEL']),
+            ("Data Extract Timestamp",        f"{cfg['DATE_LABEL']}, {datetime.now().strftime('%H:%M')}"),
+            ("Campaign Dates",                f"{cfg['START_LABEL']} to {cfg['END_LABEL']}"),
+            ("LGAs / Districts Covered",      f"{hfs_active} of {lgas_total}"),
+            # ── Coverage ───────────────────────────────────────────────────────
+            ("Daily Population Target",       f"{g['target']:,}"),
+            ("Total Records Submitted",       f"{g['records']:,}"),
+            ("Children Treated",              f"{g['treated']:,}"),
+            ("Coverage vs Daily Target",      cov_pct),
+            # ── Cumulative ─────────────────────────────────────────────────────
+            (f"Cumulative Records (Days 1–{cfg['DAY']})",  f"{cum_records:,}"),
+            (f"Cumulative Treated (Days 1–{cfg['DAY']})",  f"{cum_treated:,}"),
+            (f"Cumulative Coverage (Days 1–{cfg['DAY']})", cum_cov),
+            # ── Drug split ─────────────────────────────────────────────────────
+            (d1_label,                        f"{g['drug1']:,}"),
+            (d2_label,                        f"{g['drug2']:,}"),
+            ("Not Administered",              f"{not_admin:,}"),
+        ]
     if ors_total:
         overview_rows.append(
             (f"{cfg.get('secondary_product','ORS-Zinc')} Distributed (3-59m)", f"{ors_total:,}")
@@ -1036,10 +1099,13 @@ def _build_doc(cfg, *, g, cov_pct, lga_d, facilities, hfs_active, lgas_total,
         doc.add_paragraph()
 
     # Section 2 — Issues log (Claude-generated, with Drive links per row)
-    add_heading(doc, f"2.  Program Issues and Resolutions — Day {cfg['DAY']} Log", 4)
-    add_para(doc,
-             f"Day {cfg['DAY']} of {cfg['campaign_days']}. Issues identified during the extract and field reports.",
-             size=9, color=GREY_RGB)
+    sec2_title = ("2.  Program Issues and Resolutions — Cumulative Log" if cum
+                  else f"2.  Program Issues and Resolutions — Day {cfg['DAY']} Log")
+    sec2_note  = (f"Whole campaign (Days 1 to {cfg['DAY']}). Issues identified across the extract and field reports."
+                  if cum else
+                  f"Day {cfg['DAY']} of {cfg['campaign_days']}. Issues identified during the extract and field reports.")
+    add_heading(doc, sec2_title, 4)
+    add_para(doc, sec2_note, size=9, color=GREY_RGB)
 
     issues_header = ["#", "Issue / Observation", "Status", "Priority", "Notes", "Data"]
     tbl2 = doc.add_table(rows=1, cols=len(issues_header))
@@ -1112,7 +1178,8 @@ def _build_doc(cfg, *, g, cov_pct, lga_d, facilities, hfs_active, lgas_total,
     add_heading(doc, f"{fac_sec}  Facility Performance Analysis", 5)
     add_para(doc, "LOW coverage (<70%) and Low Activity (<10 records) facilities. Sorted by Population Coverage ascending.", size=9, bold=True)
     _fac_perf_table(doc, facilities, perf_link=perf_link,
-                    secondary_product=cfg.get("secondary_product", ""))
+                    secondary_product=cfg.get("secondary_product", ""),
+                    cumulative=cum)
     doc.add_paragraph()
 
     add_heading(doc, f"{nonadmin_sec}  Non-Administration Analysis", 5)
@@ -1234,11 +1301,20 @@ def run(cfg):
 
     # Load day-by-day totals for cumulative stats + chart
     days_data   = _load_all_days_perf(cfg)
-    cum_records = sum(d["records"] for d in days_data)
-    cum_treated = sum(d["treated"] for d in days_data)
-    cum_target  = sum(d["target"]  for d in days_data)
-    cum_cov     = f"{cum_treated/cum_target*100:.1f}%" if cum_target else "N/A"
-    chart_path  = _generate_progress_chart(days_data, cfg)
+    if cfg.get("cumulative"):
+        # Core numbers are the fresh campaign-wide totals from the cumulative Excel (g),
+        # not a sum of per-day files. Per-day files (if present) only drive the trajectory chart.
+        cum_records = g["records"]
+        cum_treated = g["treated"]
+        cum_target  = g["target"]          # full campaign target
+        cum_cov     = cov_pct
+        chart_path  = _generate_progress_chart(days_data, cfg, overall_target=g["target"])
+    else:
+        cum_records = sum(d["records"] for d in days_data)
+        cum_treated = sum(d["treated"] for d in days_data)
+        cum_target  = sum(d["target"]  for d in days_data)
+        cum_cov     = f"{cum_treated/cum_target*100:.1f}%" if cum_target else "N/A"
+        chart_path  = _generate_progress_chart(days_data, cfg)
 
     # Read previous report for trend context
     prev_report = _read_previous_report(cfg)
@@ -1247,21 +1323,32 @@ def run(cfg):
     else:
         log.info("  no previous report — first extract today")
 
-    # Upload raw Excel files to Drive so rows in the issues table can link to them
+    # Upload raw Excel files to Drive so rows in the issues table can link to them.
+    # Skipped entirely when no_upload is set — the issues table then shows plain
+    # filenames instead of hyperlinks. The resulting links are stashed on cfg so
+    # callers (e.g. the cumulative runner) can list them.
     perf_link = ""
     sync_link = ""
-    try:
-        from pipeline import notify as _notify
-        _now_hm    = datetime.now().strftime("%H:%M")
-        perf_title = f"{cfg['state_name']} Day {cfg['DAY']} Performance Data — {cfg['DATE_LABEL']} {_now_hm}"
-        sync_title = f"{cfg['state_name']} Day {cfg['DAY']} CDD Sync Data — {cfg['DATE_LABEL']} {_now_hm}"
-        log.info("  uploading performance Excel to Drive ...")
-        perf_link = _notify.upload_file(perf_path, perf_title)
-        if sync_path and os.path.exists(sync_path):
-            log.info("  uploading CDD sync Excel to Drive ...")
-            sync_link = _notify.upload_file(sync_path, sync_title)
-    except Exception as e:
-        log.warning(f"  Drive upload of Excels failed (non-fatal): {e}")
+    _period = (f"Cumulative Days 1-{cfg['DAY']}" if cfg.get("cumulative") else f"Day {cfg['DAY']}")
+    if cfg.get("no_upload"):
+        log.info("  no_upload set — skipping Drive upload of Excels (links show filenames)")
+    else:
+        try:
+            from pipeline import notify as _notify
+            _now_hm    = datetime.now().strftime("%H:%M")
+            perf_title = f"{cfg['state_name']} {_period} Performance Data — {cfg['DATE_LABEL']} {_now_hm}"
+            sync_title = f"{cfg['state_name']} {_period} CDD Sync Data — {cfg['DATE_LABEL']} {_now_hm}"
+            log.info("  uploading performance Excel to Drive ...")
+            perf_link = _notify.upload_file(perf_path, perf_title)
+            if sync_path and os.path.exists(sync_path):
+                log.info("  uploading CDD sync Excel to Drive ...")
+                sync_link = _notify.upload_file(sync_path, sync_title)
+        except Exception as e:
+            log.warning(f"  Drive upload of Excels failed (non-fatal): {e}")
+
+    # Stash Excel Drive links on cfg for the caller (harmless for daily runs).
+    cfg["perf_drive_link"] = perf_link
+    cfg["sync_drive_link"] = sync_link
 
     # Claude calls
     log.info("  calling Claude for issues log ...")
@@ -1298,22 +1385,28 @@ def run(cfg):
     doc.save(out)
     log.info(f"[report] saved -> {out}")
 
-    # Partner report (omits DQ sections 3.2 and 3.5, and links a DQ-stripped Excel)
+    # Partner report (omits DQ sections 3.2 and 3.5, and links a DQ-stripped Excel).
+    # Built whenever a partner channel is configured, OR always in cumulative mode
+    # (the end-of-campaign run always produces both an internal and a partner version).
     partner_docx_path = None
-    if cfg.get("slack_channel_partners"):
+    if cfg.get("slack_channel_partners") or cfg.get("cumulative"):
         partner_render = dict(_render)
         # Build + upload a partner-safe performance Excel (DQ columns removed) so the
         # partner report's "Full list in performance Excel" link never exposes DQ data.
         partner_perf_path = _make_partner_perf_xlsx(perf_path)
         if partner_perf_path:
             partner_render["perf_path"] = partner_perf_path
-            try:
-                from pipeline import notify as _notify
-                p_title = (f"{cfg['state_name']} Day {cfg['DAY']} Performance Data — "
-                           f"{cfg['DATE_LABEL']} {datetime.now().strftime('%H:%M')}")
-                partner_render["perf_link"] = _notify.upload_file(partner_perf_path, p_title)
-            except Exception as e:
-                log.warning(f"  partner perf Excel upload failed (non-fatal): {e}")
+            if cfg.get("no_upload"):
+                partner_render["perf_link"] = ""
+            else:
+                try:
+                    from pipeline import notify as _notify
+                    p_title = (f"{cfg['state_name']} {_period} Performance Data (Partner) — "
+                               f"{cfg['DATE_LABEL']} {datetime.now().strftime('%H:%M')}")
+                    partner_render["perf_link"] = _notify.upload_file(partner_perf_path, p_title)
+                    cfg["partner_perf_drive_link"] = partner_render["perf_link"]
+                except Exception as e:
+                    log.warning(f"  partner perf Excel upload failed (non-fatal): {e}")
         partner_doc = _build_doc(cfg, **partner_render, partner=True)
         partner_out = cfg["partner_docx_path"]
         partner_doc.save(partner_out)

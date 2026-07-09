@@ -406,6 +406,9 @@ def _load_targets(cfg):
         df = pd.read_csv(csv_path)
     col_name = "facility_name" if "facility_name" in df.columns else df.columns[0]
     col_tgt  = "individual_target" if "individual_target" in df.columns else df.columns[1]
+    # Cumulative report measures against the FULL campaign target (undivided);
+    # daily reports divide the total by campaign_days. divisor=1 keeps the overall target.
+    divisor = 1 if cfg.get("cumulative") else cfg["campaign_days"]
     tmap = {}
     for _, row in df.iterrows():
         name = str(row[col_name]).strip().lower()
@@ -413,7 +416,7 @@ def _load_targets(cfg):
             itgt = float(row[col_tgt])
         except Exception:
             itgt = 0.0
-        daily = round(itgt / cfg["campaign_days"]) if itgt > 0 else 0
+        daily = round(itgt / divisor) if itgt > 0 else 0
         tmap[name] = {"4day": int(itgt), "daily": daily}
     log.info(f"  targets loaded: {len(tmap)} facilities")
     return tmap
@@ -832,11 +835,12 @@ def _write_secondary_tab(wb, rows, cfg):
 
 # ── Excel writing ──────────────────────────────────────────────────────────────
 
-def _col_headers(drug_type):
+def _col_headers(drug_type, cumulative=False):
     d1 = "SPAQ2 (12-59m)" if drug_type == "SPAQ" else "AZM 12-59m"
     d2 = "SPAQ1 (3-11m)"  if drug_type == "SPAQ" else "AZM 1-11m"
+    tgt = "Campaign Target" if cumulative else "Daily Target"
     return [
-        "#", "LGA", "Health Facility", "Daily Target", "Records", "Treated",
+        "#", "LGA", "Health Facility", tgt, "Records", "Treated",
         "Not Treated", d1, d2, "Coverage %", "Status",
         "Absent", "Refused", "Ineligible", "Referred", "Died", "Migrated",
         "Redose", "Age>59", "Age=0", "Missing HH", "Missing Child", "Missing Gender",
@@ -1002,14 +1006,21 @@ def run(cfg):
     rows = _finalize_fac_data(fac_data, target_map, cfg)
 
     drug_type = cfg["drug_type"]
-    headers   = _col_headers(drug_type)
+    headers   = _col_headers(drug_type, cumulative=cfg.get("cumulative", False))
 
     total_target = sum(r["daily_target"] for r in rows)
     total_daily  = total_target
-    banner_text  = (
-        f"Campaign Target: {total_target * cfg['campaign_days']:,}  |  "
-        f"Daily Target (Day {cfg['DAY']}): {total_daily:,}"
-    )
+    if cfg.get("cumulative"):
+        # total_target is already the full campaign target (divisor=1 in _load_targets)
+        banner_text = (
+            f"Overall Campaign Target: {total_target:,}  |  "
+            f"Cumulative Days 1-{cfg['DAY']}  ({cfg['START_LABEL']} to {cfg['END_LABEL']})"
+        )
+    else:
+        banner_text = (
+            f"Campaign Target: {total_target * cfg['campaign_days']:,}  |  "
+            f"Daily Target (Day {cfg['DAY']}): {total_daily:,}"
+        )
 
     wb = Workbook()
     wb.remove(wb.active)
