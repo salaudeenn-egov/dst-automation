@@ -34,12 +34,70 @@ def _drive_creds():
     return _creds()
 
 
+# ── Drive folder organisation ────────────────────────────────────────────────
+# Reports are filed under the root GOOGLE_DRIVE_FOLDER_ID in a per-campaign tree,
+# all derived from existing config (no extra sheet column / env var):
+#     <Instance>/<State>/<Campaign>/<Day N | Cumulative (Days 1-N)>
+#   Instance = GOOGLE_SHEET_TAB (the per-deployment tab; naming the tab names the folder)
+#   State    = state_name column
+#   Campaign = campaign_name column (falls back to drug_type)
+
+def _find_or_create_folder(service, name, parent_id):
+    """Return the id of sub-folder `name` under `parent_id`, creating it if absent."""
+    safe = str(name).strip().replace("/", "-") or "Unnamed"
+    esc  = safe.replace("\\", "\\\\").replace("'", "\\'")
+    q = (f"name = '{esc}' and mimeType = 'application/vnd.google-apps.folder' "
+         f"and '{parent_id}' in parents and trashed = false")
+    resp = service.files().list(
+        q=q, spaces="drive", fields="files(id,name)",
+        supportsAllDrives=True, includeItemsFromAllDrives=True,
+    ).execute()
+    hits = resp.get("files", [])
+    if hits:
+        return hits[0]["id"]
+    meta = {"name": safe, "mimeType": "application/vnd.google-apps.folder",
+            "parents": [parent_id]}
+    folder = service.files().create(body=meta, fields="id", supportsAllDrives=True).execute()
+    log.info(f"[notify] Drive folder created: {safe}")
+    return folder["id"]
+
+
+def campaign_folder_id(cfg):
+    """
+    Resolve (creating on demand) the Drive folder this run's files belong in, and
+    cache it on cfg. Returns "" if no root folder is configured — callers then fall
+    back to the old flat upload. Path: <Instance>/<State>/<Campaign>/<leaf>.
+    """
+    if cfg.get("_drive_folder_id"):
+        return cfg["_drive_folder_id"]
+    root = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "").strip()
+    if not root:
+        return ""
+    try:
+        service  = build("drive", "v3", credentials=_drive_creds())
+        tab      = (os.getenv("GOOGLE_SHEET_TAB", "Sheet1") or "Sheet1").strip()
+        instance = tab.title() if tab.islower() else tab
+        state    = cfg.get("state_name") or cfg.get("tenant") or "Unknown"
+        campaign = cfg.get("campaign_name") or cfg.get("drug_type") or "Campaign"
+        leaf = (f"Cumulative (Days 1-{cfg.get('DAY', '')})" if cfg.get("cumulative")
+                else f"Day {cfg.get('DAY', '')}")
+        fid = root
+        for part in (instance, state, campaign, leaf):
+            fid = _find_or_create_folder(service, part, fid)
+        cfg["_drive_folder_id"] = fid
+        log.info(f"[notify] Drive target: {instance}/{state}/{campaign}/{leaf}")
+        return fid
+    except Exception as e:
+        log.warning(f"[notify] could not resolve campaign Drive folder (using root): {e}")
+        return ""
+
+
 # ── Google Drive ───────────────────────────────────────────────────────────────
 
-def _upload_to_drive(file_path, title):
+def _upload_to_drive(file_path, title, folder_id=None):
     """Upload file to Drive (converts docx→Google Doc, xlsx→Google Sheet). Returns shareable URL."""
     service   = build("drive", "v3", credentials=_drive_creds())
-    folder_id = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
+    folder_id = folder_id or os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
 
     ext = os.path.splitext(file_path)[1].lower()
     if ext == ".xlsx":
@@ -125,10 +183,10 @@ def _slack_post(channel, text, token):
 
 # ── shared helper (called by report.py for raw Excel uploads) ──────────────────
 
-def upload_file(path, title):
+def upload_file(path, title, folder_id=None):
     """Upload any file to Drive. Returns shareable link or empty string on failure."""
     try:
-        return _upload_to_drive(path, title)
+        return _upload_to_drive(path, title, folder_id=folder_id)
     except Exception as e:
         log.warning(f"[notify] upload_file failed (non-fatal): {e}")
         return ""
@@ -149,13 +207,16 @@ def run(cfg, docx_path, slack_text, partner_docx_path=None, mode="both"):
     do_internal = mode in ("both", "internal")
     do_partner  = mode in ("both", "partner")
 
+    # Per-campaign Drive folder (auto-created); "" falls back to the flat root folder
+    fid = campaign_folder_id(cfg)
+
     # Upload main report to Drive (only when posting internally)
     drive_link = None
     if do_internal and docx_path and os.path.exists(docx_path):
         try:
             from datetime import datetime as _dt
             title      = f"{cfg['state_name']} Day {cfg['DAY']} Report — {cfg['DATE_LABEL']} {_dt.now().strftime('%H:%M')}"
-            drive_link = _upload_to_drive(docx_path, title)
+            drive_link = _upload_to_drive(docx_path, title, folder_id=fid)
         except Exception as e:
             log.warning(f"[notify] Drive upload failed (non-fatal): {e}")
 
@@ -186,7 +247,7 @@ def run(cfg, docx_path, slack_text, partner_docx_path=None, mode="both"):
             from datetime import datetime as _dt2
             partner_title = (f"{cfg['state_name']} Day {cfg['DAY']} Report — "
                              f"{cfg['DATE_LABEL']} {_dt2.now().strftime('%H:%M')}")
-            partner_link = _upload_to_drive(partner_docx_path, partner_title)
+            partner_link = _upload_to_drive(partner_docx_path, partner_title, folder_id=fid)
         except Exception as e:
             log.warning(f"[notify] Partner Drive upload failed (non-fatal): {e}")
 

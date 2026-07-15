@@ -69,14 +69,28 @@ def _date_label(d):
 
 
 def get_active_rows():
-    """Return all rows from the DST config Google Sheet."""
+    """Return all rows from the DST config Google Sheet.
+
+    The worksheet tab is configurable per deployment via GOOGLE_SHEET_TAB
+    (defaults to "Sheet1"). This lets each environment/cluster read its own
+    tab from the same shared sheet — e.g. GOOGLE_SHEET_TAB=taraba on the
+    Taraba Jupyter, GOOGLE_SHEET_TAB=togo on the Togo one.
+    """
     sheet_id = os.getenv("GOOGLE_SHEET_ID")
     if not sheet_id:
         raise ValueError("GOOGLE_SHEET_ID not set in .env")
-    client  = _gs_client()
-    sheet   = client.open_by_key(sheet_id).worksheet("Sheet1")
-    rows    = sheet.get_all_records()
-    log.info(f"Google Sheet: {len(rows)} rows loaded")
+    tab    = os.getenv("GOOGLE_SHEET_TAB", "Sheet1").strip() or "Sheet1"
+    client = _gs_client()
+    try:
+        sheet = client.open_by_key(sheet_id).worksheet(tab)
+    except gspread.WorksheetNotFound:
+        raise ValueError(
+            f"Worksheet tab '{tab}' not found in sheet {sheet_id}. "
+            f"Check GOOGLE_SHEET_TAB in .env, or create the tab with the "
+            f"standard column headers."
+        )
+    rows = sheet.get_all_records()
+    log.info(f"Google Sheet tab '{tab}': {len(rows)} rows loaded")
     return rows
 
 
@@ -134,6 +148,16 @@ def build(row):
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(os.path.join(out_dir, "logs"), exist_ok=True)
 
+    # ES index prefix. Nigeria central instances are tenant-prefixed (e.g.
+    # "ba-project-task-index-v1"). Togo's dedicated cluster uses UN-prefixed
+    # indices ("project-task-index-v1") with tenantId carried inside each doc.
+    # Control per deployment via ES_INDEX_PREFIX in .env:
+    #   unset      -> "{tenant}-"  (default, Nigeria central)
+    #   ES_INDEX_PREFIX=   (empty) -> no prefix (Togo dedicated cluster)
+    #   ES_INDEX_PREFIX=xx-        -> custom prefix
+    _prefix_env = os.getenv("ES_INDEX_PREFIX")
+    idx_prefix  = f"{tenant}-" if _prefix_env is None else _prefix_env
+
     return {
         # identity
         "active":          _bool(row.get("active", "TRUE")),
@@ -159,11 +183,11 @@ def build(row):
         # ES credentials from .env
         "es_url":  os.getenv("ES_URL"),
         "es_auth": (os.getenv("ES_USER"), os.getenv("ES_PASS")) if os.getenv("ES_USER") else None,
-        "ES_INDEX_TASK":      f"{tenant}-project-task-index-v1",
-        "ES_INDEX_STAFF":     f"{tenant}-project-staff-index-v1",
-        "ES_INDEX_SYNC":      f"{tenant}-user-sync-index-v1",
-        "ES_INDEX_IND":       f"{tenant}-individual-index-v1",
-        "ES_INDEX_HH_MEMBER": f"{tenant}-household-member-index-v1",
+        "ES_INDEX_TASK":      f"{idx_prefix}project-task-index-v1",
+        "ES_INDEX_STAFF":     f"{idx_prefix}project-staff-index-v1",
+        "ES_INDEX_SYNC":      f"{idx_prefix}user-sync-index-v1",
+        "ES_INDEX_IND":       f"{idx_prefix}individual-index-v1",
+        "ES_INDEX_HH_MEMBER": f"{idx_prefix}household-member-index-v1",
 
         # Campaign identifier — drives ES filter in analyze.py and cdd_sync.py
         # is_admin_console=TRUE  → filter by campaignNumber (Nigeria, Chad admin)

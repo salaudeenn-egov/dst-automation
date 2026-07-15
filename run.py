@@ -61,10 +61,11 @@ def _update_sheet_status(cfg, status, step_failed="", error_msg="", drive_link="
                     "https://www.googleapis.com/auth/drive"],
         )
         spreadsheet = gspread.Client(auth=creds).open_by_key(sheet_id)
+        runlog_tab  = os.getenv("GOOGLE_RUNLOG_TAB", "Run Log")
         try:
-            ws = spreadsheet.worksheet("Run Log")
+            ws = spreadsheet.worksheet(runlog_tab)
         except gspread.WorksheetNotFound:
-            ws = spreadsheet.add_worksheet("Run Log", rows=1000, cols=10)
+            ws = spreadsheet.add_worksheet(runlog_tab, rows=1000, cols=10)
             ws.append_row(["Timestamp","State","Campaign","Day","Time","Status","Step Failed","Error","Drive Link"])
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
         row = [
@@ -245,8 +246,10 @@ def run_cumulative(row, end_date):
     hm2            = datetime.now().strftime("%H:%M")
     internal_title = f"{state} Cumulative Days 1-{total_days} Report — {cfg['END_LABEL']} {hm2}"
     partner_title  = f"{state} Cumulative Days 1-{total_days} Report (Partner) — {cfg['END_LABEL']} {hm2}"
-    internal_link  = notify.upload_file(docx_path, internal_title) if docx_path and os.path.exists(docx_path) else ""
-    partner_link   = (notify.upload_file(partner_docx_path, partner_title)
+    _fid           = notify.campaign_folder_id(cfg)
+    internal_link  = (notify.upload_file(docx_path, internal_title, folder_id=_fid)
+                      if docx_path and os.path.exists(docx_path) else "")
+    partner_link   = (notify.upload_file(partner_docx_path, partner_title, folder_id=_fid)
                       if partner_docx_path and os.path.exists(partner_docx_path) else "")
 
     # Collect the files actually written for the summary list

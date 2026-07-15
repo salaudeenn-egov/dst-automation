@@ -1335,14 +1335,15 @@ def run(cfg):
     else:
         try:
             from pipeline import notify as _notify
+            _fid       = _notify.campaign_folder_id(cfg)
             _now_hm    = datetime.now().strftime("%H:%M")
             perf_title = f"{cfg['state_name']} {_period} Performance Data — {cfg['DATE_LABEL']} {_now_hm}"
             sync_title = f"{cfg['state_name']} {_period} CDD Sync Data — {cfg['DATE_LABEL']} {_now_hm}"
             log.info("  uploading performance Excel to Drive ...")
-            perf_link = _notify.upload_file(perf_path, perf_title)
+            perf_link = _notify.upload_file(perf_path, perf_title, folder_id=_fid)
             if sync_path and os.path.exists(sync_path):
                 log.info("  uploading CDD sync Excel to Drive ...")
-                sync_link = _notify.upload_file(sync_path, sync_title)
+                sync_link = _notify.upload_file(sync_path, sync_title, folder_id=_fid)
         except Exception as e:
             log.warning(f"  Drive upload of Excels failed (non-fatal): {e}")
 
@@ -1403,7 +1404,8 @@ def run(cfg):
                     from pipeline import notify as _notify
                     p_title = (f"{cfg['state_name']} {_period} Performance Data (Partner) — "
                                f"{cfg['DATE_LABEL']} {datetime.now().strftime('%H:%M')}")
-                    partner_render["perf_link"] = _notify.upload_file(partner_perf_path, p_title)
+                    partner_render["perf_link"] = _notify.upload_file(
+                        partner_perf_path, p_title, folder_id=_notify.campaign_folder_id(cfg))
                     cfg["partner_perf_drive_link"] = partner_render["perf_link"]
                 except Exception as e:
                     log.warning(f"  partner perf Excel upload failed (non-fatal): {e}")
