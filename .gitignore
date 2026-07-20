@@ -1,5 +1,7 @@
 # Credentials & secrets
 .env
+.env.*
+!.env.example
 credential.json
 credential.backup.json
 drive_oauth_client.json

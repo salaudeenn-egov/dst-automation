@@ -17,7 +17,6 @@ from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
 
 urllib3.disable_warnings()
 log = logging.getLogger(__name__)
-
 _HDR_FILL    = PatternFill("solid", fgColor="003366")
 _NEVER_FILL  = PatternFill("solid", fgColor="FFD7D7")
 _LOW_FILL    = PatternFill("solid", fgColor="FFE0B3")
@@ -132,7 +131,7 @@ def _load_syncs_admin(cfg, uname_list):
     must = [
         {"terms": {"Data.taskDates":              cfg["CAMPAIGN_DATES"]}},
         {"terms": {"Data.syncedUserName.keyword": uname_list}},
-        {"term":  {"Data.role.keyword":           "DISTRIBUTOR"}},
+        {"term": {"Data.role.keyword": "COMMUNITY_DISTRIBUTOR"}},
         {"term":  {"Data.campaignNumber.keyword": cfg["campaign_number"]}},
     ]
     sources = [
@@ -162,7 +161,7 @@ def _load_staff_project(cfg):
         ],
         "query": {"bool": {"must": [
             {"term": {"Data.projectTypeId.keyword": cfg["project_type_id"]}},
-            {"term": {"Data.role.keyword":          "DISTRIBUTOR"}},
+            {"term": {"Data.role.keyword": "COMMUNITY_DISTRIBUTOR"}},
             {"term": {"Data.isDeleted":             False}},
         ]}},
     }
@@ -228,7 +227,7 @@ def _count_synced_by_cutoff(cfg, cutoff_hour, cutoff_min=0):
     if cfg["is_admin_console"]:
         must_filter = [
             {"term":  {"Data.campaignNumber.keyword": cfg["campaign_number"]}},
-            {"term":  {"Data.role.keyword": "DISTRIBUTOR"}},
+            {"term": {"Data.role.keyword": "COMMUNITY_DISTRIBUTOR"}},
             {"terms": {"Data.taskDates": [today]}},
             {"range": {"Data.createdTime": {"lte": cutoff_ms}}},
         ]
@@ -236,7 +235,7 @@ def _count_synced_by_cutoff(cfg, cutoff_hour, cutoff_min=0):
     else:
         must_filter = [
             {"term":  {"Data.projectTypeId.keyword": cfg["project_type_id"]}},
-            {"term":  {"Data.role.keyword": "DISTRIBUTOR"}},
+            {"term": {"Data.role.keyword": "COMMUNITY_DISTRIBUTOR"}},
             {"terms": {"Data.taskDates": [today]}},
             {"range": {"Data.createdTime": {"lte": cutoff_ms}}},
         ]
@@ -277,7 +276,7 @@ def _get_synced_keys_by_cutoff(cfg, cutoff_hour=17, cutoff_min=30):
     if cfg["is_admin_console"]:
         must_filter = [
             {"term":  {"Data.campaignNumber.keyword": cfg["campaign_number"]}},
-            {"term":  {"Data.role.keyword": "DISTRIBUTOR"}},
+            {"term": {"Data.role.keyword": "COMMUNITY_DISTRIBUTOR"}},
             {"terms": {"Data.taskDates": [today]}},
             {"range": {"Data.createdTime": {"lte": cutoff_ms}}},
         ]
@@ -285,7 +284,7 @@ def _get_synced_keys_by_cutoff(cfg, cutoff_hour=17, cutoff_min=30):
     else:
         must_filter = [
             {"term":  {"Data.projectTypeId.keyword": cfg["project_type_id"]}},
-            {"term":  {"Data.role.keyword": "DISTRIBUTOR"}},
+            {"term": {"Data.role.keyword": "COMMUNITY_DISTRIBUTOR"}},
             {"terms": {"Data.taskDates": [today]}},
             {"range": {"Data.createdTime": {"lte": cutoff_ms}}},
         ]

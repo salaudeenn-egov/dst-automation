@@ -7,7 +7,6 @@ import os
 from collections import defaultdict
 from datetime import timedelta, datetime
 
-import anthropic
 import openpyxl
 from docx import Document
 from docx.shared import Pt, RGBColor, Cm, Inches
@@ -423,15 +422,21 @@ def _generate_progress_chart(days_data, cfg, overall_target=None):
         campaign_days = cfg["campaign_days"]
         labels        = [f"Day {d['day']}\n{d['date']}" for d in days_data]
 
-        # Build cumulative coverage against total target
-        cum_treated = 0
-        coverage    = []
+        # Build cumulative coverage against total target.
+        # Use a STABLE denominator for every bar — the fullest day's target sum
+        # × campaign_days. Dividing cumulative treated by each day's OWN target sum
+        # breaks on early/partial extracts: a day where few facilities have reported
+        # yet has a tiny target sum, so cumulative-treated ÷ tiny-target explodes
+        # (this is what produced the 916% Day-4 bar).
+        cum_treated      = 0
+        coverage         = []
+        max_daily_target = max((d["target"] for d in days_data), default=0)
         for d in days_data:
             cum_treated += d["treated"]
             if cfg.get("cumulative") and overall_target:
                 total_target = overall_target
             else:
-                total_target = d["target"] * campaign_days if d["target"] else 0
+                total_target = max_daily_target * campaign_days if max_daily_target else 0
             coverage.append(cum_treated / total_target * 100 if total_target else 0)
 
         def bar_color(c):
@@ -442,12 +447,20 @@ def _generate_progress_chart(days_data, cfg, overall_target=None):
         fig, ax = plt.subplots(figsize=(9, 4))
         fig.patch.set_facecolor("#F9F9F9")
 
+        # Cap plotted bar height + label position to the axis so an outlier day
+        # (e.g. a day whose target denominator is near-zero, producing an absurd %)
+        # cannot shoot off the top and stretch the saved image into a tall white void.
+        # Colour and the printed label still reflect the TRUE coverage value.
+        Y_MAX     = 115
+        BAR_CAP   = Y_MAX - 5     # 110 — keeps the value label inside the axis
+        plot_vals = [min(c, BAR_CAP) for c in coverage]
+
         colors = [bar_color(c) for c in coverage]
-        bars   = ax.bar(labels, coverage, color=colors, width=0.5, zorder=3)
+        bars   = ax.bar(labels, plot_vals, color=colors, width=0.5, zorder=3)
         ax.set_title(f"{cfg['state_name']} — Cumulative Coverage vs Total Campaign Target",
                      fontsize=11, fontweight="bold", pad=10)
         ax.set_ylabel("Cumulative Coverage (%)", fontsize=9)
-        ax.set_ylim(0, 115)
+        ax.set_ylim(0, Y_MAX)
         ax.axhline(95, color="#1A7A1A", linestyle="--", linewidth=1, alpha=0.6, label="HIGH (95%)")
         ax.axhline(70, color="#E06000", linestyle="--", linewidth=1, alpha=0.6, label="MODERATE (70%)")
         ax.legend(fontsize=8)
@@ -455,7 +468,8 @@ def _generate_progress_chart(days_data, cfg, overall_target=None):
         ax.set_axisbelow(True)
         for bar, val in zip(bars, coverage):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1.5,
-                    f"{val:.1f}%", ha="center", va="bottom", fontsize=9, fontweight="bold")
+                    f"{val:.1f}%", ha="center", va="bottom", fontsize=9, fontweight="bold",
+                    clip_on=True)
 
         plt.tight_layout(pad=2.0)
         chart_path = os.path.join(cfg["out_dir"], f"progress_chart_day{cfg['DAY']}.png")
@@ -524,33 +538,50 @@ def _read_previous_report(cfg):
         return ""
 
 
-# ── Claude API ─────────────────────────────────────────────────────────────────
+# ── Narrative LLM: Groq (free tier, OpenAI-compatible) ──────────────────────────
 
 def _claude(prompt, max_tokens=300):
-    api_key = os.getenv("ANTHROPIC_API_KEY")
+    """
+    Generate narrative text via Groq's free tier (llama-3.3-70b-versatile by default).
+    Groq-only for now — the Claude and Ollama providers were removed. Config:
+        GROQ_API_KEY   (required)
+        GROQ_MODEL     (default llama-3.3-70b-versatile)
+        GROQ_BASE_URL  (default https://api.groq.com/openai/v1)
+    On any failure returns a "[Narrative not generated — ...]" placeholder so the
+    report still builds (non-fatal).
+    """
+    import requests as _rq
+    api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
-        log.warning("ANTHROPIC_API_KEY not set — returning placeholder text")
-        return "[Narrative not generated — ANTHROPIC_API_KEY missing]"
-    model = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+        log.warning("GROQ_API_KEY not set — returning placeholder text")
+        return "[Narrative not generated — GROQ_API_KEY missing]"
+    base  = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
+    model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
     try:
-        client = anthropic.Anthropic(api_key=api_key)
-        resp = client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            messages=[{"role": "user", "content": prompt}],
+        r = _rq.post(
+            f"{base}/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": 0.4,   # low — favours clean JSON + consistent prose
+            },
+            timeout=120,
         )
-        if not resp.content:
-            log.warning("Claude API returned empty content list")
-            return "[Narrative not generated — empty response]"
-        if getattr(resp, "stop_reason", None) == "max_tokens":
+        r.raise_for_status()
+        data = r.json()
+        choice = (data.get("choices") or [{}])[0]
+        if choice.get("finish_reason") == "length":
             log.warning(
-                f"Claude response hit max_tokens={max_tokens} — output likely "
-                f"truncated mid-sentence. Consider raising the cap for this call."
+                f"Groq response hit max_tokens={max_tokens} — output likely "
+                f"truncated. Consider raising the cap for this call."
             )
-        return resp.content[0].text.strip()
+        txt = (choice.get("message", {}).get("content") or "").strip()
+        return txt or "[Narrative not generated — empty Groq response]"
     except Exception as e:
-        log.warning(f"Claude API call failed (non-fatal): {e}")
-        return "[Narrative not generated — Claude API error]"
+        log.warning(f"Groq call failed (non-fatal): {e}")
+        return "[Narrative not generated — Groq error]"
 
 
 def _extract_prev_stats(prev_report):
@@ -674,35 +705,65 @@ def _claude_issues(cfg, g, cov_pct, lga_d, facilities, sync_rows, sync_time_stat
         }]
 
 
+def _fmt_slack_heading(cfg):
+    """Deterministic one-line heading for the Slack post (state, campaign, day, date)."""
+    if cfg.get("cumulative"):
+        return (f"*{cfg['state_name']} — {cfg['campaign_name']} "
+                f"(Cumulative Days 1-{cfg['DAY']}, {cfg['START_LABEL']} to {cfg['END_LABEL']})*")
+    return (f"*{cfg['state_name']} — {cfg['campaign_name']} "
+            f"(Day {cfg['DAY']} of {cfg['campaign_days']}, {cfg['DATE_LABEL']})*")
+
+
 def _slack_prompt(cfg, g, cov_pct, docx_name, sync_rows, sync_time_stats, prev_report):
+    """Prompt for a single flowing summary paragraph (figures woven into prose)."""
+    drug_type = cfg["drug_type"]
+    d1 = "SPAQ2 (12-59 months)" if drug_type == "SPAQ" else "AZM 12-59 months"
+    d2 = "SPAQ1 (3-11 months)"  if drug_type == "SPAQ" else "AZM 1-11 months"
+
     total_cdds  = sum(int(r[2] or 0) for r in sync_rows if len(r) > 2 and r[2])
     synced_cdds = sum(int(r[3] or 0) for r in sync_rows if len(r) > 3 and r[3])
+    never       = sum(int(r[6] or 0) for r in sync_rows if len(r) > 6 and r[6])
     sync_pct    = f"{synced_cdds/total_cdds*100:.1f}%" if total_cdds else "N/A"
     by17 = ""
     if sync_time_stats:
         for _, (count, pct) in sync_time_stats.items():
-            by17 = f" by17:{count:,}({pct})"
+            if count is not None:
+                by17 = f"{count:,} ({pct})"
+    not_admin = (g['absent'] + g['refused'] + g['inelig']
+                 + g['referred'] + g['died'] + g['migrated'])
     prev = _extract_prev_stats(prev_report)
     cum  = cfg.get("cumulative")
-    header = (
-        f"{cfg['campaign_name']} {cfg['state_name']} CUMULATIVE Days 1-{cfg['DAY']} "
-        f"({cfg['START_LABEL']} to {cfg['END_LABEL']})"
-        if cum else
-        f"{cfg['campaign_name']} {cfg['state_name']} Day {cfg['DAY']}/{cfg['campaign_days']} {cfg['DATE_LABEL']}"
-    )
+    scope = (f"Cumulative Days 1-{cfg['DAY']} ({cfg['START_LABEL']} to {cfg['END_LABEL']})"
+             if cum else
+             f"Day {cfg['DAY']} of {cfg['campaign_days']} ({cfg['DATE_LABEL']})")
+    tgt_word = "campaign target" if cum else "daily target"
 
+    facts = (
+        f"Campaign: {cfg['campaign_name']} in {cfg['state_name']}, {scope}, {cfg['drug_type']}.\n"
+        f"Coverage: {cov_pct}\n"
+        f"Children treated: {g['treated']:,}\n"
+        f"{tgt_word.capitalize()}: {g['target']:,}\n"
+        f"Records submitted: {g['records']:,}\n"
+        f"{d2}: {g['drug2']:,}\n"
+        f"{d1}: {g['drug1']:,}\n"
+        f"Not administered: {not_admin:,}\n"
+        f"Duplicate records: {g['dups']:,}\n"
+        f"Missing child name: {g['missing_child']:,}\n"
+        f"CDDs synced: {synced_cdds:,} of {total_cdds:,} ({sync_pct})\n"
+        f"Never synced: {never:,}\n"
+        + (f"Synced by 17:00: {by17}\n" if by17 else "")
+        + (f"Previous report summary: {prev}\n" if prev else "")
+    )
     return (
-        f"{header}\n"
-        f"Coverage:{cov_pct} Treated:{g['treated']:,} Target(overall):{g['target']:,}\n"
-        f"Sync:{synced_cdds:,}/{total_cdds:,}({sync_pct}){by17}\n"
-        + (f"Prev:{prev}\n" if prev else "")
-        + ("Write Slack message exactly:\n"
-           "[1 sentence: overall campaign coverage vs full target across all distribution + mop-up days]\n"
-           if cum else
-           "Write Slack message exactly:\n"
-           "[1 sentence: coverage" + (" vs previous" if prev else "") + "]\n")
-        + "[1 sentence: sync status + urgent action]\n\n"
-          "Plain text only, no emojis, no bullets, no asterisks."
+        facts
+        + "\nWrite a single flowing paragraph (4 to 6 sentences) for a Slack field update "
+          "summarising the figures above. Weave the key numbers into the prose naturally and "
+          "note the coverage trend"
+        + (" versus the previous report" if prev else "")
+        + ", then end with the single most urgent action for supervisors "
+          "(prioritise data sync when sync coverage is low). "
+          "Use the exact numbers given, do not invent any. Plain prose only — one paragraph, "
+          "no heading, no bullet points, no emojis, no asterisks."
     )
 
 
@@ -1360,11 +1421,13 @@ def run(cfg):
     conclusion = _claude(_conclusion_prompt(cfg, g, cov_pct, lga_d, sync_rows, sync_time_stats, prev_report),
                          max_tokens=600)
     log.info("  calling Claude for Slack text ...")
-    slack_text = _claude(
+    _slack_narrative = _claude(
         _slack_prompt(cfg, g, cov_pct, os.path.basename(cfg["docx_path"]),
                       sync_rows, sync_time_stats, prev_report),
-        max_tokens=300,
+        max_tokens=400,
     )
+    # Final Slack message = deterministic heading, then the LLM summary paragraph.
+    slack_text = _fmt_slack_heading(cfg) + "\n\n" + _slack_narrative
 
     # Bundle render params — shared between main + partner docs
     _render = dict(
