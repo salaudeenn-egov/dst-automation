@@ -226,6 +226,49 @@ def _fetch_individual_names(cfg, ind_ids):
     return name_map
 
 
+def _fetch_pb_to_individual(cfg, pb_refs):
+    """Chad: project-beneficiary clientReferenceId -> the individual's clientReferenceId.
+    The PB index is FLAT (no Data. wrapper); for an INDIVIDUAL beneficiary,
+    beneficiaryClientReferenceId IS the individual's clientReferenceId.
+    Returns {pb_clref_id: individual_clref_id}.
+    """
+    if not pb_refs:
+        return {}
+    batches = [pb_refs[i:i + _BATCH] for i in range(0, len(pb_refs), _BATCH)]
+    out = {}
+
+    def _one_batch(batch):
+        q = {
+            "size": _BATCH,
+            "query": {"terms": {"clientReferenceId.keyword": batch}},
+            "_source": ["clientReferenceId", "beneficiaryClientReferenceId"],
+        }
+        r = requests.post(
+            f"{cfg['es_url']}/{cfg['ES_INDEX_PB']}/_search",
+            json=q, auth=cfg["es_auth"], verify=False, timeout=60,
+        )
+        r.raise_for_status()
+        res = {}
+        for h in r.json()["hits"]["hits"]:
+            s   = h["_source"]
+            pb  = s.get("clientReferenceId", "")
+            ind = s.get("beneficiaryClientReferenceId", "")
+            if pb and ind:
+                res[pb] = ind
+        return res
+
+    log.info(f"  PB->individual: {len(pb_refs):,} refs in {len(batches)} batches ...")
+    with ThreadPoolExecutor(max_workers=_WORKERS) as ex:
+        futures = {ex.submit(_one_batch, b): b for b in batches}
+        for f in as_completed(futures):
+            try:
+                out.update(f.result())
+            except Exception as e:
+                log.warning(f"  PB batch error: {e}")
+    log.info(f"  PB->individual: {len(out):,} beneficiaries resolved")
+    return out
+
+
 def _fetch_hh_member_map(cfg, ind_ids):
     """
     Step 4 (Togo pattern): for each individual ID find their household clientReferenceId.
@@ -447,9 +490,9 @@ def _aggregate_batch(task_hits, name_map, hh_name_map, fac_data, cfg):
     for h in task_hits:
         doc  = h["_source"]["Data"]
         bh   = doc.get("boundaryHierarchy") or {}
-        lga  = str(bh.get("lga",            "") or "").strip()
-        ward = str(bh.get("ward",           "") or "").strip()
-        fac  = str(bh.get("healthFacility", "") or "").strip()
+        lga  = str(bh.get("lga",  "") or bh.get("district", "") or "").strip()
+        ward = str(bh.get("ward", "") or bh.get("locality", "") or "").strip()
+        fac  = str(bh.get("healthFacility", "") or bh.get("HEALTHFACILITY", "") or "").strip()
         if not fac:
             continue
 
@@ -460,8 +503,10 @@ def _aggregate_batch(task_hits, name_map, hh_name_map, fac_data, cfg):
         lat        = doc.get("latitude")  if doc.get("latitude")  not in (None, "") else add.get("latitude")
         lon        = doc.get("longitude") if doc.get("longitude") not in (None, "") else add.get("longitude")
         del_com    = str(add.get("deliveryComments") or doc.get("deliveryComments") or "").strip()
-        hh_head    = hh_name_map.get(ind_id, "")
-        child_name = name_map.get(ind_id, "") if ind_id else ""
+        # name maps are resolved per-task in run() and keyed by the task's clientReferenceId
+        cref       = doc.get("clientReferenceId", "") or ""
+        child_name = name_map.get(cref, "")
+        hh_head    = hh_name_map.get(cref, "")
 
         age_raw = doc.get("age")
         try:
@@ -603,9 +648,9 @@ def _aggregate(task_hits, name_map, hh_name_map, target_map, cfg):
     for h in task_hits:
         doc  = h["_source"]["Data"]
         bh   = doc.get("boundaryHierarchy") or {}
-        lga  = str(bh.get("lga",           "") or "").strip()
-        ward = str(bh.get("ward",          "") or "").strip()
-        fac  = str(bh.get("healthFacility","") or "").strip()
+        lga  = str(bh.get("lga",  "") or bh.get("district", "") or "").strip()
+        ward = str(bh.get("ward", "") or bh.get("locality", "") or "").strip()
+        fac  = str(bh.get("healthFacility","") or bh.get("HEALTHFACILITY","") or "").strip()
         if not fac:
             continue
 
@@ -785,8 +830,8 @@ def _fetch_secondary_counts(cfg):
         for h in batch:
             doc = h["_source"]["Data"]
             bh  = doc.get("boundaryHierarchy") or {}
-            fac = str(bh.get("healthFacility", "") or "").strip()
-            lga = str(bh.get("lga",            "") or "").strip()
+            fac = str(bh.get("healthFacility", "") or bh.get("HEALTHFACILITY", "") or "").strip()
+            lga = str(bh.get("lga",            "") or bh.get("district",       "") or "").strip()
             if fac:
                 fac_counts[fac]["lga"]    = lga
                 fac_counts[fac]["count"] += 1
@@ -958,6 +1003,7 @@ def run(cfg):
 
     _source    = [
         "Data.boundaryHierarchy", "Data.age", "Data.gender", "Data.individualId",
+        "Data.clientReferenceId", "Data.projectBeneficiaryClientReferenceId",
         "Data.quantity", "Data.administrationStatus",
         "Data.latitude", "Data.longitude", "Data.additionalDetails",
     ]
@@ -988,17 +1034,38 @@ def run(cfg):
     total_processed = 0
     for label, query in queries:
         for batch in _scroll_batches(cfg["es_url"], cfg["ES_INDEX_TASK"], query, cfg["es_auth"], label):
-            # Fetch individual names only for this batch — never accumulate all IDs
-            batch_ind_ids = list({
-                h["_source"]["Data"].get("individualId", "")
-                for h in batch
-                if h["_source"]["Data"].get("individualId", "")
-            })
-            name_map    = _fetch_individual_names(cfg, batch_ind_ids)
-            # Household HEAD name (3-step DIGIT chain):
-            #   child ind -> household id -> head member (isHeadOfHousehold) -> head name.
-            # "Missing HH" = head name unresolved at any hop.
-            hh_name_map = _build_hh_head_name_map(cfg, batch_ind_ids)
+            # ── Name resolution — deterministic full chain, names ONLY from the individual index:
+            #   project-task -> project-beneficiary -> household-member -> individual
+            #   child = the beneficiary's individual; head = the isHeadOfHousehold=true member's individual.
+            docs = [h["_source"]["Data"] for h in batch]
+
+            # 1. project-task -> project-beneficiary -> beneficiary (child's individual clientReferenceId)
+            pb_refs  = list({(d.get("projectBeneficiaryClientReferenceId") or "") for d in docs
+                             if d.get("projectBeneficiaryClientReferenceId")})
+            pb2benef = _fetch_pb_to_individual(cfg, pb_refs)                 # pbRef -> beneficiary indiv clref
+
+            # 2. beneficiary -> household  (household-member index, by individualClientReferenceId)
+            benef_ids = list({v for v in pb2benef.values() if v})
+            benef2hh  = _fetch_hh_member_map(cfg, benef_ids)                 # indiv clref -> householdClientReferenceId
+
+            # 3. household -> head individual  (household-member index, isHeadOfHousehold=true)
+            hh_ids  = list({v for v in benef2hh.values() if v})
+            hh2head = _fetch_hh_head_map(cfg, hh_ids)                        # household -> head indiv clref
+
+            # 4. individual index -> names (children + heads)
+            ind_names = _fetch_individual_names(
+                cfg, list(set(benef_ids) | {v for v in hh2head.values() if v}))
+
+            # 5. per-task maps keyed by the task's clientReferenceId
+            name_map, hh_name_map = {}, {}
+            for d in docs:
+                cr = d.get("clientReferenceId") or ""
+                if not cr:
+                    continue
+                benef = pb2benef.get(d.get("projectBeneficiaryClientReferenceId") or "", "")
+                head  = hh2head.get(benef2hh.get(benef, ""), "")
+                name_map[cr]    = ind_names.get(benef, "")   # child name (individual index)
+                hh_name_map[cr] = ind_names.get(head, "")    # head name  (individual index)
             _aggregate_batch(batch, name_map, hh_name_map, fac_data, cfg)
             total_processed += len(batch)
 

@@ -187,6 +187,7 @@ def build(row):
         "ES_INDEX_STAFF":     f"{idx_prefix}project-staff-index-v1",
         "ES_INDEX_SYNC":      f"{idx_prefix}user-sync-index-v1",
         "ES_INDEX_IND":       f"{idx_prefix}individual-index-v1",
+        "ES_INDEX_PB":        f"{idx_prefix}project-beneficiary-index-v1",
         "ES_INDEX_HH_MEMBER": f"{idx_prefix}household-member-index-v1",
 
         # Campaign identifier — drives ES filter in analyze.py and cdd_sync.py
