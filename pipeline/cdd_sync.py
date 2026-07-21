@@ -131,7 +131,7 @@ def _load_syncs_admin(cfg, uname_list):
     must = [
         {"terms": {"Data.taskDates":              cfg["CAMPAIGN_DATES"]}},
         {"terms": {"Data.syncedUserName.keyword": uname_list}},
-        {"term": {"Data.role.keyword": "COMMUNITY_DISTRIBUTOR"}},
+        {"term": {"Data.role.keyword": "DISTRIBUTOR"}},
         {"term":  {"Data.campaignNumber.keyword": cfg["campaign_number"]}},
     ]
     sources = [
@@ -161,7 +161,7 @@ def _load_staff_project(cfg):
         ],
         "query": {"bool": {"must": [
             {"term": {"Data.projectTypeId.keyword": cfg["project_type_id"]}},
-            {"term": {"Data.role.keyword": "COMMUNITY_DISTRIBUTOR"}},
+            {"term": {"Data.role.keyword": "DISTRIBUTOR"}},
             {"term": {"Data.isDeleted":             False}},
         ]}},
     }
@@ -181,8 +181,8 @@ def _load_staff_project(cfg):
             "province":   bh.get("province",    ""),
             "district":   bh.get("district",    ""),
             "health_area":bh.get("healthArea",  ""),
-            "facility":   bh.get("healthFacility", ""),
-            "lga":        bh.get("lga", ""),
+            "facility":   bh.get("healthFacility", "") or bh.get("HEALTHFACILITY", ""),
+            "lga":        bh.get("lga", "") or bh.get("district", ""),
         }
         uid_list.append(d.get("userId", "").strip())
     log.info(f"  staff (project): {len(cdds):,} unique CDDs")
@@ -224,10 +224,21 @@ def _count_synced_by_cutoff(cfg, cutoff_hour, cutoff_min=0):
     )
     cutoff_ms = int(cutoff_dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
 
-    if cfg["is_admin_console"]:
+    if cfg.get("tenant") == "ch":
+        # Chad: the user-sync-index carries campaignNumber (NOT projectTypeId),
+        # and the CDD role is DISTRIBUTOR. Scope on campaignNumber so the cutoff
+        # is non-zero (projectTypeId doesn't exist on this index).
         must_filter = [
             {"term":  {"Data.campaignNumber.keyword": cfg["campaign_number"]}},
-            {"term": {"Data.role.keyword": "COMMUNITY_DISTRIBUTOR"}},
+            {"term":  {"Data.role.keyword": "DISTRIBUTOR"}},
+            {"terms": {"Data.taskDates": [today]}},
+            {"range": {"Data.createdTime": {"lte": cutoff_ms}}},
+        ]
+        agg_field = "Data.syncedUserId.keyword"
+    elif cfg["is_admin_console"]:
+        must_filter = [
+            {"term":  {"Data.campaignNumber.keyword": cfg["campaign_number"]}},
+            {"term": {"Data.role.keyword": "DISTRIBUTOR"}},
             {"terms": {"Data.taskDates": [today]}},
             {"range": {"Data.createdTime": {"lte": cutoff_ms}}},
         ]
@@ -235,7 +246,7 @@ def _count_synced_by_cutoff(cfg, cutoff_hour, cutoff_min=0):
     else:
         must_filter = [
             {"term":  {"Data.projectTypeId.keyword": cfg["project_type_id"]}},
-            {"term": {"Data.role.keyword": "COMMUNITY_DISTRIBUTOR"}},
+            {"term": {"Data.role.keyword": "DISTRIBUTOR"}},
             {"terms": {"Data.taskDates": [today]}},
             {"range": {"Data.createdTime": {"lte": cutoff_ms}}},
         ]
@@ -273,10 +284,19 @@ def _get_synced_keys_by_cutoff(cfg, cutoff_hour=17, cutoff_min=30):
     )
     cutoff_ms = int(cutoff_dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
 
-    if cfg["is_admin_console"]:
+    if cfg.get("tenant") == "ch":
+        # Chad: sync index has campaignNumber (not projectTypeId); role DISTRIBUTOR.
         must_filter = [
             {"term":  {"Data.campaignNumber.keyword": cfg["campaign_number"]}},
-            {"term": {"Data.role.keyword": "COMMUNITY_DISTRIBUTOR"}},
+            {"term":  {"Data.role.keyword": "DISTRIBUTOR"}},
+            {"terms": {"Data.taskDates": [today]}},
+            {"range": {"Data.createdTime": {"lte": cutoff_ms}}},
+        ]
+        agg_sources = [{"key": {"terms": {"field": "Data.syncedUserId.keyword"}}}]
+    elif cfg["is_admin_console"]:
+        must_filter = [
+            {"term":  {"Data.campaignNumber.keyword": cfg["campaign_number"]}},
+            {"term": {"Data.role.keyword": "DISTRIBUTOR"}},
             {"terms": {"Data.taskDates": [today]}},
             {"range": {"Data.createdTime": {"lte": cutoff_ms}}},
         ]
@@ -284,7 +304,7 @@ def _get_synced_keys_by_cutoff(cfg, cutoff_hour=17, cutoff_min=30):
     else:
         must_filter = [
             {"term":  {"Data.projectTypeId.keyword": cfg["project_type_id"]}},
-            {"term": {"Data.role.keyword": "COMMUNITY_DISTRIBUTOR"}},
+            {"term": {"Data.role.keyword": "DISTRIBUTOR"}},
             {"terms": {"Data.taskDates": [today]}},
             {"range": {"Data.createdTime": {"lte": cutoff_ms}}},
         ]
@@ -442,11 +462,17 @@ def run(cfg):
         if col not in df_all.columns:
             df_all[col] = ""
 
-    # Time-based sync counts
-    synced_by_1700 = _count_synced_by_cutoff(cfg, 17, 0)
-    synced_by_1730 = _count_synced_by_cutoff(cfg, 17, 30)
-    # Keys of CDDs who synced by 17:30 — used for the NOT SYNCED tab
-    synced_keys_1730 = _get_synced_keys_by_cutoff(cfg, 17, 30)
+    # Time-based sync counts. These are a TODAY-only operational metric (they key off
+    # extract_date and a same-day UTC cutoff), so they are meaningless in a whole-campaign
+    # cumulative report — skip them there. The per-LGA HIGH/MOD/LOW/NEVER breakdown already
+    # spans every campaign day (CAMPAIGN_DATES), which is the cumulative view.
+    if cfg.get("cumulative"):
+        synced_by_1700 = synced_by_1730 = synced_keys_1730 = None
+    else:
+        synced_by_1700 = _count_synced_by_cutoff(cfg, 17, 0)
+        synced_by_1730 = _count_synced_by_cutoff(cfg, 17, 30)
+        # Keys of CDDs who synced by 17:30 — used for the NOT SYNCED tab
+        synced_keys_1730 = _get_synced_keys_by_cutoff(cfg, 17, 30)
 
     from openpyxl import Workbook as _WB
     wb = _WB()

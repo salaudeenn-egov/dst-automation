@@ -657,7 +657,9 @@ def _conclusion_prompt(cfg, g, cov_pct, lga_d, sync_rows, sync_time_stats, prev_
     worst_lga = min(lga_d, key=lambda l: lga_d[l]["treated"] / lga_d[l]["target"] * 100
                     if lga_d[l]["target"] else 100, default="N/A")
     total_cdds  = sum(int(r[2] or 0) for r in sync_rows if len(r) > 2 and r[2])
-    synced_cdds = sum(int(r[3] or 0) for r in sync_rows if len(r) > 3 and r[3])
+    never       = sum(int(r[6] or 0) for r in sync_rows if len(r) > 6 and r[6])
+    synced_cdds = (total_cdds - never) if cfg.get("cumulative") else \
+                  sum(int(r[3] or 0) for r in sync_rows if len(r) > 3 and r[3])
     sync_pct    = f"{synced_cdds/total_cdds*100:.1f}%" if total_cdds else "N/A"
     by17 = ""
     if sync_time_stats:
@@ -689,8 +691,9 @@ def _conclusion_prompt(cfg, g, cov_pct, lga_d, sync_rows, sync_time_stats, prev_
 
 def _issues_prompt(cfg, g, cov_pct, lga_d, facilities, sync_rows, sync_time_stats, prev_report):
     total_cdds  = sum(int(r[2] or 0) for r in sync_rows if len(r) > 2 and r[2])
-    synced_cdds = sum(int(r[3] or 0) for r in sync_rows if len(r) > 3 and r[3])
     never       = sum(int(r[6] or 0) for r in sync_rows if len(r) > 6 and r[6])
+    synced_cdds = (total_cdds - never) if cfg.get("cumulative") else \
+                  sum(int(r[3] or 0) for r in sync_rows if len(r) > 3 and r[3])
     sync_pct    = f"{synced_cdds/total_cdds*100:.1f}%" if total_cdds else "N/A"
     worst_sync  = sorted(
         [(str(r[1]), int(r[6] or 0), int(r[2] or 0))
@@ -776,8 +779,9 @@ def _slack_prompt(cfg, g, cov_pct, docx_name, sync_rows, sync_time_stats, prev_r
     d2 = "SPAQ1 (3-11 months)"  if drug_type == "SPAQ" else "AZM 1-11 months"
 
     total_cdds  = sum(int(r[2] or 0) for r in sync_rows if len(r) > 2 and r[2])
-    synced_cdds = sum(int(r[3] or 0) for r in sync_rows if len(r) > 3 and r[3])
     never       = sum(int(r[6] or 0) for r in sync_rows if len(r) > 6 and r[6])
+    synced_cdds = (total_cdds - never) if cfg.get("cumulative") else \
+                  sum(int(r[3] or 0) for r in sync_rows if len(r) > 3 and r[3])
     sync_pct    = f"{synced_cdds/total_cdds*100:.1f}%" if total_cdds else "N/A"
     by17 = ""
     if sync_time_stats:
@@ -1048,28 +1052,41 @@ def _dq_summary_table(doc, g):
 
 def _sync_table(doc, sync_rows, cfg, sync_time_stats=None):
     total_cdds  = sum(int(r[2] or 0) for r in sync_rows if len(r) > 2 and r[2])
-    synced_cdds = sum(int(r[3] or 0) for r in sync_rows if len(r) > 3 and r[3])
+    high        = sum(int(r[3] or 0) for r in sync_rows if len(r) > 3 and r[3])
     never       = sum(int(r[6] or 0) for r in sync_rows if len(r) > 6 and r[6])
-    sync_pct    = f"{synced_cdds/total_cdds*100:.1f}%" if total_cdds else "N/A"
 
     add_heading(doc, "5.1  FLW Sync Summary", 5)
-    summary_rows = [
-        ("Total CDDs Registered",   f"{total_cdds:,}"),
-        ("CDDs Synced (total day)",  f"{synced_cdds:,}  ({sync_pct})"),
-        ("Never Synced",             f"{never:,}"),
-    ]
-    # Time-based breakdown
-    if sync_time_stats:
-        for label, (count, pct) in sync_time_stats.items():
-            hour = label.replace("Synced by ", "").replace(" today (UTC)", "")
-            if count is not None:
-                summary_rows.append(
-                    (f"Synced by {hour}",
-                     f"{count:,}  ({pct})  — early sync indicator")
-                )
-    summary_rows += [
-        ("Report Date",  cfg["DATE_LABEL"]),
-    ]
+    if cfg.get("cumulative"):
+        # Whole-campaign totals. "Synced" = synced at least once over the campaign
+        # (Total - Never = HIGH+MODERATE+LOW). HIGH alone means synced EVERY day, so
+        # showing HIGH as "CDDs Synced" wrongly reads as 0 when no one synced all N days.
+        synced_ever = total_cdds - never
+        ever_pct    = f"{synced_ever/total_cdds*100:.1f}%" if total_cdds else "N/A"
+        full_pct    = f"{high/total_cdds*100:.1f}%" if total_cdds else "N/A"
+        summary_rows = [
+            ("Total CDDs Registered",                        f"{total_cdds:,}"),
+            (f"CDDs Synced (>=1 day, Days 1-{cfg['DAY']})",  f"{synced_ever:,}  ({ever_pct})"),
+            (f"Fully Synced (all {cfg['DAY']} days)",        f"{high:,}  ({full_pct})"),
+            ("Never Synced (whole campaign)",                f"{never:,}"),
+            ("Report Period",  f"{cfg['START_LABEL']} to {cfg['END_LABEL']}"),
+        ]
+    else:
+        sync_pct = f"{high/total_cdds*100:.1f}%" if total_cdds else "N/A"
+        summary_rows = [
+            ("Total CDDs Registered",   f"{total_cdds:,}"),
+            ("CDDs Synced (total day)",  f"{high:,}  ({sync_pct})"),
+            ("Never Synced",             f"{never:,}"),
+        ]
+        # Time-based breakdown (daily only — today-cutoff is meaningless cumulatively)
+        if sync_time_stats:
+            for label, (count, pct) in sync_time_stats.items():
+                hour = label.replace("Synced by ", "").replace(" today (UTC)", "")
+                if count is not None:
+                    summary_rows.append(
+                        (f"Synced by {hour}",
+                         f"{count:,}  ({pct})  — early sync indicator")
+                    )
+        summary_rows += [("Report Date",  cfg["DATE_LABEL"])]
     _two_col_table(doc, summary_rows, col_widths=(5, 6))
     doc.add_paragraph()
 
@@ -1137,8 +1154,14 @@ def _build_doc(cfg, *, g, cov_pct, lga_d, facilities, hfs_active, lgas_total,
 
     # Sync totals needed for overview table
     total_cdds  = sum(int(r[2] or 0) for r in sync_rows if len(r) > 2 and r[2])
-    synced_cdds = sum(int(r[3] or 0) for r in sync_rows if len(r) > 2 and r[2])
+    high_cdds   = sum(int(r[3] or 0) for r in sync_rows if len(r) > 3 and r[3])
     never_cdds  = sum(int(r[6] or 0) for r in sync_rows if len(r) > 6 and r[6])
+    if cum:
+        # Cumulative: "synced" = synced at least once over the whole campaign
+        # (Total - Never = HIGH+MODERATE+LOW), NOT HIGH-only (which means every day).
+        synced_cdds = total_cdds - never_cdds
+    else:
+        synced_cdds = high_cdds
     sync_pct_ov = f"{synced_cdds/total_cdds*100:.1f}%" if total_cdds else "N/A"
     by_17_val   = "—"
     if sync_time_stats:
@@ -1193,12 +1216,20 @@ def _build_doc(cfg, *, g, cov_pct, lga_d, facilities, hfs_active, lgas_total,
         overview_rows.append(
             (f"{cfg.get('secondary_product','ORS-Zinc')} Distributed (3-59m)", f"{ors_total:,}")
         )
-    overview_rows += [
-        # ── Sync ───────────────────────────────────────────────────────────
-        ("CDDs Registered",               f"{total_cdds:,}"),
-        ("CDDs Synced",                   f"{synced_cdds:,}  ({sync_pct_ov})"),
-        ("CDDs Synced by 17:00",          by_17_val),
-    ]
+    if cum:
+        # ── Sync (whole-campaign totals; today-cutoff is meaningless here) ──
+        overview_rows += [
+            ("CDDs Registered",               f"{total_cdds:,}"),
+            ("CDDs Synced (>=1 day)",         f"{synced_cdds:,}  ({sync_pct_ov})"),
+            ("Never Synced",                  f"{never_cdds:,}"),
+        ]
+    else:
+        overview_rows += [
+            # ── Sync ───────────────────────────────────────────────────────────
+            ("CDDs Registered",               f"{total_cdds:,}"),
+            ("CDDs Synced",                   f"{synced_cdds:,}  ({sync_pct_ov})"),
+            ("CDDs Synced by 17:00",          by_17_val),
+        ]
     _two_col_table(doc, overview_rows)
     doc.add_paragraph()
 
