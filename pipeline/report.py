@@ -366,6 +366,61 @@ def _load_facility_sync_rates(sync_path):
         return []
 
 
+def _load_days_from_es(cfg):
+    """
+    Cumulative trajectory straight from ES: per-day treated + records for EVERY
+    campaign day (start .. cfg['DAY']), so the progress chart covers all days even
+    when per-day performance Excel files are missing. Lightweight _count queries.
+    """
+    import requests, urllib3
+    urllib3.disable_warnings()
+    url, idx, auth = cfg["es_url"], cfg["ES_INDEX_TASK"], cfg["es_auth"]
+    date_field = cfg.get("task_date_field", "taskDates")
+
+    # campaign scope — mirror analyze._build_campaign_filters
+    scope = []
+    if cfg.get("task_campaign_filter"):
+        if cfg.get("is_admin_console") and cfg.get("campaign_number"):
+            scope.append({"term": {"Data.campaignNumber.keyword": cfg["campaign_number"]}})
+        elif cfg.get("project_type_id"):
+            scope.append({"term": {"Data.projectTypeId.keyword": cfg["project_type_id"]}})
+        elif cfg.get("project_type"):
+            scope.append({"term": {"Data.projectType.keyword": cfg["project_type"]}})
+        if cfg.get("cycle_index"):
+            scope.append({"term": {"Data.additionalDetails.cycleIndex.keyword": cfg["cycle_index"]}})
+
+    min_age = 3 if cfg["drug_type"] == "SPAQ" else 1
+    all_status = ["ADMINISTRATION_SUCCESS", "VISITED", "BENEFICIARY_INELIGIBLE",
+                  "INELIGIBLE", "BENEFICIARY_REFERRED", "BENEFICIARY_DIED",
+                  "BENEFICIARY_ABSENT", "BENEFICIARY_MIGRATED", "BENEFICIARY_REFUSED"]
+
+    def _count(extra):
+        q = {"query": {"bool": {"filter": scope + extra}}}
+        r = requests.post(f"{url}/{idx}/_count", json=q, auth=auth, verify=False, timeout=60)
+        r.raise_for_status()
+        return r.json().get("count", 0)
+
+    days = []
+    for day_num in range(1, cfg["DAY"] + 1):
+        d   = cfg["campaign_start"] + timedelta(days=day_num - 1)
+        rng = {"range": {f"Data.{date_field}": {
+            "gte": f"{d.isoformat()}T00:00:00.000Z", "lte": f"{d.isoformat()}T23:59:59.999Z"}}}
+        try:
+            records = _count([rng, {"terms": {"Data.administrationStatus.keyword": all_status}}])
+            treated = _count([rng,
+                              {"term":  {"Data.administrationStatus.keyword": "ADMINISTRATION_SUCCESS"}},
+                              {"range": {"Data.age": {"gte": min_age, "lte": 59}}}])
+        except Exception as e:
+            log.warning(f"[report] day {day_num} ES back-fill failed (non-fatal): {e}")
+            records, treated = 0, 0
+        days.append({"day": day_num, "date": d.strftime("%d %b"),
+                     "records": records, "treated": treated,
+                     "target": 0, "cov_pct": 0.0, "coverage": "N/A"})
+    log.info(f"[report] cumulative trajectory from ES: {len(days)} days "
+             f"(treated {sum(x['treated'] for x in days):,})")
+    return days
+
+
 def _load_all_days_perf(cfg):
     """
     Read each day's performance Excel and return a list of daily totals dicts.
@@ -1361,16 +1416,26 @@ def run(cfg):
     log.info(f"  {len(facilities)} facilities, {len(lga_d)} LGAs, coverage {cov_pct}")
 
     # Load day-by-day totals for cumulative stats + chart
-    days_data   = _load_all_days_perf(cfg)
     if cfg.get("cumulative"):
         # Core numbers are the fresh campaign-wide totals from the cumulative Excel (g),
-        # not a sum of per-day files. Per-day files (if present) only drive the trajectory chart.
+        # not a sum of per-day files. The trajectory chart is built day-by-day from ES so
+        # it always covers EVERY campaign day (start .. DAY), regardless of which per-day
+        # performance_dayN.xlsx files happen to exist on disk.
+        days_data = _load_days_from_es(cfg)
+        if not days_data:                       # ES back-fill failed → fall back to files
+            days_data = _load_all_days_perf(cfg)
+        daily_tgt = round(g["target"] / cfg["campaign_days"]) if cfg.get("campaign_days") else 0
+        for d in days_data:
+            d["target"]   = daily_tgt
+            d["cov_pct"]  = d["treated"] / daily_tgt * 100 if daily_tgt else 0.0
+            d["coverage"] = f"{d['cov_pct']:.1f}%" if daily_tgt else "N/A"
         cum_records = g["records"]
         cum_treated = g["treated"]
         cum_target  = g["target"]          # full campaign target
         cum_cov     = cov_pct
         chart_path  = _generate_progress_chart(days_data, cfg, overall_target=g["target"])
     else:
+        days_data   = _load_all_days_perf(cfg)
         cum_records = sum(d["records"] for d in days_data)
         cum_treated = sum(d["treated"] for d in days_data)
         cum_target  = sum(d["target"]  for d in days_data)
