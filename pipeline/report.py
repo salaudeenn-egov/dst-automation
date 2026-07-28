@@ -222,38 +222,34 @@ def _load_perf(path, drug_type):
     return lga_d, facilities
 
 
-def _load_ors_summary(path, secondary_product):
+def _load_secondary_summary(path, spec):
     """
-    Read ORS-ZINC tab from performance Excel.
-    Returns (total, {lga: count}, {facility_name_lower: count}).
+    Read one secondary-product tab (spec['tab']) from the performance Excel.
+    Returns (total, {facility_name_lower: count}).
     """
-    if not path or not secondary_product or not os.path.exists(path):
-        return 0, {}, {}
+    if not path or not spec or not os.path.exists(path):
+        return 0, {}
     try:
         wb = openpyxl.load_workbook(path, read_only=True)
-        if "ORS-ZINC" not in wb.sheetnames:
+        if spec["tab"] not in wb.sheetnames:
             wb.close()
-            return 0, {}, {}
-        ws    = wb["ORS-ZINC"]
+            return 0, {}
+        ws    = wb[spec["tab"]]
         total = 0
-        lga_d = defaultdict(int)
         fac_d = {}
         for row in ws.iter_rows(min_row=3, values_only=True):
             if not row or not row[2]:
                 continue
-            lga = str(row[0] or "").strip()
             fac = str(row[1] or "").strip()
             cnt = int(row[2] or 0)
             if fac and fac.upper() not in ("TOTAL", "GRAND TOTAL"):
-                if lga:
-                    lga_d[lga] += cnt
                 fac_d[fac.lower()] = cnt
                 total += cnt
         wb.close()
-        return total, dict(lga_d), fac_d
+        return total, fac_d
     except Exception as e:
-        log.warning(f"[report] ORS summary load failed (non-fatal): {e}")
-        return 0, {}, {}
+        log.warning(f"[report] secondary summary load failed (non-fatal): {e}")
+        return 0, {}
 
 
 def _make_partner_perf_xlsx(perf_path):
@@ -406,10 +402,16 @@ def _load_days_from_es(cfg):
         rng = {"range": {f"Data.{date_field}": {
             "gte": f"{d.isoformat()}T00:00:00.000Z", "lte": f"{d.isoformat()}T23:59:59.999Z"}}}
         try:
+            # treated: mirror analyze._aggregate_batch is_treated exactly —
+            # ADMINISTRATION_SUCCESS + age in [min_age,59] + quantity>=1 (+doseIndex if enabled).
+            treated_f = [rng,
+                         {"term":  {"Data.administrationStatus.keyword": "ADMINISTRATION_SUCCESS"}},
+                         {"range": {"Data.age":      {"gte": min_age, "lte": 59}}},
+                         {"range": {"Data.quantity": {"gte": 1}}}]
+            if cfg.get("dose_index_filter"):
+                treated_f.append({"term": {"Data.additionalDetails.doseIndex.keyword": "1"}})
             records = _count([rng, {"terms": {"Data.administrationStatus.keyword": all_status}}])
-            treated = _count([rng,
-                              {"term":  {"Data.administrationStatus.keyword": "ADMINISTRATION_SUCCESS"}},
-                              {"range": {"Data.age": {"gte": min_age, "lte": 59}}}])
+            treated = _count(treated_f)
         except Exception as e:
             log.warning(f"[report] day {day_num} ES back-fill failed (non-fatal): {e}")
             records, treated = 0, 0
@@ -887,19 +889,21 @@ def _dq_table(doc, lga_d):
             dat(row.cells[ci], val, alt=alt)
 
 
-def _fac_perf_table(doc, facilities, perf_link="", secondary_product="", cumulative=False):
+def _fac_perf_table(doc, facilities, perf_link="", secondary_specs=None, cumulative=False):
     """
     LOW coverage (<70%) and Low Activity (<10 records) facilities.
     Target Achievement % = Treated / Target * 100.
     Pop. Coverage        = Records / Target * 100.
     Treatment Coverage   = Treated / Records * 100.
     Target = overall campaign target in cumulative mode, daily target otherwise.
-    If secondary_product set, appends an ORS-Zinc count column.
+    Appends one count column per configured secondary product that has data.
     Cells colour-coded: >=95% green, 70-95% amber, <70% red.
     """
     tgt_word = "Campaign Target" if cumulative else "Daily Target"
     trt_word = "Treatment Coverage" if cumulative else "Daily Treatment Coverage"
-    show_ors = bool(secondary_product and any(f.get("ors_count", 0) for f in facilities))
+    secondary_specs = secondary_specs or []
+    show_specs = [s for s in secondary_specs
+                  if any(f.get("secondary", {}).get(s["label"], 0) for f in facilities)]
 
     low_facs = [
         f for f in facilities
@@ -922,8 +926,13 @@ def _fac_perf_table(doc, facilities, perf_link="", secondary_product="", cumulat
         f"Pop. Coverage = Records ÷ {tgt_word} × 100    |    "
         f"{trt_word} = Treated ÷ Records × 100"
     )
-    if show_ors:
-        formula_lines += f"    |    {secondary_product} = successful deliveries age 3-59m"
+    if show_specs:
+        _parts = []
+        for s in show_specs:
+            _band = (f" age {s['age_min']}-{s['age_max']}m"
+                     if s.get("age_min") is not None and s.get("age_max") is not None else "")
+            _parts.append(f"{s['label']} = successful deliveries{_band}")
+        formula_lines += "    |    " + ", ".join(_parts)
     add_para(doc, formula_lines, size=8, color=GREY_RGB)
 
     if not low_facs:
@@ -933,8 +942,8 @@ def _fac_perf_table(doc, facilities, perf_link="", secondary_product="", cumulat
     header = ["#", "District", "Health Facility", tgt_word, "Records",
               "Treated", "Not Treated", "Target Achievement %",
               "Pop. Coverage", trt_word]
-    if show_ors:
-        header.append(secondary_product)
+    for s in show_specs:
+        header.append(s["label"])
 
     table  = doc.add_table(rows=1, cols=len(header))
     table.style = "Table Grid"
@@ -958,8 +967,8 @@ def _fac_perf_table(doc, facilities, perf_link="", secondary_product="", cumulat
         alt = ri % 2 == 1
         vals = [ri, f["lga"], f["fac"], f"{f['tgt']:,}", f"{f['rec']:,}",
                 f"{f['treated']:,}", f"{not_trt:,}", achv_str, pop_str, trt_str]
-        if show_ors:
-            vals.append(f.get("ors_count", 0))
+        for s in show_specs:
+            vals.append(f.get("secondary", {}).get(s["label"], 0))
 
         for ci, val in enumerate(vals):
             cell = row.cells[ci]
@@ -1111,9 +1120,11 @@ def _build_doc(cfg, *, g, cov_pct, lga_d, facilities, hfs_active, lgas_total,
                d1_label, d2_label, days_data, cum_records, cum_treated,
                cum_target, cum_cov, sync_rows, sync_time_stats, issues_data,
                conclusion, perf_link, sync_link, perf_path, sync_path,
-               chart_path, ors_total=0, partner=False):
+               chart_path, secondary_specs=None, secondary_totals=None, partner=False):
     """Build and return a Document. partner=True omits DQ sections 3.2 and 3.5."""
     cum = cfg.get("cumulative", False)
+    secondary_specs  = secondary_specs or []
+    secondary_totals = secondary_totals or {}
     doc = Document()
     for section in doc.sections:
         section.top_margin    = Cm(1.8)
@@ -1212,10 +1223,12 @@ def _build_doc(cfg, *, g, cov_pct, lga_d, facilities, hfs_active, lgas_total,
             (d2_label,                        f"{g['drug2']:,}"),
             ("Not Administered",              f"{not_admin:,}"),
         ]
-    if ors_total:
-        overview_rows.append(
-            (f"{cfg.get('secondary_product','ORS-Zinc')} Distributed (3-59m)", f"{ors_total:,}")
-        )
+    for spec in secondary_specs:
+        tot = secondary_totals.get(spec["label"], 0)
+        if tot:
+            band = (f" ({spec['age_min']}-{spec['age_max']}m)"
+                    if spec.get("age_min") is not None and spec.get("age_max") is not None else "")
+            overview_rows.append((f"{spec['label']} Distributed{band}", f"{tot:,}"))
     if cum:
         # ── Sync (whole-campaign totals; today-cutoff is meaningless here) ──
         overview_rows += [
@@ -1325,8 +1338,7 @@ def _build_doc(cfg, *, g, cov_pct, lga_d, facilities, hfs_active, lgas_total,
     add_heading(doc, f"{fac_sec}  Facility Performance Analysis", 5)
     add_para(doc, "LOW coverage (<70%) and Low Activity (<10 records) facilities. Sorted by Population Coverage ascending.", size=9, bold=True)
     _fac_perf_table(doc, facilities, perf_link=perf_link,
-                    secondary_product=cfg.get("secondary_product", ""),
-                    cumulative=cum)
+                    secondary_specs=secondary_specs, cumulative=cum)
     doc.add_paragraph()
 
     add_heading(doc, f"{nonadmin_sec}  Non-Administration Analysis", 5)
@@ -1434,11 +1446,15 @@ def run(cfg):
 
     lga_d, facilities          = _load_perf(perf_path, drug_type)
     sync_rows, sync_time_stats = _load_sync_summary(sync_path)
-    ors_total, _, ors_fac      = _load_ors_summary(perf_path, cfg.get("secondary_product"))
-    # Stamp per-facility ORS count onto each facility dict
-    if ors_fac:
-        for f in facilities:
-            f["ors_count"] = ors_fac.get(f["fac"].lower(), 0)
+    # Secondary products (ORS / VAS / ...): per-product totals + per-facility counts.
+    secondary_specs  = cfg.get("secondary_products", []) or []
+    secondary_totals = {}
+    for spec in secondary_specs:
+        tot, fac_d = _load_secondary_summary(perf_path, spec)
+        secondary_totals[spec["label"]] = tot
+        if fac_d:
+            for f in facilities:
+                f.setdefault("secondary", {})[spec["label"]] = fac_d.get(f["fac"].lower(), 0)
     g                          = _grand_totals(lga_d)
     cov_pct           = _cov_str(g["treated"], g["target"])
     hfs_active        = len({f["lga"] for f in facilities})
@@ -1536,7 +1552,8 @@ def run(cfg):
         issues_data=issues_data, conclusion=conclusion,
         perf_link=perf_link, sync_link=sync_link,
         perf_path=perf_path, sync_path=sync_path,
-        chart_path=chart_path, ors_total=ors_total,
+        chart_path=chart_path,
+        secondary_specs=secondary_specs, secondary_totals=secondary_totals,
     )
 
     # Main report (full — includes all sections)

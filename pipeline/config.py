@@ -68,6 +68,67 @@ def _date_label(d):
     return f"{d.day} {_MONTH_MAP[d.month]} {d.year}"
 
 
+def _safe_int(val, default):
+    try:
+        return int(float(val))
+    except (ValueError, TypeError):
+        return default
+
+
+def _sanitize_tab(name):
+    """openpyxl sheet name: strip invalid chars []:*?/\\ and cap at 31."""
+    safe = str(name).translate(str.maketrans("", "", "[]:*?/\\")).strip()
+    return safe[:31] or "SECONDARY"
+
+
+def _parse_secondary_products(row):
+    """
+    Parse the secondary product(s) counted alongside the primary drug.
+
+    Read from a single sheet column — `secondary_products` if present, else the
+    existing `secondary_product` column. The value drives one of two formats:
+
+    1. LIST format (contains '|' or ';') — one or more entries, each pipe-delimited
+       as  productName|label|ageMin|ageMax  (label/bands optional), ';'-separated:
+           Red VAS|Red VAS; Blue VAS|Blue VAS
+           VITAMIN_A_RED|Red VAS|12|59; VITAMIN_A_BLUE|Blue VAS|6|11
+       Omit the age band to count the product across ALL ages (the productName
+       already encodes the band; age-filtering would undercount vs dashboard).
+
+    2. LEGACY single value (no delimiter) — a bare product name, counted age 3-59,
+       tab "ORS-ZINC" (keeps Kebbi/Sokoto ORS-Zinc working unchanged).
+
+    Returns a list of {name, label, age_min, age_max, tab} dicts (possibly empty).
+    """
+    raw = (str(row.get("secondary_products", "")).strip()
+           or str(row.get("secondary_product", "")).strip())
+    if not raw:
+        return []
+
+    # Legacy single product (no list delimiters) — bare name, age 3-59.
+    if "|" not in raw and ";" not in raw:
+        return [{"name": raw, "label": raw,
+                 "age_min": 3, "age_max": 59, "tab": "ORS-ZINC"}]
+
+    # List format.
+    specs = []
+    for chunk in raw.split(";"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = [p.strip() for p in chunk.split("|")]
+        name  = parts[0] if parts else ""
+        if not name:
+            continue
+        label = parts[1] if len(parts) > 1 and parts[1] else name
+        amin  = _safe_int(parts[2], None) if len(parts) > 2 and parts[2] != "" else None
+        amax  = _safe_int(parts[3], None) if len(parts) > 3 and parts[3] != "" else None
+        specs.append({"name": name, "label": label,
+                      "age_min": amin, "age_max": amax,
+                      "tab": _sanitize_tab(label)})
+    return specs
+
+
 def get_active_rows():
     """Return all rows from the DST config Google Sheet.
 
@@ -213,8 +274,10 @@ def build(row):
         # share the same tenant and date range.
         "task_campaign_filter": _bool(row.get("task_campaign_filter", "FALSE")),
 
-        # secondary product (e.g. "ORS-Zinc" for Kebbi) — empty = disabled
-        "secondary_product": str(row.get("secondary_product", "")).strip(),
+        # secondary product(s) counted alongside the primary drug — empty = disabled.
+        # Legacy single string (age 3-59) OR a spec list (see _parse_secondary_products).
+        "secondary_product":  str(row.get("secondary_product", "")).strip(),
+        "secondary_products": _parse_secondary_products(row),
 
         # targets / counts
         "target_csv":      str(row.get("target_csv", "")).strip(),

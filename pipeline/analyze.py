@@ -806,22 +806,28 @@ def _aggregate(task_hits, name_map, hh_name_map, target_map, cfg):
 
 # ── secondary product (ORS-Zinc etc.) ─────────────────────────────────────────
 
-def _fetch_secondary_counts(cfg):
+def _fetch_secondary_counts(cfg, spec):
     """
-    Count secondary product deliveries per facility.
-    Filters: productName = cfg["secondary_product"], age 3-59, ADMINISTRATION_SUCCESS.
-    Only called when secondary_product is set — Kebbi ORS-Zinc, not active for other states.
+    Count one secondary product's successful deliveries per facility.
+    Filters: productName = spec['name'], ADMINISTRATION_SUCCESS, age in
+    [spec['age_min'], spec['age_max']], plus the campaign scope filters.
+    Called once per entry in cfg['secondary_products'] (Kebbi ORS-Zinc = 1 entry,
+    Bauchi VAS = 2 entries: Red VAS 12-59, Blue VAS 6-11).
     """
-    product    = cfg["secondary_product"]
+    product    = spec["name"]
+    amin, amax = spec["age_min"], spec["age_max"]
     date_field = cfg.get("task_date_field", "taskDates")
+    filters = [
+        {"range": {f"Data.{date_field}": {"gte": cfg["GTE"], "lte": cfg["LTE"]}}},
+        {"term":  {"Data.productName.keyword": product}},
+        {"term":  {"Data.administrationStatus.keyword": "ADMINISTRATION_SUCCESS"}},
+    ] + _build_campaign_filters(cfg)
+    # Age filter only when a band is configured; VAS is counted by productName alone.
+    if amin is not None and amax is not None:
+        filters.append({"range": {"Data.age": {"gte": amin, "lte": amax}}})
     query = {
         "size": _BATCH,
-        "query": {"bool": {"filter": [
-            {"range": {f"Data.{date_field}": {"gte": cfg["GTE"], "lte": cfg["LTE"]}}},
-            {"term":  {"Data.productName.keyword": product}},
-            {"term":  {"Data.administrationStatus.keyword": "ADMINISTRATION_SUCCESS"}},
-            {"range": {"Data.age": {"gte": 3, "lte": 59}}},
-        ]}},
+        "query": {"bool": {"filter": filters}},
         "_source": ["Data.boundaryHierarchy", "Data.age"],
     }
     fac_counts = defaultdict(lambda: {"lga": "", "count": 0})
@@ -843,12 +849,15 @@ def _fetch_secondary_counts(cfg):
     )
 
 
-def _write_secondary_tab(wb, rows, cfg):
-    """Write ORS-ZINC tab: LGA | Health Facility | Count."""
-    product = cfg["secondary_product"]
-    ws      = wb.create_sheet("ORS-ZINC")
+def _write_secondary_tab(wb, rows, cfg, spec):
+    """Write one secondary-product tab: LGA | Health Facility | <label> Count."""
+    label      = spec["label"]
+    amin, amax = spec["age_min"], spec["age_max"]
+    product    = label
+    ws      = wb.create_sheet(spec["tab"])
     total   = sum(r["count"] for r in rows)
-    banner  = f"{product} Distribution — Day {cfg['DAY']}  |  Total: {total:,}  |  Age 3-59 months"
+    band_txt = f"Age {amin}-{amax} months" if amin is not None and amax is not None else "All ages"
+    banner  = f"{label} Distribution — Day {cfg['DAY']}  |  Total: {total:,}  |  {band_txt}"
 
     ws.merge_cells("A1:C1")
     c = ws["A1"]
@@ -1102,12 +1111,15 @@ def run(cfg):
         ws = wb.create_sheet(band)
         _write_tab(ws, band_rows, headers, drug_type, cfg, banner_text)
 
-    # Secondary product tab (ORS-Zinc for Kebbi — no-op for all other states)
-    if cfg.get("secondary_product"):
-        log.info(f"[analyze] fetching {cfg['secondary_product']} counts ...")
-        ors_rows = _fetch_secondary_counts(cfg)
-        _write_secondary_tab(wb, ors_rows, cfg)
-        log.info(f"[analyze] {cfg['secondary_product']}: {sum(r['count'] for r in ors_rows):,} records across {len(ors_rows)} facilities")
+    # Secondary product tab(s) — one per entry in secondary_products.
+    # Kebbi ORS-Zinc = 1 entry; Bauchi VAS = 2 (Red VAS 12-59, Blue VAS 6-11).
+    # No-op for states with no secondary products configured.
+    for spec in cfg.get("secondary_products", []):
+        log.info(f"[analyze] fetching {spec['name']} counts ...")
+        sec_rows = _fetch_secondary_counts(cfg, spec)
+        _write_secondary_tab(wb, sec_rows, cfg, spec)
+        log.info(f"[analyze] {spec['label']}: {sum(r['count'] for r in sec_rows):,} "
+                 f"records across {len(sec_rows)} facilities")
 
     out = cfg["perf_xlsx"]
     wb.save(out)
