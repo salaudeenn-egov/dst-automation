@@ -76,8 +76,15 @@ def _run_campaign_thread(raw_row, mode="both"):
     t.start()
 
 
+# ITN/LLIN campaigns (household bed-net distribution) use a fully separate
+# module set — see analyze_itn.py's docstring for why (SPAQ/AZM's per-child
+# age/dose logic doesn't apply to household-based delivery).
+_ITN_DRUG_TYPES = {"ITN", "LLIN"}
+
+
 def _run_campaign(raw_row, mode="both"):
     from pipeline import config, analyze, cdd_sync, report, notify
+    from pipeline import analyze_itn, cdd_sync_itn, report_itn
 
     state = raw_row.get("state_name", "?")
 
@@ -116,14 +123,19 @@ def _run_campaign(raw_row, mode="both"):
         if not cfg["in_campaign_window"]:
             log.info(f"[{state}] outside campaign window — skip"); return
 
-        analyze.run(cfg)
+        if cfg.get("drug_type") in _ITN_DRUG_TYPES:
+            analyze_mod, cdd_sync_mod, report_mod = analyze_itn, cdd_sync_itn, report_itn
+        else:
+            analyze_mod, cdd_sync_mod, report_mod = analyze, cdd_sync, report
+
+        analyze_mod.run(cfg)
 
         try:
-            cdd_sync.run(cfg)
+            cdd_sync_mod.run(cfg)
         except Exception as e:
             log.error(f"[{state}] cdd_sync FAILED (non-fatal — continuing to report): {e}", exc_info=True)
 
-        docx, partner_docx, slack_text = report.run(cfg)
+        docx, partner_docx, slack_text = report_mod.run(cfg)
         notify.run(cfg, docx, slack_text, partner_docx_path=partner_docx, mode=mode)
         log.info(f"[{state}] pipeline complete (mode={mode})")
     except Exception as e:

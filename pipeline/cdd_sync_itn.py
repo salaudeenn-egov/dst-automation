@@ -1,0 +1,460 @@
+"""
+cdd_sync_itn.py — ITN/LLIN CDD sync tracking (chad-user-sync-index-v1)
+
+Separate module from cdd_sync.py by design (see analyze_itn.py's docstring for the
+full "no touching original files" reasoning). Even though cdd_sync.py already has a
+tenant-branching precedent (a `tenant == "ch"` special case), the instruction this
+session has been separate files only — so this is additive, cdd_sync.py is untouched.
+
+Confirmed this session (tenant=chad, campaign CMP-2026-06-03-000312):
+  - chad-user-sync-index-v1 exists and Data.syncedUserId.keyword / Data.taskDates
+    are valid, correct fields (same names cdd_sync.py already uses for other
+    non-admin-console tenants).
+  - Data.role.keyword IS present directly on sync records (unlike having to
+    cross-reference the staff index) — confirmed only two roles ever sync:
+    DISTRIBUTOR_REGISTRAR (the real CDD role for chad) and WAREHOUSE_MANAGER.
+  - "DISTRIBUTOR" (the role cdd_sync.py's existing tenants filter by) is NOT the
+    right role for chad — DISTRIBUTOR_REGISTRAR is ~96% of the field-staff
+    population; plain DISTRIBUTOR is a small minority (540 of 14,857+).
+
+KNOWN GAP, deliberately not papered over: this module can report how many CDDs
+are ACTIVELY SYNCING (a real, verified number), but NOT a roster-based coverage
+percentage ("X of Y total registered CDDs"). Getting a correct denominator
+requires scoping the STAFF index (chad-project-staff-index-v1) to just this
+campaign's project hierarchy — proven this session that neither
+Data.additionalDetails.cycleIndex (cycle "03" doesn't exist on ANY staff record,
+staff assignments aren't re-tagged per cycle) nor Data.projectTypeId alone
+(spans every historical LLIN campaign/pilot for this tenant) can scope it
+correctly. The real fix needs a DB query (chad.project, projecthierarchy LIKE
+'<campaign root>.%') to get every projectId under this specific campaign, then
+filter staff by Data.projectId IN (...) — not yet built, deliberately left as a
+TODO rather than shipping a number computed from an unverified/wrong roster.
+"""
+import logging
+from datetime import datetime, timezone
+
+import pandas as pd
+import requests
+import urllib3
+from openpyxl import Workbook
+
+# Reused via import — generic Excel-styling helpers, no tenant/drug branching inside
+# them (same pattern already used by analyze_itn.py/report_itn.py for analyze.py/
+# report.py's generic helpers). NOT reusing _write_summary/_write_df/_build_rows/
+# _sync_status themselves — those are built around cdd_sync.py's fixed "Day 1..Day N
+# of a short campaign" model, which doesn't fit a continuously-running, months-long
+# ITN campaign (see _roster_status below for the adapted status model).
+from pipeline.cdd_sync import _style, _HDR_FILL, _TOTAL_FILL, _LOW_FILL, _NEVER_FILL, _BORDER
+
+urllib3.disable_warnings()
+log = logging.getLogger(__name__)
+
+CDD_ROLE = "DISTRIBUTOR_REGISTRAR"   # confirmed the real field-CDD role for chad
+
+# CONFIRMED this session: chad-user-sync-index-v1 DOES carry
+# Data.additionalDetails.projectReferenceId, same as the task index — proven by
+# a real sample record showing "CMP-2026-01-24-000223" (LLIN_phase1_tchad2026-Final),
+# a DIFFERENT campaign than ours — i.e. this index genuinely mixes multiple
+# campaigns' sync records together, confirming the scoping filter below is
+# necessary, not just precautionary.
+
+
+def _campaign_filter(cfg):
+    """Same scoping field as analyze_itn.py's task-index filter, confirmed
+    present on the sync index too."""
+    if not cfg.get("campaign_number"):
+        raise ValueError("campaign_number is required for ITN CDD sync reporting")
+    return {"term": {"Data.additionalDetails.projectReferenceId.keyword": cfg["campaign_number"]}}
+
+
+def _distinct_cdds_synced(cfg, date_str=None):
+    """
+    Distinct DISTRIBUTOR_REGISTRAR users with a sync record for THIS campaign
+    (scoped via _campaign_filter — confirmed necessary, this index genuinely
+    mixes multiple campaigns' records together), optionally scoped to one date
+    (taskDates). No date filter = cumulative to date.
+    Returns (count, doc_count) — doc_count included since it's a distinct signal
+    from distinct-user count (many sync docs can belong to the same user/day).
+    """
+    filters = [_campaign_filter(cfg), {"term": {"Data.role.keyword": CDD_ROLE}}]
+    if date_str:
+        filters.append({"term": {"Data.taskDates": date_str}})
+
+    body = {
+        "size": 0,
+        "query": {"bool": {"filter": filters}},
+        "aggs": {"distinct_cdds": {"cardinality": {"field": "Data.syncedUserId.keyword"}}},
+    }
+    r = requests.post(
+        f"{cfg['es_url']}/{cfg['ES_INDEX_SYNC']}/_search",
+        json=body, auth=cfg["es_auth"], verify=False, timeout=60,
+    )
+    r.raise_for_status()
+    data = r.json()
+    return data["aggregations"]["distinct_cdds"]["value"], data["hits"]["total"]["value"]
+
+
+# ── time-cutoff sync count ────────────────────────────────────────────────────
+# Mirrors cdd_sync.py's _count_synced_by_cutoff exactly (same createdTime-epoch-ms
+# approach, confirmed present on chad's sync docs this session — sample doc showed
+# Data.createdTime: 1785564126353). Only difference from the SPAQ version: campaign
+# scoping field (additionalDetails.projectReferenceId, not campaignNumber) and role
+# (DISTRIBUTOR_REGISTRAR, not DISTRIBUTOR) — both already established elsewhere in
+# this file. Verified live: 418 distinct CDDs synced by 17:00 UTC today (9,493 sync
+# docs before cutoff, out of >=10,000 total today's docs for this campaign+role).
+
+def _count_synced_by_cutoff(cfg, cutoff_hour, cutoff_min=0):
+    """
+    Count unique CDDs (this campaign, DISTRIBUTOR_REGISTRAR) who synced TODAY
+    before cutoff_hour:cutoff_min UTC. Uses Data.createdTime (epoch ms, server
+    receipt timestamp). Returns int count, or None if query fails.
+    """
+    today = cfg["extract_date"].isoformat()
+    cutoff_dt = datetime.strptime(
+        f"{today}T{cutoff_hour:02d}:{cutoff_min:02d}:00", "%Y-%m-%dT%H:%M:%S"
+    )
+    cutoff_ms = int(cutoff_dt.replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+    filters = [
+        _campaign_filter(cfg),
+        {"term": {"Data.role.keyword": CDD_ROLE}},
+        {"term": {"Data.taskDates": today}},
+        {"range": {"Data.createdTime": {"lte": cutoff_ms}}},
+    ]
+    body = {
+        "size": 0,
+        "query": {"bool": {"filter": filters}},
+        "aggs": {"unique_synced": {"cardinality": {"field": "Data.syncedUserId.keyword"}}},
+    }
+    try:
+        r = requests.post(
+            f"{cfg['es_url']}/{cfg['ES_INDEX_SYNC']}/_search",
+            json=body, auth=cfg["es_auth"], verify=False, timeout=30,
+        )
+        r.raise_for_status()
+        count = r.json()["aggregations"]["unique_synced"]["value"]
+        log.info(f"[cdd_sync_itn] synced by {cutoff_hour:02d}:{cutoff_min:02d} UTC: {count:,}")
+        return count
+    except Exception as e:
+        log.warning(f"[cdd_sync_itn] time-cutoff query failed (non-fatal): {e}")
+        return None
+
+
+# ── CDD roster (sync-derived) ─────────────────────────────────────────────────
+# ADAPTATION FROM SPAQ, disclosed: cdd_sync.py's roster comes from the STAFF index
+# (assigned CDDs), then cross-references sync activity against it — so it can show
+# a "NEVER SYNCED" CDD (assigned but inactive). That roster source is blocked here
+# (see module docstring: no correct campaign-scoping field on chad-project-staff-
+# index-v1). This module instead derives the roster FROM the sync records
+# themselves — real, verified per this session's ES checks — which means a CDD
+# who has NEVER synced even once for this campaign cannot appear at all. This is a
+# structural limitation of the approach, not a bug: it's disclosed here and again
+# in the SUMMARY tab's note row rather than silently reusing SPAQ's "NEVER SYNCED"
+# label for something this data can't actually show.
+#
+# Status model: SAME HIGH/MODERATE/LOW/NEVER SYNCED thresholds as cdd_sync.py's
+# _sync_status(n, day) — n = distinct days synced, day = elapsed campaign day
+# (cfg["campaign_start"] to cfg["extract_date"], not cfg["DAY"]/cfg["campaign_days"],
+# which config.py defaults to 4 when a sheet row doesn't set it). NEVER SYNCED will
+# always read 0 here — structural, not a bug: this roster is built FROM sync
+# records, so a CDD with 0 syncs can never appear in it (see roster note above).
+# The column is kept so the table shape matches cdd_sync.py's exactly.
+
+def _fetch_cdd_roster(cfg):
+    """
+    Composite aggregation over syncedUserId, cumulative (no date filter) —
+    scales to however long this campaign has been running without scrolling every
+    individual sync doc (this campaign alone has >=10,000 sync docs for a single
+    day; scrolling the full cumulative history would be wasteful when all we need
+    is one row per distinct CDD). Sub-aggs per user: distinct days synced, total
+    sync record count (bucket doc_count), first/last sync time, and a top_hits
+    sample of the most recent record's syncedUserName + boundaryHierarchy
+    (province/district/facility) — confirmed present on chad's sync docs this
+    session (sample doc carried province=OUADDAI, district=ADRE, sppSfd=CS KATARFA).
+    """
+    filters = [_campaign_filter(cfg), {"term": {"Data.role.keyword": CDD_ROLE}}]
+    rows = {}
+    after = None
+    while True:
+        composite = {"size": 1000, "sources": [{"uid": {"terms": {"field": "Data.syncedUserId.keyword"}}}]}
+        if after:
+            composite["after"] = after
+        body = {
+            "size": 0,
+            "query": {"bool": {"filter": filters}},
+            "aggs": {
+                "by_user": {
+                    "composite": composite,
+                    "aggs": {
+                        "distinct_days": {"cardinality": {"field": "Data.taskDates"}},
+                        "last_sync_ms":  {"max": {"field": "Data.createdTime"}},
+                        "first_sync_ms": {"min": {"field": "Data.createdTime"}},
+                        "latest": {
+                            "top_hits": {
+                                "size": 1,
+                                "sort": [{"Data.createdTime": "desc"}],
+                                "_source": ["Data.syncedUserName", "Data.boundaryHierarchy"],
+                            }
+                        },
+                    },
+                }
+            },
+        }
+        r = requests.post(
+            f"{cfg['es_url']}/{cfg['ES_INDEX_SYNC']}/_search",
+            json=body, auth=cfg["es_auth"], verify=False, timeout=120,
+        )
+        r.raise_for_status()
+        data = r.json()
+        buckets = data["aggregations"]["by_user"]["buckets"]
+        for b in buckets:
+            uid = b["key"]["uid"]
+            hits = b["latest"]["hits"]["hits"]
+            src = hits[0]["_source"]["Data"] if hits else {}
+            bh = src.get("boundaryHierarchy") or {}
+            last_ms = b["last_sync_ms"]["value"]
+            first_ms = b["first_sync_ms"]["value"]
+            rows[uid] = {
+                "user_id": uid,
+                "username": src.get("syncedUserName", ""),
+                "province": bh.get("province", ""),
+                "district": bh.get("district", ""),
+                "facility": bh.get("sppSfd", ""),
+                "records": b["doc_count"],
+                "distinct_days": int(b["distinct_days"]["value"]),
+                "first_sync": (
+                    datetime.fromtimestamp(first_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+                    if first_ms else ""
+                ),
+                "last_sync": (
+                    datetime.fromtimestamp(last_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+                    if last_ms else ""
+                ),
+            }
+        after = data["aggregations"]["by_user"].get("after_key")
+        if not after:
+            break
+    log.info(f"[cdd_sync_itn] roster (sync-derived): {len(rows):,} distinct CDDs")
+    return rows
+
+
+def _roster_status(n_days, elapsed_day):
+    """Identical thresholds to cdd_sync.py's _sync_status(n, day)."""
+    if n_days == elapsed_day: return "HIGH"
+    elif n_days >= 3:         return "MODERATE"
+    elif n_days >= 1:         return "LOW"
+    else:                     return "NEVER SYNCED"
+
+
+def _build_roster_rows(cfg):
+    roster = _fetch_cdd_roster(cfg)
+    extract_date   = cfg.get("extract_date")
+    campaign_start = cfg.get("campaign_start")
+    elapsed_day = (extract_date - campaign_start).days + 1 if (extract_date and campaign_start) else None
+
+    all_rows = []
+    for uid, info in roster.items():
+        status = _roster_status(info["distinct_days"], elapsed_day) if elapsed_day else "LOW"
+        synced_today = bool(extract_date and info["last_sync"] == extract_date.isoformat())
+        all_rows.append({
+            "District":            info["district"] or info["province"] or "Unknown",
+            "Health Facility":     info["facility"],
+            "Username":            info["username"],
+            "User ID":             info["user_id"],
+            "Distinct Days Synced":info["distinct_days"],
+            "Total Sync Records":  info["records"],
+            "First Sync Date":     info["first_sync"],
+            "Last Sync Date":      info["last_sync"],
+            "Status":              status,
+            "Synced Today":        "Y" if synced_today else "N",
+        })
+    return all_rows
+
+
+# ── Excel writer ───────────────────────────────────────────────────────────────
+
+def _write_df_itn(ws, df):
+    for ci, col in enumerate(df.columns, 1):
+        cell = ws.cell(row=1, column=ci, value=col)
+        _style(cell, fill=_HDR_FILL, bold=True, color="FFFFFF")
+    for ri, row in enumerate(df.itertuples(index=False), 2):
+        status = getattr(row, "Status", None)
+        row_fill = (
+            _NEVER_FILL if status == "NEVER SYNCED"
+            else _LOW_FILL if status == "LOW"
+            else None
+        )
+        for ci, val in enumerate(row, 1):
+            cell = ws.cell(row=ri, column=ci, value=val)
+            _style(cell, fill=row_fill)
+    for ci, col in enumerate(df.columns, 1):
+        lengths = [len(str(col))] + [len(str(v)) for v in df.iloc[:, ci - 1] if v is not None]
+        max_len = max(lengths) if lengths else 10
+        from openpyxl.utils import get_column_letter
+        ws.column_dimensions[get_column_letter(ci)].width = min(max_len + 2, 30)
+
+
+def _write_summary_itn(ws, all_rows):
+    """Same column set/layout as cdd_sync.py's _write_summary: # | District |
+    Total CDDs | HIGH | MODERATE | LOW | NEVER SYNCED | % Never Synced."""
+    from collections import defaultdict
+    dist_stats = defaultdict(lambda: {"total": 0, "HIGH": 0, "MODERATE": 0, "LOW": 0, "NEVER SYNCED": 0})
+    for rec in all_rows:
+        d = rec["District"] or "Unknown"
+        dist_stats[d]["total"] += 1
+        dist_stats[d][rec["Status"]] += 1
+
+    cols = ["#", "District", "Total CDDs", "HIGH", "MODERATE", "LOW", "NEVER SYNCED", "% Never Synced"]
+    for ci, h in enumerate(cols, 1):
+        _style(ws.cell(row=1, column=ci, value=h), fill=_HDR_FILL, bold=True, color="FFFFFF")
+
+    for ri, (dist, s) in enumerate(sorted(dist_stats.items()), 2):
+        pct = f"{s['NEVER SYNCED']/s['total']*100:.1f}%" if s["total"] else "-"
+        vals = [ri - 1, dist, s["total"], s["HIGH"], s["MODERATE"], s["LOW"], s["NEVER SYNCED"], pct]
+        for ci, val in enumerate(vals, 1):
+            _style(ws.cell(row=ri, column=ci, value=val))
+
+    tr = len(dist_stats) + 2
+    totals = [
+        "", "GRAND TOTAL",
+        sum(s["total"] for s in dist_stats.values()),
+        sum(s["HIGH"] for s in dist_stats.values()),
+        sum(s["MODERATE"] for s in dist_stats.values()),
+        sum(s["LOW"] for s in dist_stats.values()),
+        sum(s["NEVER SYNCED"] for s in dist_stats.values()),
+        "",
+    ]
+    for ci, val in enumerate(totals, 1):
+        _style(ws.cell(row=tr, column=ci, value=val), fill=_TOTAL_FILL, bold=True)
+
+    note_row = tr + 2
+    ws.cell(note_row, 1,
+            "Note: roster is derived from CDDs who have synced at least once for this "
+            "campaign (no assigned-staff roster available). NEVER SYNCED will always "
+            "read 0 here — a CDD who has never synced cannot appear in this workbook.")
+    ws.merge_cells(start_row=note_row, start_column=1, end_row=note_row, end_column=len(cols))
+    ws.cell(note_row, 1).alignment = ws.cell(note_row, 1).alignment.copy(horizontal="left", wrap_text=True)
+
+    return dist_stats, tr
+
+
+def run(cfg):
+    """
+    Returns a dict of what's verified/available. `roster_total` and `coverage_pct`
+    are deliberately None — see module docstring for why that denominator isn't
+    solved yet. Callers (report_itn.py) must handle None gracefully, not assume
+    a coverage percentage exists.
+    """
+    log.info(f"[cdd_sync_itn] {cfg['state_name']} — checking CDD sync activity ...")
+
+    today_str = cfg.get("extract_date").isoformat() if cfg.get("extract_date") else None
+
+    cumulative_cdds, cumulative_docs = _distinct_cdds_synced(cfg)
+    today_cdds, today_docs = (None, None)
+    if today_str:
+        today_cdds, today_docs = _distinct_cdds_synced(cfg, today_str)
+
+    log.info(
+        f"[cdd_sync_itn] cumulative distinct CDDs synced (this campaign): {cumulative_cdds:,} "
+        f"({cumulative_docs:,} sync records)"
+        + (f"; today: {today_cdds:,} ({today_docs:,} records)" if today_str else "")
+    )
+
+    # Time-cutoff sync counts. Same-day operational metric, meaningless once the
+    # report spans the whole multi-month campaign — skip for cumulative runs, same
+    # gating as cdd_sync.py's _write_summary caller.
+    synced_by_1700 = synced_by_1730 = None
+    if today_str and not cfg.get("cumulative"):
+        synced_by_1700 = _count_synced_by_cutoff(cfg, 17, 0)
+        synced_by_1730 = _count_synced_by_cutoff(cfg, 17, 30)
+
+    # ── Excel workbook (sync-derived roster) ───────────────────────────────
+    all_rows = _build_roster_rows(cfg)
+    out = None
+    low_count = 0
+    if all_rows:
+        wb = Workbook()
+        wb.remove(wb.active)
+
+        ws_sum = wb.create_sheet("SUMMARY")
+        dist_stats, last_row = _write_summary_itn(ws_sum, all_rows)
+
+        # Append time-based stats below the note row, same layout as cdd_sync.py
+        total_cdds = len(all_rows)
+        time_rows = []
+        if synced_by_1700 is not None:
+            pct = f"{synced_by_1700/total_cdds*100:.1f}%" if total_cdds else "-"
+            time_rows.append(("Synced by 17:00 today (UTC)", synced_by_1700, pct))
+        if synced_by_1730 is not None:
+            pct = f"{synced_by_1730/total_cdds*100:.1f}%" if total_cdds else "-"
+            time_rows.append(("Synced by 17:30 today (UTC)", synced_by_1730, pct))
+        for i, (label, count, pct) in enumerate(time_rows):
+            r = last_row + 4 + i
+            ws_sum.cell(r, 1, label)
+            ws_sum.cell(r, 2, count)
+            ws_sum.cell(r, 3, pct)
+            for ci in range(1, 4):
+                _style(ws_sum.cell(r, ci), fill=_TOTAL_FILL, bold=True)
+
+        COLS = ["Health Facility", "Username", "User ID", "Distinct Days Synced",
+                "Total Sync Records", "First Sync Date", "Last Sync Date", "Status"]
+        df_all = pd.DataFrame(all_rows).sort_values(["District", "Last Sync Date"])
+
+        # Per-district tabs
+        for dist in sorted(df_all["District"].unique()):
+            df_d = df_all[df_all["District"] == dist][COLS].copy().reset_index(drop=True)
+            df_d.insert(0, "#", range(1, len(df_d) + 1))
+            safe = str(dist).translate(str.maketrans("/\\*?[]:", "-------"))[:31] or "Unknown"
+            ws = wb.create_sheet(safe)
+            _write_df_itn(ws, df_d)
+
+        # NEVER SYNCED — same tab name as cdd_sync.py, always empty here (see
+        # module docstring: sync-derived roster structurally can't contain one).
+        df_never = df_all[df_all["Status"] == "NEVER SYNCED"][
+            ["District"] + COLS
+        ].reset_index(drop=True)
+        df_never.insert(0, "#", range(1, len(df_never) + 1))
+        ws_never = wb.create_sheet("NEVER SYNCED")
+        _write_df_itn(ws_never, df_never)
+
+        # LOW SYNCED — same tab name as cdd_sync.py
+        df_low = df_all[df_all["Status"] == "LOW"][
+            ["District"] + COLS
+        ].reset_index(drop=True)
+        df_low.insert(0, "#", range(1, len(df_low) + 1))
+        low_count = len(df_low)
+        ws_low = wb.create_sheet("LOW SYNCED")
+        _write_df_itn(ws_low, df_low)
+
+        # NOT SYNCED TODAY — only meaningful on a daily run, and only among CDDs
+        # we know about (roster is sync-derived; see note row in SUMMARY)
+        if today_str and not cfg.get("cumulative"):
+            df_nst = df_all[df_all["Synced Today"] == "N"][
+                ["District"] + COLS
+            ].reset_index(drop=True)
+            df_nst.insert(0, "#", range(1, len(df_nst) + 1))
+            ws_nst = wb.create_sheet("NOT SYNCED TODAY")
+            _write_df_itn(ws_nst, df_nst)
+
+        out = cfg["sync_xlsx"]
+        wb.save(out)
+        log.info(
+            f"[cdd_sync_itn] saved -> {out}  "
+            f"({total_cdds} CDDs in roster, {low_count} LOW)"
+        )
+
+    return {
+        "role": CDD_ROLE,
+        "campaign_scoped": True,   # confirmed via additionalDetails.projectReferenceId
+        "cumulative_cdds_synced": cumulative_cdds,
+        "cumulative_sync_records": cumulative_docs,
+        "today_cdds_synced": today_cdds,
+        "today_sync_records": today_docs,
+        "synced_by_1700": synced_by_1700,
+        "synced_by_1730": synced_by_1730,
+        "roster_total": None,     # TODO: needs DB projecthierarchy join — see docstring
+        "coverage_pct": None,     # cannot compute without roster_total
+        "roster_ever_synced": len(all_rows),
+        "roster_low": low_count,
+        "sync_xlsx": out,
+    }
