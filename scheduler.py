@@ -162,6 +162,8 @@ def _reload_schedule():
     schedule.clear()
     schedule.every(1).hours.do(_reload_schedule)
 
+    from pipeline.schedule_utils import compute_trigger_slots
+
     def _schedule_times(state, times, row, mode):
         n = 0
         for t in times:
@@ -178,25 +180,14 @@ def _reload_schedule():
         if row.get("active", "").strip().upper() not in ("TRUE", "YES", "1", "Y"):
             continue
         state = row.get("state_name", "?")
-        internal_times = [t.strip() for t in str(row.get("report_times", "")).split(",") if t.strip()]
-        partner_times  = [t.strip() for t in str(row.get("partner_report_times", "")).split(",") if t.strip()]
-
-        if partner_times:
-            # A time in BOTH lists → one combined "both" run (avoids two same-time runs
-            # colliding on the per-campaign lock). Otherwise internal-only / partner-only.
-            both_times    = [t for t in internal_times if t in partner_times]
-            internal_only = [t for t in internal_times if t not in partner_times]
-            partner_only  = [t for t in partner_times  if t not in internal_times]
-            if not internal_times:
-                log.warning(f"[{state}] report_times not set — no internal jobs scheduled")
-            job_count += _schedule_times(state, both_times, row, "both")
-            job_count += _schedule_times(state, internal_only, row, "internal")
-            job_count += _schedule_times(state, partner_only, row, "partner")
-        else:
-            # Backward-compatible: report_times posts BOTH internal and partner together
-            if not internal_times:
-                log.warning(f"[{state}] report_times not set — no jobs scheduled"); continue
-            job_count += _schedule_times(state, internal_times, row, "both")
+        slots = compute_trigger_slots(row)
+        if not slots:
+            log.warning(f"[{state}] report_times not set — no jobs scheduled"); continue
+        by_mode = {}
+        for t, mode in slots:
+            by_mode.setdefault(mode, []).append(t)
+        for mode, times in by_mode.items():
+            job_count += _schedule_times(state, times, row, mode)
 
     log.info(f"Schedule loaded: {job_count} job(s) across {len(rows)} campaign(s)")
 
