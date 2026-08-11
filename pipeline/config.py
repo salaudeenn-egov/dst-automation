@@ -64,6 +64,15 @@ def _bool(val):
     return str(val).strip().upper() in ("TRUE", "YES", "1", "Y")
 
 
+# ── in-code feature defaults ───────────────────────────────────────────────────
+# ITN duplicate-distribution matrix (analyze_itn._classify_duplicates): the
+# code-side switch, so no Google Sheet column is needed. Flip to "TRUE" to
+# enable it for every ITN/LLIN row this deployment runs; SMC/AZM rows never
+# read it. A dup_matrix column on the sheet, if one is ever added, overrides
+# this per row (TRUE/FALSE cell beats the default; empty cell falls back here).
+DUP_MATRIX_DEFAULT = "FALSE"
+
+
 def _date_label(d):
     return f"{d.day} {_MONTH_MAP[d.month]} {d.year}"
 
@@ -273,6 +282,13 @@ def build(row):
         # isolates the campaign. TRUE only for AZM/non-admin where multiple project types
         # share the same tenant and date range.
         "task_campaign_filter": _bool(row.get("task_campaign_filter", "FALSE")),
+
+        # ITN only: duplicate-distribution matrix (same/different user x same/different
+        # day per household). Off keeps every existing number, query, Word section and
+        # Slack post unchanged (the performance Excel only gains six empty trailing
+        # columns). Default lives IN CODE (DUP_MATRIX_DEFAULT above — no sheet column
+        # required); a non-empty dup_matrix sheet cell overrides it per row.
+        "dup_matrix": _bool(str(row.get("dup_matrix", "")).strip() or DUP_MATRIX_DEFAULT),
 
         # secondary product(s) counted alongside the primary drug — empty = disabled.
         # Legacy single string (age 3-59) OR a spec list (see _parse_secondary_products).

@@ -22,11 +22,11 @@ import json
 import logging
 import os
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import openpyxl
 from docx import Document
-from docx.shared import Pt, Cm, Inches
+from docx.shared import Pt, Cm, Inches, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 from pipeline.report import (
@@ -61,15 +61,33 @@ def _load_perf_itn(path):
     # #, Province, LGA, Facilities, Target HH, HH Visited, HH Cov%,
     # Target Pop, Pop Covered, Pop Cov%, Target ITN, Nets Distributed, ITN Cov%,
     # Status, Records, Dup Records, Missing HH Head, Missing GPS,
-    # Manual Codes, Scanned Codes, % Scanned, Missing Codes
+    # Manual Codes, Scanned Codes, % Scanned, Missing Codes,
+    # then (appended at the END — cols 22-25, may be ABSENT on pre-matrix files)
+    # the duplicate-matrix buckets in _DUP_MATRIX_KEYS order.
     lga_d = {}
 
     for row in rows_raw:
+        # Pad short rows (older-generation files) so the fixed unpack below
+        # cannot raise — absent trailing columns read as None.
+        if len(row) < 22:
+            row = tuple(row) + (None,) * (22 - len(row))
         (_, province, lga, facs, hh_t, hh_v, hh_cov, pop_t, pop_c, pop_cov,
          net_t, net_d, net_cov, status, records, dup, miss_hh, miss_gps,
          manual_codes, scanned_codes, pct_scanned, miss_codes) = row[:22]
 
         def i(v): return int(v or 0)
+
+        def dm(idx):
+            # Duplicate-matrix cell: absent column (old file) or empty cell
+            # (matrix off/failed that run) -> None ("not measured"), never a
+            # fabricated 0 — the doc section is omitted entirely on None.
+            v = row[idx] if len(row) > idx else None
+            if v is None or str(v).strip() == "":
+                return None
+            try:
+                return int(float(v))
+            except (ValueError, TypeError):
+                return None
 
         if not lga:
             continue
@@ -83,6 +101,7 @@ def _load_perf_itn(path):
             missing_hh_head=i(miss_hh), missing_gps=i(miss_gps),
             manual_codes=i(manual_codes), scanned_codes=i(scanned_codes),
             missing_codes=i(miss_codes),
+            **{k: dm(22 + n) for n, k in enumerate(_DUP_MATRIX_KEYS)},
         )
 
     facilities = _load_facility_detail_itn(path)
@@ -133,6 +152,31 @@ def _grand_totals(lga_d):
             if isinstance(v, (int, float)):
                 g[k] += v
     return g
+
+
+# Same key order as analyze_itn._DUP_KEYS / its appended _DUP_HEADERS columns —
+# kept in sync manually since this module reads the Excel, not analyze_itn.
+_DUP_MATRIX_KEYS = ("dup_su_sd", "dup_su_dd", "dup_du_sd", "dup_du_dd")
+
+
+def _dup_matrix_totals(lga_d):
+    """
+    Totals of the duplicate-distribution matrix, or None when the matrix was
+    not measured for this extract (dup_matrix off, enrichment failed, or a
+    pre-matrix Excel) — callers render nothing on None, never fabricated zeros.
+    Measured/None is expected to be uniform across rows; a mix (hand-edited
+    file, writer bug) is warned about since None rows would sum as zeros.
+    """
+    if not lga_d:
+        return None
+    none_rows = sum(1 for D in lga_d.values()
+                    if all(D.get(k) is None for k in _DUP_MATRIX_KEYS))
+    if none_rows == len(lga_d):
+        return None
+    if none_rows:
+        log.warning(f"[report_itn] dup matrix: {none_rows}/{len(lga_d)} LGA rows unmeasured "
+                    f"but others measured — totals treat unmeasured rows as 0")
+    return {k: sum(D.get(k) or 0 for D in lga_d.values()) for k in _DUP_MATRIX_KEYS}
 
 
 def _cov_str(numer, denom):
@@ -195,6 +239,65 @@ def _load_sync_summary_itn(path):
 # data — same as SPAQ's per-day files — and this accumulates a running sum across
 # days, the same way report.py's _load_all_days_perf/_generate_progress_chart do,
 # rather than needing any delta/subtraction workaround.
+
+def _load_days_from_es_itn(cfg, elapsed_day):
+    """
+    Per-day series straight from ES AT REPORT TIME — one aggregation per
+    campaign day (distinct households, sum of nets, sum of memberCount).
+    This is the primary source for the cumulative view; the itn_history
+    file-sum (_load_all_days_perf_itn) is only the fallback.
+
+    Why ES and not the day files: each day file is frozen at that day's report
+    time, and records synced later (with taskDates still = that day) never
+    reach any file — on chad roughly half of a day's data arrives after the
+    report runs, so the file-summed cumulative drifted to ~half of the
+    dashboard's truth. ES always holds the complete picture for past days, so
+    this back-fill self-heals on every run. Same pattern as report.py's
+    _load_days_from_es for SPAQ.
+
+    Semantics match the DSS dashboard tiles: households = distinct householdId
+    per day (cardinality, approximate above ~40k/day), nets = sum(quantity),
+    population = sum(memberCount) over ADMINISTRATION_SUCCESS records of the
+    campaign. Raises on ES failure — the caller falls back to the file-sum.
+    """
+    import requests
+    if not (cfg.get("campaign_start") and elapsed_day):
+        return []
+    url, idx, auth = cfg["es_url"], cfg["ES_INDEX_TASK"], cfg["es_auth"]
+    date_field = cfg.get("task_date_field", "taskDates")
+    scope = [
+        {"term": {"Data.additionalDetails.projectReferenceId.keyword": cfg["campaign_number"]}},
+        {"term": {"Data.administrationStatus.keyword": "ADMINISTRATION_SUCCESS"}},
+    ]
+    days = []
+    cum_hh = cum_pop = cum_nets = 0
+    for day_num in range(1, elapsed_day + 1):
+        d   = cfg["campaign_start"] + timedelta(days=day_num - 1)
+        rng = {"range": {f"Data.{date_field}": {
+            "gte": f"{d.isoformat()}T00:00:00.000Z", "lte": f"{d.isoformat()}T23:59:59.999Z"}}}
+        q = {"size": 0,
+             "query": {"bool": {"filter": scope + [rng]}},
+             "aggs": {
+                 "hh":   {"cardinality": {"field": "Data.householdId.keyword",
+                                           "precision_threshold": 40000}},
+                 "nets": {"sum": {"field": "Data.quantity"}},
+                 "pop":  {"sum": {"field": "Data.memberCount"}},
+             }}
+        r = requests.post(f"{url}/{idx}/_search", json=q, auth=auth, verify=False, timeout=60)
+        r.raise_for_status()
+        a = r.json()["aggregations"]
+        hh, nets, pop = int(a["hh"]["value"]), int(a["nets"]["value"] or 0), int(a["pop"]["value"] or 0)
+        cum_hh += hh; cum_pop += pop; cum_nets += nets
+        days.append({
+            "day": day_num, "date": d.strftime("%d %b"),
+            "hh_visited": hh, "pop_covered": pop, "nets_distributed": nets,
+            "cum_hh_visited": cum_hh, "cum_pop_covered": cum_pop,
+            "cum_nets_distributed": cum_nets,
+        })
+    log.info(f"[report_itn] day series from ES: {len(days)} days, "
+             f"cumulative nets {cum_nets:,} (late syncs included)")
+    return days
+
 
 def _load_all_days_perf_itn(cfg, elapsed_day):
     """
@@ -337,7 +440,7 @@ def _progress_table_itn(doc, days_data, current_daily_target):
     average so far), not the chart's full-campaign-target metric. Mirrored here
     as current_daily_target x elapsed days, rather than literally summing each
     day's stored target value — because a historical itn_history/ snapshot can
-    carry a stale target (e.g. from before this session's fixes), and summing
+    carry a stale target (written by an older code version), and summing
     stale + fresh values would silently corrupt this total. Every day's real
     daily target is the same fixed value all campaign (full target / campaign
     days), so multiplying today's fresh figure by the day count is equivalent
@@ -405,7 +508,7 @@ def _conclusion_prompt(cfg, g, hh_cov, pop_cov, net_cov, lga_d, roster_ever_sync
         f"Households Visited:{g['hh_visited']:,}/{g['hh_target']:,}  "
         f"Nets Distributed:{g['nets_distributed']:,}/{g['net_target']:,}\n"
         f"BestLGA:{best_lga} WorstLGA:{worst_lga}\n"
-        f"DuplicateRecords:{g['dup_records']:,} MissingHHHead:{g['missing_hh_head']:,} MissingGPS:{g['missing_gps']:,}\n"
+        f"MissingHHHead:{g['missing_hh_head']:,} MissingGPS:{g['missing_gps']:,}\n"
         f"CDDSync:{sync_str}\n"
         "Write a 5-sentence formal conclusion covering: (1) overall ITN distribution coverage vs target "
         "(2) best-performing LGA numbers (3) worst-performing LGA implication "
@@ -422,7 +525,10 @@ def _slack_prompt(cfg, g, hh_cov, pop_cov, net_cov, roster_ever_synced=0, roster
         f"ITN Coverage: {net_cov}\n"
         f"Households visited: {g['hh_visited']:,} of {g['hh_target']:,}\n"
         f"Nets distributed: {g['nets_distributed']:,} of {g['net_target']:,}\n"
-        f"Duplicate records: {g['dup_records']:,}\n"
+        # No duplicate figure: the legacy within-day dup_records number reads
+        # as "double distribution" but only counts same-ID re-syncs — the
+        # authoritative duplicate analysis lives in the internal report's
+        # Duplicate Distribution section.
         f"Missing household head name: {g['missing_hh_head']:,}\n"
         f"Missing GPS: {g['missing_gps']:,}\n"
         + (f"CDDs synced: {roster_high:,} of {roster_ever_synced:,} ({sync_pct})\n" if roster_ever_synced else "")
@@ -437,6 +543,10 @@ def _slack_prompt(cfg, g, hh_cov, pop_cov, net_cov, roster_ever_synced=0, roster
 
 
 def _issues_prompt(cfg, g, hh_cov, pop_cov, net_cov, lga_d, facilities, sync_lga_rows, sync_time_stats):
+    # Deliberately receives NO duplicate-matrix facts: issues_data is shared
+    # by the internal AND partner documents, and duplicate metrics are a DQ
+    # surface stripped from every partner output. The matrix has its own
+    # deterministic section in the internal report.
     low_act = [f for f in facilities if f["records"] < 10]
     worst_lga = min(
         lga_d,
@@ -456,7 +566,7 @@ def _issues_prompt(cfg, g, hh_cov, pop_cov, net_cov, lga_d, facilities, sync_lga
         f"{header}\n"
         f"HHCoverage:{hh_cov} PopCoverage:{pop_cov} ITNCoverage:{net_cov}\n"
         f"WorstLGA:{worst_lga}\n"
-        f"LowActivity(<10 records):{len(low_act)} DuplicateRecords:{g['dup_records']:,} "
+        f"LowActivity(<10 records):{len(low_act)} "
         f"MissingHHHead:{g['missing_hh_head']:,} MissingGPS:{g['missing_gps']:,}\n"
         f"CDDSync:{sync_str}{by17}\n"
         'Return ONLY a JSON array of 3-5 issues, no markdown:\n'
@@ -599,10 +709,14 @@ def _sync_section_itn(doc, sec_num, sync_lga_rows, sync_time_stats, sync_note,
                 dat(tr.cells[ci], val, alt=alt)
 
 
-def _dq_summary_table(doc, g, sec_num="3.5"):
+def _dq_summary_table(doc, g, sec_num="3.5", dup_matrix=None, lga_d=None, perf_link=""):
     total = g["hh_visited"] or 1
-    metrics = [
-        ("Duplicate Records",              g["dup_records"]),
+    # The flat "Duplicate Records" row appears only when the matrix wasn't
+    # measured — otherwise its four-way breakdown (subsection .3) replaces it.
+    metrics = []
+    if dup_matrix is None:
+        metrics.append(("Duplicate Records", g["dup_records"]))
+    metrics += [
         ("Missing Household Head Name",    g["missing_hh_head"]),
         ("Missing GPS",                    g["missing_gps"]),
     ]
@@ -658,6 +772,68 @@ def _dq_summary_table(doc, g, sec_num="3.5"):
     dat(row.cells[2], pct_missing_codes)
     doc.add_paragraph()
 
+    # Duplicate Distribution — rendered only when the matrix was measured.
+    if dup_matrix is not None:
+        add_heading(doc, f"{sec_num}.3  Duplicate Distribution", 5)
+        _dup_matrix_section(doc, dup_matrix, lga_d or {}, g["records"], perf_link=perf_link)
+        doc.add_paragraph()
+
+
+def _dup_matrix_section(doc, dm, lga_d, total_records, perf_link=""):
+    """
+    Duplicate Distribution table — internal report only (the caller gates on
+    `partner`, like every DQ section). Counts are record-level classifications
+    against each household's earliest campaign-to-date record (see
+    analyze_itn._classify_duplicates), so they deliberately do not reconcile
+    with the within-day Duplicate Records column — the note under the table
+    says so.
+    """
+    total_records = total_records or 1
+    rows_spec = [
+        ("Same user, same day", dm["dup_su_sd"],
+         "Sync retries / double taps — technical, no field action", False),
+        ("Same user, different days", dm["dup_su_dd"],
+         "CDD re-visited a household they already served", False),
+        ("Different users, same day", dm["dup_du_sd"],
+         "Two CDDs served one household the same day — coordination gap", True),
+        ("Different users, different days", dm["dup_du_dd"],
+         "Household re-served on a later day — double distribution", True),
+    ]
+
+    # Equation only — the classification logic lives in the grey note below.
+    add_para(doc, "Formula:  % of Records = Bucket Count ÷ Total Records × 100",
+              size=8, color=GREY_RGB)
+
+    _DUP_RED = RGBColor(0xCC, 0x00, 0x00)   # same red as ACTIVE/High elsewhere
+    header = ["Duplicate Type", "Count", "% of Records", "Reading"]
+    table = doc.add_table(rows=1, cols=len(header))
+    table.style = "Table Grid"
+    for ci, h in enumerate(header):
+        hdr(table.cell(0, ci), h)
+    for ri, (label, count, reading, emph) in enumerate(rows_spec, 1):
+        row = table.add_row()
+        alt = ri % 2 == 1
+        # The costly buckets (different-user / re-served rows) flag in bold red,
+        # and only when non-zero — a zero is good news, not an alert.
+        flag = _DUP_RED if (emph and count) else None
+        dat(row.cells[0], label, alt=alt, align=WD_ALIGN_PARAGRAPH.LEFT, bold=emph)
+        dat(row.cells[1], f"{count:,}", alt=alt, bold=emph, color=flag)
+        dat(row.cells[2], f"{count/total_records*100:.2f}%", alt=alt, bold=emph, color=flag)
+        dat(row.cells[3], reading, alt=alt, align=WD_ALIGN_PARAGRAPH.LEFT, size=9)
+    doc.add_paragraph()
+
+    # Method note, ending in a Drive hyperlink to the performance Excel (same
+    # pattern as the Low Activity and sync sections' links).
+    note_p = add_para(doc, "Households are matched by head name, household size and village; "
+                            "any delivery after a household's first is a duplicate. Affected "
+                            "households are listed per type in the DUP sheets of the ",
+                       size=8, color=GREY_RGB)
+    if perf_link:
+        _add_hyperlink(note_p, "performance Excel ↗", perf_link)
+    else:
+        run = note_p.add_run("performance Excel.")
+        run.font.name = FONT; run.font.size = Pt(8); run.font.color.rgb = GREY_RGB
+
 
 def _low_activity_facility_table(doc, facilities, perf_link=""):
     """
@@ -702,7 +878,9 @@ def _low_activity_facility_table(doc, facilities, perf_link=""):
 # Same DQ-column set as analyze_itn.HEADERS' DQ additions — kept in sync manually
 # since this reads the Excel by header name, not by importing analyze_itn.
 _DQ_COLS_ITN = {"Duplicate Records", "Missing HH Head", "Missing GPS",
-                "Manual Codes", "Scanned Codes", "% Scanned", "Missing Codes"}
+                "Manual Codes", "Scanned Codes", "% Scanned", "Missing Codes",
+                "Dup Same User Same Day", "Dup Same User Diff Day",
+                "Dup Diff User Same Day", "Dup Diff User Diff Day"}
 
 
 def _make_partner_perf_xlsx_itn(perf_path):
@@ -716,6 +894,12 @@ def _make_partner_perf_xlsx_itn(perf_path):
         return ""
     try:
         wb = openpyxl.load_workbook(perf_path)
+        # Every DUP* sheet (one per duplicate type; also covers the older
+        # single "DUPLICATE DETAIL" tab) is dropped WHOLE, not column-stripped —
+        # head names + household CRIDs + usernames, internal tracing data that
+        # must never leave the internal report.
+        for name in [n for n in wb.sheetnames if n.upper().startswith("DUP")]:
+            wb.remove(wb[name])
         for ws in wb.worksheets:
             headers = [c.value for c in ws[HEADER_ROW]]
             to_del  = sorted([i + 1 for i, h in enumerate(headers) if h in _DQ_COLS_ITN], reverse=True)
@@ -743,7 +927,8 @@ def _make_partner_perf_xlsx_itn(perf_path):
 def _build_doc(cfg, *, g, hh_cov, pop_cov, net_cov, lga_d, facilities,
                 issues_data, sync_lga_rows, sync_time_stats, sync_note,
                 roster_ever_synced, roster_high, days_data, chart_path,
-                conclusion, perf_link, sync_link="", perf_path="", sync_path="", partner=False):
+                conclusion, perf_link, sync_link="", perf_path="", sync_path="",
+                partner=False, dup_matrix=None):
     doc = Document()
     for section in doc.sections:
         section.top_margin = section.bottom_margin = Cm(1.8)
@@ -957,8 +1142,12 @@ def _build_doc(cfg, *, g, hh_cov, pop_cov, net_cov, lga_d, facilities,
     # session). Do not fabricate zeros here; add once confirmed.
 
     if not partner:
+        # Duplicate Distribution renders inside Data Quality Summary (as .3,
+        # replacing the flat Duplicate Records row) and only when the matrix
+        # was measured — None keeps the summary's classic shape.
         add_heading(doc, f"{dist_sec}.{sub}  Data Quality Summary", 5)
-        _dq_summary_table(doc, g, sec_num=f"{dist_sec}.{sub}")
+        _dq_summary_table(doc, g, sec_num=f"{dist_sec}.{sub}",
+                          dup_matrix=dup_matrix, lga_d=lga_d, perf_link=perf_link)
         doc.add_paragraph()
     sec += 1
 
@@ -1018,6 +1207,11 @@ def run(cfg):
     pop_cov = _cov_str(g["pop_covered"], g["pop_target"])
     net_cov = _cov_str(g["nets_distributed"], g["net_target"])
 
+    # Duplicate-distribution matrix — None when not measured for this extract
+    # (dup_matrix off, enrichment failed, or a pre-matrix Excel); every consumer
+    # below (doc section, issues facts, Slack line) skips entirely on None.
+    dup_matrix = _dup_matrix_totals(lga_d)
+
     log.info(f"  {len(facilities)} facilities, {len(lga_d)} LGAs, ITN coverage {net_cov}")
 
     # CDD sync data — read back the Excel cdd_sync_itn.py already wrote (same
@@ -1050,12 +1244,20 @@ def run(cfg):
     cfg["perf_drive_link"] = perf_link
     cfg["sync_drive_link"] = sync_link
 
-    # Day-wise progress — read back itn_history/ (analyze_itn.py's day-indexed
-    # snapshots), same mechanism as report.py's _load_all_days_perf.
+    # Day-wise progress — primary source is ES at report time (late syncs
+    # included; the itn_history files are frozen at each day's report time and
+    # undercount — proven ~2x low on chad). File-sum is the fallback only.
     elapsed_day = None
     if cfg.get("campaign_start") and cfg.get("extract_date"):
         elapsed_day = (cfg["extract_date"] - cfg["campaign_start"]).days + 1
-    days_data = _load_all_days_perf_itn(cfg, elapsed_day)
+    days_data = []
+    try:
+        days_data = _load_days_from_es_itn(cfg, elapsed_day)
+    except Exception as e:
+        log.warning(f"[report_itn] ES day-series back-fill failed (non-fatal — "
+                    f"falling back to itn_history files, cumulative may undercount): {e}")
+    if not days_data:
+        days_data = _load_all_days_perf_itn(cfg, elapsed_day)
 
     # TRUE daily target, generic for any campaign/tenant: g["net_target"] is
     # already the daily figure in daily mode, or the full campaign figure in
@@ -1100,7 +1302,8 @@ def run(cfg):
                      roster_ever_synced=roster_ever_synced, roster_high=roster_high,
                      days_data=days_data, chart_path=chart_path,
                      conclusion=conclusion, perf_link=perf_link, sync_link=sync_link,
-                     perf_path=perf_path, sync_path=sync_path, partner=False)
+                     perf_path=perf_path, sync_path=sync_path, partner=False,
+                     dup_matrix=dup_matrix)
     out = cfg["docx_path"]
     doc.save(out)
     log.info(f"[report_itn] saved -> {out}")
