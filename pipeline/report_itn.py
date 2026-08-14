@@ -5,10 +5,9 @@ Separate module from report.py by design (see analyze_itn.py's docstring for the
 full reasoning): report.py's _build_doc() hardcodes "Children Treated" / drug1-drug2
 splits and individual-child DQ metrics throughout nearly every section, not just in
 a couple of branches — retrofitting ITN there would mean wrapping most of a 300-line
-function in conditionals. This module reuses ONLY the generic, drug-agnostic docx
-styling helpers from report.py (hdr, dat, add_heading, add_para, set_cell_bg,
-set_cell_borders, _add_hyperlink, _two_col_table) — report.py itself is never
-modified and its SPAQ/AZM path is untouched.
+function in conditionals. Shares only the generic docx styling helpers in
+pipeline.core.word — report.py itself is never imported and its SPAQ/AZM path
+is untouched.
 
 Section structure deliberately mirrors report.py's Word report (same rigor, same
 sections) so the two report types read consistently to the same audience:
@@ -29,10 +28,11 @@ from docx import Document
 from docx.shared import Pt, Cm, Inches, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-from pipeline.report import (
-    hdr, dat, add_heading, add_para, set_cell_bg, set_cell_borders,
-    _add_hyperlink, _two_col_table, _cov_band, STATUS_COLOR, GREY_RGB, TITLE_RGB,
-    FONT, _claude, ALT_FILL,
+from pipeline.core.llm import generate_narrative
+from pipeline.core.word import (
+    ALT_FILL, FONT, GREY_RGB, STATUS_COLOR, TITLE_RGB,
+    add_heading, add_hyperlink, add_para, cov_band, dat, hdr, set_cell_bg,
+    set_cell_borders, two_col_table,
 )
 
 log = logging.getLogger(__name__)
@@ -470,7 +470,7 @@ def _progress_table_itn(doc, days_data, current_daily_target):
         day_cov_pct = (d["nets_distributed"] / current_daily_target * 100
                        if current_daily_target else 0)
         day_cov_str = f"{day_cov_pct:.1f}%" if current_daily_target else "N/A"
-        cov_color = STATUS_COLOR.get(_cov_band(day_cov_pct) if current_daily_target else "NO TARGET")
+        cov_color = STATUS_COLOR.get(cov_band(day_cov_pct) if current_daily_target else "NO TARGET")
         vals = [f"Day {d['day']}", d["date"], f"{current_daily_target:,.0f}",
                 f"{d['nets_distributed']:,}", day_cov_str]
         for ci, val in enumerate(vals):
@@ -575,9 +575,9 @@ def _issues_prompt(cfg, g, hh_cov, pop_cov, net_cov, lga_d, facilities, sync_lga
     )
 
 
-def _claude_issues(cfg, g, hh_cov, pop_cov, net_cov, lga_d, facilities, sync_lga_rows, sync_time_stats):
+def _generate_issues(cfg, g, hh_cov, pop_cov, net_cov, lga_d, facilities, sync_lga_rows, sync_time_stats):
     prompt = _issues_prompt(cfg, g, hh_cov, pop_cov, net_cov, lga_d, facilities, sync_lga_rows, sync_time_stats)
-    raw = _claude(prompt, max_tokens=1500)
+    raw = generate_narrative(prompt, max_tokens=1500)
     try:
         text = raw.strip()
         if text.startswith("```"):
@@ -619,7 +619,7 @@ def _perf_table(doc, lga_d):
     for ri, (dist, D) in enumerate(sorted(lga_d.items()), 1):
         raw_pct = D["nets_distributed"] / D["net_target"] * 100 if D["net_target"] else None
         cov     = f"{raw_pct:.1f}%" if raw_pct is not None else "N/A"
-        stat    = _cov_band(raw_pct) if raw_pct is not None else "NO TARGET"
+        stat    = cov_band(raw_pct) if raw_pct is not None else "NO TARGET"
         vals = [dist, D["facs"], f"{D['hh_target']:,}", f"{D['hh_visited']:,}",
                 f"{D['hh_visited']/D['hh_target']*100:.1f}%" if D["hh_target"] else "N/A",
                 f"{D['net_target']:,}", f"{D['nets_distributed']:,}", cov, stat]
@@ -681,7 +681,7 @@ def _sync_section_itn(doc, sec_num, sync_lga_rows, sync_time_stats, sync_note,
         hour = label.replace("Synced by ", "").replace(" today (UTC)", "")
         if count is not None:
             summary_rows.append((f"Synced by {hour}", f"{count:,}  ({pct})  — early sync indicator"))
-    _two_col_table(doc, summary_rows, col_widths=(5, 6))
+    two_col_table(doc, summary_rows, col_widths=(5, 6))
     doc.add_paragraph()
 
     if sync_note:
@@ -692,7 +692,7 @@ def _sync_section_itn(doc, sec_num, sync_lga_rows, sync_time_stats, sync_note,
         add_heading(doc, f"{sec_num}.2  Sync Status by LGA", 5)
         note_p = add_para(doc, "", size=9, color=GREY_RGB)
         if sync_link:
-            _add_hyperlink(note_p, "Full CDD sync data ↗", sync_link)
+            add_hyperlink(note_p, "Full CDD sync data ↗", sync_link)
         else:
             run_d = note_p.add_run("Full CDD sync data.")
             run_d.font.name = FONT; run_d.font.size = Pt(9); run_d.font.color.rgb = GREY_RGB
@@ -829,7 +829,7 @@ def _dup_matrix_section(doc, dm, lga_d, total_records, perf_link=""):
                             "households are listed per type in the DUP sheets of the ",
                        size=8, color=GREY_RGB)
     if perf_link:
-        _add_hyperlink(note_p, "performance Excel ↗", perf_link)
+        add_hyperlink(note_p, "performance Excel ↗", perf_link)
     else:
         run = note_p.add_run("performance Excel.")
         run.font.name = FONT; run.font.size = Pt(8); run.font.color.rgb = GREY_RGB
@@ -850,7 +850,7 @@ def _low_activity_facility_table(doc, facilities, perf_link=""):
     note_text  = f"Showing {shown} Low Activity facilities (<10 records) of {total_facs} total. "
     note_p     = add_para(doc, note_text, size=9, color=GREY_RGB)
     if perf_link:
-        _add_hyperlink(note_p, "Full list in performance Excel ↗", perf_link)
+        add_hyperlink(note_p, "Full list in performance Excel ↗", perf_link)
     else:
         run = note_p.add_run("Full list in performance Excel.")
         run.font.name = FONT; run.font.size = Pt(9); run.font.color.rgb = GREY_RGB
@@ -1049,7 +1049,7 @@ def _build_doc(cfg, *, g, hh_cov, pop_cov, net_cov, lga_d, facilities,
             (f"Cumulative Population Covered (Days 1-{elapsed_day or '?'})",   f"{cum_pop_covered:,}"),
             (f"Cumulative Nets Distributed (Days 1-{elapsed_day or '?'})",     f"{cum_nets_distributed:,}"),
         ]
-    _two_col_table(doc, overview_rows)
+    two_col_table(doc, overview_rows)
     doc.add_paragraph()
 
     # Coverage chart — directly under Section 1 overview table, same position as
@@ -1106,7 +1106,7 @@ def _build_doc(cfg, *, g, hh_cov, pop_cov, net_cov, lga_d, facilities,
         fname = (os.path.basename(sync_path) if dtype == "sync" else os.path.basename(perf_path)) or label
 
         if link:
-            _add_hyperlink(dp, label + " ↗", link)
+            add_hyperlink(dp, label + " ↗", link)
         else:
             run_d = dp.add_run(fname)
             run_d.font.name = FONT; run_d.font.size = Pt(8)
@@ -1276,16 +1276,16 @@ def run(cfg):
     )
     chart_path = _generate_progress_chart_itn(days_data, cfg, current_daily_target)
 
-    issues_data = _claude_issues(
+    issues_data = _generate_issues(
         cfg, g, hh_cov, pop_cov, net_cov, lga_d, facilities, sync_lga_rows, sync_time_stats
     )
 
-    conclusion = _claude(
+    conclusion = generate_narrative(
         _conclusion_prompt(cfg, g, hh_cov, pop_cov, net_cov, lga_d,
                             roster_ever_synced, roster_high),
         max_tokens=600,
     )
-    slack_narrative = _claude(
+    slack_narrative = generate_narrative(
         _slack_prompt(cfg, g, hh_cov, pop_cov, net_cov, roster_ever_synced, roster_high),
         max_tokens=400,
     )

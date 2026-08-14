@@ -38,15 +38,16 @@ import requests
 import urllib3
 from openpyxl import Workbook
 
-# Reused via import — generic Excel-styling helpers, no tenant/drug branching inside
-# them (same pattern already used by analyze_itn.py/report_itn.py for analyze.py/
-# report.py's generic helpers). NOT reusing _write_summary/_write_df/_build_rows/
-# _sync_status themselves — those are built around cdd_sync.py's fixed "Day 1..Day N
-# of a short campaign" model, which doesn't fit a continuously-running, months-long
-# ITN campaign (see _roster_status below for the adapted status model).
-from pipeline.cdd_sync import _style, _HDR_FILL, _TOTAL_FILL, _LOW_FILL, _NEVER_FILL, _BORDER
-
 urllib3.disable_warnings()
+
+# Shares only the generic Excel-styling primitives from pipeline.core. NOT reusing
+# cdd_sync.py's _write_summary/_write_df/_build_rows/_sync_status — those are built
+# around a fixed "Day 1..Day N of a short campaign" model, which doesn't fit a
+# continuously-running, months-long ITN campaign (see _roster_status below).
+from pipeline.core.excel import (
+    SYNC_HDR_FILL, SYNC_LOW_FILL, SYNC_NEVER_FILL, SYNC_TOTAL_FILL, style_sync_cell,
+)
+
 log = logging.getLogger(__name__)
 
 CDD_ROLE = "DISTRIBUTOR_REGISTRAR"   # confirmed the real field-CDD role for chad
@@ -276,17 +277,17 @@ def _build_roster_rows(cfg):
 def _write_df_itn(ws, df):
     for ci, col in enumerate(df.columns, 1):
         cell = ws.cell(row=1, column=ci, value=col)
-        _style(cell, fill=_HDR_FILL, bold=True, color="FFFFFF")
+        style_sync_cell(cell, fill=SYNC_HDR_FILL, bold=True, color="FFFFFF")
     for ri, row in enumerate(df.itertuples(index=False), 2):
         status = getattr(row, "Status", None)
         row_fill = (
-            _NEVER_FILL if status == "NEVER SYNCED"
-            else _LOW_FILL if status == "LOW"
+            SYNC_NEVER_FILL if status == "NEVER SYNCED"
+            else SYNC_LOW_FILL if status == "LOW"
             else None
         )
         for ci, val in enumerate(row, 1):
             cell = ws.cell(row=ri, column=ci, value=val)
-            _style(cell, fill=row_fill)
+            style_sync_cell(cell, fill=row_fill)
     for ci, col in enumerate(df.columns, 1):
         lengths = [len(str(col))] + [len(str(v)) for v in df.iloc[:, ci - 1] if v is not None]
         max_len = max(lengths) if lengths else 10
@@ -306,13 +307,13 @@ def _write_summary_itn(ws, all_rows):
 
     cols = ["#", "District", "Total CDDs", "HIGH", "MODERATE", "LOW", "NEVER SYNCED", "% Never Synced"]
     for ci, h in enumerate(cols, 1):
-        _style(ws.cell(row=1, column=ci, value=h), fill=_HDR_FILL, bold=True, color="FFFFFF")
+        style_sync_cell(ws.cell(row=1, column=ci, value=h), fill=SYNC_HDR_FILL, bold=True, color="FFFFFF")
 
     for ri, (dist, s) in enumerate(sorted(dist_stats.items()), 2):
         pct = f"{s['NEVER SYNCED']/s['total']*100:.1f}%" if s["total"] else "-"
         vals = [ri - 1, dist, s["total"], s["HIGH"], s["MODERATE"], s["LOW"], s["NEVER SYNCED"], pct]
         for ci, val in enumerate(vals, 1):
-            _style(ws.cell(row=ri, column=ci, value=val))
+            style_sync_cell(ws.cell(row=ri, column=ci, value=val))
 
     tr = len(dist_stats) + 2
     totals = [
@@ -325,7 +326,7 @@ def _write_summary_itn(ws, all_rows):
         "",
     ]
     for ci, val in enumerate(totals, 1):
-        _style(ws.cell(row=tr, column=ci, value=val), fill=_TOTAL_FILL, bold=True)
+        style_sync_cell(ws.cell(row=tr, column=ci, value=val), fill=SYNC_TOTAL_FILL, bold=True)
 
     note_row = tr + 2
     ws.cell(note_row, 1,
@@ -394,7 +395,7 @@ def run(cfg):
             ws_sum.cell(r, 2, count)
             ws_sum.cell(r, 3, pct)
             for ci in range(1, 4):
-                _style(ws_sum.cell(r, ci), fill=_TOTAL_FILL, bold=True)
+                style_sync_cell(ws_sum.cell(r, ci), fill=SYNC_TOTAL_FILL, bold=True)
 
         COLS = ["Health Facility", "Username", "User ID", "Distinct Days Synced",
                 "Total Sync Records", "First Sync Date", "Last Sync Date", "Status"]

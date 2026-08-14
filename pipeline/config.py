@@ -159,7 +159,7 @@ def get_active_rows():
             f"Check GOOGLE_SHEET_TAB in .env, or create the tab with the "
             f"standard column headers."
         )
-    rows = sheet.get_all_records()
+    rows = sheet.get_all_records(numericise_ignore=["all"])
     log.info(f"Google Sheet tab '{tab}': {len(rows)} rows loaded")
     return rows
 

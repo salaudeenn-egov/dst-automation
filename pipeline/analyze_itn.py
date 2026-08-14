@@ -4,9 +4,9 @@ analyze_itn.py — ITN/LLIN (bed-net) household-based aggregation → performanc
 Separate module from analyze.py by design: SPAQ/AZM's core computation (is_treated
 requires a non-null Data.age; one child = one dose) does not apply to ITN campaigns
 (beneficiaryType=HOUSEHOLD, Data.age is always null, one household = N nets based on
-household size). Reuses ONLY the generic, drug-agnostic styling primitives from
-analyze.py (_style_cell, the fill/border constants, FLAG_COLOR) — analyze.py itself
-is never imported for its aggregation logic and is never modified by this file.
+household size). Shares only the generic primitives in pipeline.core (ES scroll,
+Excel styling) plus analyze.py's name-resolution lookups — analyze.py's aggregation
+logic is never imported and never modified by this file.
 
 Confirmed on live chad ES (tenant=chad, campaign CMP-2026-06-03-000312, LLIN_phase2_
 tchad2026-final-3):
@@ -82,28 +82,18 @@ import os
 from datetime import datetime, timezone
 
 import pandas as pd
-import urllib3
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
 from openpyxl.utils import get_column_letter
-
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 
-from pipeline.analyze import (
-    _BORDER, _BANNER_FILL, _HDR_FILL, _TOTAL_FILL, _WHITE_FILL, _style_cell,
-    _scroll_batches, _fetch_hh_head_map, _fetch_individual_names,
+from pipeline.analyze import _map_household_ids_to_head_ids, _fetch_individual_names
+from pipeline.core.es import scroll_batches
+from pipeline.core.excel import (
+    BANNER_FILL, FLAG_COLOR, HDR_FILL, TOTAL_FILL, WHITE_FILL, style_cell,
 )
 
-urllib3.disable_warnings()
 log = logging.getLogger(__name__)
-
-FLAG_COLOR = {
-    "HIGH":         "1A7A1A",   # green  >=95%
-    "MODERATE":     "E06000",   # orange 70-95%
-    "LOW":          "CC0000",   # red    <70%
-    "NO TARGET":    "888888",
-    "LOW ACTIVITY": "888888",
-}
 
 _BATCH = 5000
 
@@ -213,14 +203,14 @@ def _fetch_facility_rows(cfg):
     }
 
     total_processed = 0
-    for batch in _scroll_batches(cfg["es_url"], cfg["ES_INDEX_TASK"], query, cfg["es_auth"], "itn-task"):
+    for batch in scroll_batches(cfg["es_url"], cfg["ES_INDEX_TASK"], query, cfg["es_auth"], "itn-task"):
         docs = [h["_source"]["Data"] for h in batch]
 
         # Resolve any new households' head-individual mapping seen in this batch.
         batch_hh_ids = list({d.get("householdId") for d in docs if d.get("householdId")})
         new_hh_ids   = [h for h in batch_hh_ids if h not in hh_head_ind_map]
         if new_hh_ids:
-            hh_head_ind_map.update(_fetch_hh_head_map(cfg, new_hh_ids))
+            hh_head_ind_map.update(_map_household_ids_to_head_ids(cfg, new_hh_ids))
 
         # Resolve any new heads' names seen in this batch.
         batch_head_ids = list({hh_head_ind_map[h] for h in batch_hh_ids if h in hh_head_ind_map})
@@ -455,7 +445,7 @@ def _fetch_dup_history(cfg, today_events):
                 "query": {"bool": {"filter": base_filters + [{"terms": {field: batch}}]}},
                 "_source": _source,
             }
-            for page in _scroll_batches(cfg["es_url"], cfg["ES_INDEX_TASK"], query,
+            for page in scroll_batches(cfg["es_url"], cfg["ES_INDEX_TASK"], query,
                                          cfg["es_auth"], f"dup-history {label} {bi}/{len(batches)}"):
                 for h in page:
                     if h["_id"] in seen_ids:
@@ -518,7 +508,7 @@ def _fetch_usernames(cfg, uuids):
                 "query": {"terms": {f"{id_field}.keyword": batch}},
                 "_source": [id_field] + name_fields,
             }
-            for page in _scroll_batches(cfg["es_url"], index, query, cfg["es_auth"],
+            for page in scroll_batches(cfg["es_url"], index, query, cfg["es_auth"],
                                          f"dup-usernames {index.split('-')[0]}"):
                 for h in page:
                     d = h["_source"].get("Data") or {}
@@ -873,14 +863,14 @@ def _write_tab(ws, rows, banner_text):
     ws.merge_cells(f"A1:{last_col}1")
     banner = ws["A1"]
     banner.value = banner_text
-    banner.fill  = _BANNER_FILL
+    banner.fill  = BANNER_FILL
     banner.font  = Font(bold=True, color="FFFFFF", size=10, name="Calibri")
     banner.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 20
 
     for ci, h in enumerate(HEADERS, 1):
         cell = ws.cell(row=2, column=ci, value=h)
-        _style_cell(cell, fill=_HDR_FILL, bold=True, align="center", color="FFFFFF")
+        style_cell(cell, fill=HDR_FILL, bold=True, align="center", color="FFFFFF")
 
     status_col = HEADERS.index("Status") + 1
     dup_flag_cols = {HEADERS.index(h) + 1: c for h, c in _DUP_FLAG_COLOR.items()}
@@ -888,7 +878,7 @@ def _write_tab(ws, rows, banner_text):
         vals = _row_values(r, ri)
         for ci, val in enumerate(vals, 1):
             cell = ws.cell(row=ri + 2, column=ci, value=val)
-            _style_cell(cell, fill=_WHITE_FILL, align="center")
+            style_cell(cell, fill=WHITE_FILL, align="center")
             if ci == status_col:
                 flag_col = FLAG_COLOR.get(str(val), "000000")
                 cell.font = Font(bold=True, color=flag_col, size=9, name="Calibri")
@@ -901,7 +891,7 @@ def _write_tab(ws, rows, banner_text):
         tot_vals = _row_values(tot, "")
         for ci, val in enumerate(tot_vals, 1):
             cell = ws.cell(row=tot_row, column=ci, value=val)
-            _style_cell(cell, fill=_TOTAL_FILL, bold=True, align="center")
+            style_cell(cell, fill=TOTAL_FILL, bold=True, align="center")
 
     ws.freeze_panes = "E3"
     ws.auto_filter.ref = f"A2:{last_col}2"
@@ -920,21 +910,21 @@ def _write_facility_tab(ws, rows, banner_text):
     ws.merge_cells(f"A1:{last_col}1")
     banner = ws["A1"]
     banner.value = banner_text
-    banner.fill  = _BANNER_FILL
+    banner.fill  = BANNER_FILL
     banner.font  = Font(bold=True, color="FFFFFF", size=10, name="Calibri")
     banner.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 20
 
     for ci, h in enumerate(FACILITY_HEADERS, 1):
         cell = ws.cell(row=2, column=ci, value=h)
-        _style_cell(cell, fill=_HDR_FILL, bold=True, align="center", color="FFFFFF")
+        style_cell(cell, fill=HDR_FILL, bold=True, align="center", color="FFFFFF")
 
     dup_flag_cols = {FACILITY_HEADERS.index(h) + 1: c for h, c in _DUP_FLAG_COLOR.items()}
     for ri, r in enumerate(sorted(rows, key=lambda x: x["records"]), 1):
         vals = _facility_row_values(r, ri)
         for ci, val in enumerate(vals, 1):
             cell = ws.cell(row=ri + 2, column=ci, value=val)
-            _style_cell(cell, fill=_WHITE_FILL, align="center")
+            style_cell(cell, fill=WHITE_FILL, align="center")
             if ci in dup_flag_cols and isinstance(val, int) and val > 0:
                 cell.font = Font(bold=True, color=dup_flag_cols[ci], size=9, name="Calibri")
 
@@ -1028,14 +1018,14 @@ def _write_dup_detail_tab(ws, detail_rows, fac_meta, banner_text, uname_map=None
     ws.merge_cells(f"A1:{last_col}1")
     banner = ws["A1"]
     banner.value = banner_text
-    banner.fill  = _BANNER_FILL
+    banner.fill  = BANNER_FILL
     banner.font  = Font(bold=True, color="FFFFFF", size=10, name="Calibri")
     banner.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 20
 
     for ci, h in enumerate(_DUP_DETAIL_HEADERS, 1):
         cell = ws.cell(row=2, column=ci, value=h)
-        _style_cell(cell, fill=_HDR_FILL, bold=True, align="center", color="FFFFFF")
+        style_cell(cell, fill=HDR_FILL, bold=True, align="center", color="FFFFFF")
 
     def _meta(fc):
         m = fac_meta.get(fc) or {}
@@ -1066,7 +1056,7 @@ def _write_dup_detail_tab(ws, detail_rows, fac_meta, banner_text, uname_map=None
             cell = ws.cell(row=ri + 2, column=ci, value=_clean(val))
             if isinstance(val, str) and val.startswith("="):
                 cell.data_type = "s"
-            _style_cell(cell, fill=_WHITE_FILL, align="center")
+            style_cell(cell, fill=WHITE_FILL, align="center")
 
     ws.freeze_panes = "A3"
     ws.auto_filter.ref = f"A2:{last_col}2"

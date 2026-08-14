@@ -7,84 +7,23 @@ Two variants:
 """
 import logging
 from collections import defaultdict
-from datetime import date, timedelta, datetime, timezone
+from datetime import timedelta, datetime, timezone
 
 import pandas as pd
 import requests
-import urllib3
-from openpyxl import load_workbook
-from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+from openpyxl import Workbook
+from openpyxl.utils import get_column_letter
 
-urllib3.disable_warnings()
+from pipeline.core.checkpoint import load_checkpoint, save_checkpoint
+from pipeline.core.es import composite_agg, scroll_all
+from pipeline.core.excel import (
+    SYNC_HDR_FILL, SYNC_LOW_FILL, SYNC_NEVER_FILL, SYNC_TOTAL_FILL, style_sync_cell,
+)
+
 log = logging.getLogger(__name__)
-_HDR_FILL    = PatternFill("solid", fgColor="003366")
-_NEVER_FILL  = PatternFill("solid", fgColor="FFD7D7")
-_LOW_FILL    = PatternFill("solid", fgColor="FFE0B3")
-_TOTAL_FILL  = PatternFill("solid", fgColor="D6E4F0")
-_thin        = Side(border_style="thin", color="CCCCCC")
-_BORDER      = Border(left=_thin, right=_thin, top=_thin, bottom=_thin)
 
 
-# ── ES helpers ─────────────────────────────────────────────────────────────────
-
-def _scroll_all(url, index, query, auth, label):
-    hits = []
-    sid  = None
-    try:
-        r = requests.post(f"{url}/{index}/_search?scroll=10m",
-                          json=query, auth=auth, verify=False, timeout=120)
-        r.raise_for_status()
-        data  = r.json()
-        sid   = data["_scroll_id"]
-        batch = data["hits"]["hits"]
-        hits.extend(batch)
-        total = data["hits"]["total"]["value"]
-        log.info(f"  {label}: ~{total:,} docs ...")
-        while batch:
-            r = requests.post(f"{url}/_search/scroll",
-                              json={"scroll": "10m", "scroll_id": sid},
-                              auth=auth, verify=False, timeout=120)
-            r.raise_for_status()
-            data  = r.json()
-            sid   = data["_scroll_id"]
-            batch = data["hits"]["hits"]
-            hits.extend(batch)
-            if len(hits) % 50_000 < len(batch):
-                log.info(f"  {label}: {len(hits):,} / ~{total:,} fetched ...")
-    finally:
-        if sid:
-            requests.delete(f"{url}/_search/scroll",
-                            json={"scroll_id": sid}, auth=auth, verify=False, timeout=30)
-    log.info(f"  {label}: {len(hits):,} docs")
-    return hits
-
-
-def _composite_agg(url, index, query_must, agg_sources, auth):
-    """Paginate through a composite aggregation. Returns list of buckets."""
-    buckets = []
-    after   = None
-    while True:
-        agg_body = {"size": 1000, "sources": agg_sources}
-        if after:
-            agg_body["after"] = after
-        q = {
-            "size": 0,
-            "query": {"bool": {"must": query_must}},
-            "aggs": {"combo": {"composite": agg_body}},
-        }
-        r = requests.post(f"{url}/{index}/_search",
-                          json=q, auth=auth, verify=False, timeout=120)
-        r.raise_for_status()
-        data   = r.json()
-        page   = data["aggregations"]["combo"]["buckets"]
-        buckets.extend(page)
-        after  = data["aggregations"]["combo"].get("after_key")
-        if not after:
-            break
-    return buckets
-
-
-def _ts_to_date(val):
+def _epoch_ms_to_date(val):
     if isinstance(val, int):
         return datetime.fromtimestamp(val / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
     return str(val)[:10]
@@ -92,7 +31,7 @@ def _ts_to_date(val):
 
 # ── Variant A: admin console = TRUE (Nigeria, campaignNumber) ──────────────────
 
-def _load_staff_admin(cfg):
+def _load_staff_by_campaign(cfg):
     query = {
         "size": 5000,
         "_source": [
@@ -105,7 +44,7 @@ def _load_staff_admin(cfg):
             {"term": {"Data.role.keyword": "DISTRIBUTOR"}},
         ]}},
     }
-    hits = _scroll_all(cfg["es_url"], cfg["ES_INDEX_STAFF"], query,
+    hits = scroll_all(cfg["es_url"], cfg["ES_INDEX_STAFF"], query,
                        cfg["es_auth"], "staff (admin)")
     cdds       = {}   # lower(uname) -> info
     uname_list = []
@@ -127,7 +66,7 @@ def _load_staff_admin(cfg):
     return cdds, uname_list
 
 
-def _load_syncs_admin(cfg, uname_list):
+def _load_sync_dates_by_username(cfg, uname_list):
     must = [
         {"terms": {"Data.taskDates":              cfg["CAMPAIGN_DATES"]}},
         {"terms": {"Data.syncedUserName.keyword": uname_list}},
@@ -138,13 +77,13 @@ def _load_syncs_admin(cfg, uname_list):
         {"uname": {"terms": {"field": "Data.syncedUserName.keyword"}}},
         {"date":  {"terms": {"field": "Data.taskDates"}}},
     ]
-    buckets = _composite_agg(cfg["es_url"], cfg["ES_INDEX_SYNC"], must, sources,
+    buckets = composite_agg(cfg["es_url"], cfg["ES_INDEX_SYNC"], must, sources,
                               cfg["es_auth"])
     log.info(f"  sync agg (admin): {len(buckets):,} (uname, date) pairs")
     user_dates = defaultdict(set)
     for b in buckets:
         uname = b["key"]["uname"].lower()
-        dt    = _ts_to_date(b["key"]["date"])
+        dt    = _epoch_ms_to_date(b["key"]["date"])
         if dt in cfg["CAMPAIGN_DATES"]:
             user_dates[uname].add(dt)
     return user_dates
@@ -152,7 +91,7 @@ def _load_syncs_admin(cfg, uname_list):
 
 # ── Variant B: admin console = FALSE (Chad/Togo, projectTypeId) ───────────────
 
-def _load_staff_project(cfg):
+def _load_staff_by_project_type(cfg):
     query = {
         "size": 5000,
         "_source": [
@@ -165,7 +104,7 @@ def _load_staff_project(cfg):
             {"term": {"Data.isDeleted":             False}},
         ]}},
     }
-    hits = _scroll_all(cfg["es_url"], cfg["ES_INDEX_STAFF"], query,
+    hits = scroll_all(cfg["es_url"], cfg["ES_INDEX_STAFF"], query,
                        cfg["es_auth"], "staff (project)")
     cdds     = {}   # lower(uid) -> info
     uid_list = []
@@ -189,7 +128,7 @@ def _load_staff_project(cfg):
     return cdds, uid_list
 
 
-def _load_syncs_project(cfg, uid_list):
+def _load_sync_dates_by_user_id(cfg, uid_list):
     must = [
         {"terms": {"Data.taskDates":            cfg["CAMPAIGN_DATES"]}},
         {"terms": {"Data.syncedUserId.keyword": uid_list}},
@@ -198,13 +137,13 @@ def _load_syncs_project(cfg, uid_list):
         {"uid":  {"terms": {"field": "Data.syncedUserId.keyword"}}},
         {"date": {"terms": {"field": "Data.taskDates"}}},
     ]
-    buckets = _composite_agg(cfg["es_url"], cfg["ES_INDEX_SYNC"], must, sources,
+    buckets = composite_agg(cfg["es_url"], cfg["ES_INDEX_SYNC"], must, sources,
                               cfg["es_auth"])
     log.info(f"  sync agg (project): {len(buckets):,} (uid, date) pairs")
     user_dates = defaultdict(set)
     for b in buckets:
         uid = b["key"]["uid"].lower()
-        dt  = _ts_to_date(b["key"]["date"])
+        dt  = _epoch_ms_to_date(b["key"]["date"])
         if dt in cfg["CAMPAIGN_DATES"]:
             user_dates[uid].add(dt)
     return user_dates
@@ -311,7 +250,7 @@ def _get_synced_keys_by_cutoff(cfg, cutoff_hour=17, cutoff_min=30):
         agg_sources = [{"key": {"terms": {"field": "Data.syncedUserId.keyword"}}}]
 
     try:
-        buckets = _composite_agg(
+        buckets = composite_agg(
             cfg["es_url"], cfg["ES_INDEX_SYNC"], must_filter, agg_sources, cfg["es_auth"]
         )
         synced = {b["key"]["key"].lower() for b in buckets}
@@ -324,18 +263,18 @@ def _get_synced_keys_by_cutoff(cfg, cutoff_hour=17, cutoff_min=30):
 
 # ── status + build rows ────────────────────────────────────────────────────────
 
-def _sync_status(n, day):
+def _sync_status_band(n, day):
     if n == day:      return "HIGH"
     elif n >= 3:      return "MODERATE"
     elif n >= 1:      return "LOW"
     else:             return "NEVER SYNCED"
 
 
-def _build_rows(cdds, user_dates, cfg, is_admin):
+def _build_cdd_rows(cdds, user_dates, cfg, is_admin):
     day_labels = {}
     start = cfg["campaign_start"]
     for i, dt in enumerate(cfg["CAMPAIGN_DATES"]):
-        d = start + __import__("datetime").timedelta(days=i)
+        d = start + timedelta(days=i)
         day_labels[dt] = f"Day {i+1} ({d.day} {d.strftime('%b')})"
 
     all_rows = []
@@ -351,7 +290,7 @@ def _build_rows(cdds, user_dates, cfg, is_admin):
         }
         for dt, col in day_labels.items():
             rec[col] = "Y" if dt in dates_synced else "N"
-        rec["Status"]     = _sync_status(n_days, cfg["DAY"])
+        rec["Status"]     = _sync_status_band(n_days, cfg["DAY"])
         rec["Sync Dates"] = ", ".join(sorted(dates_synced))
         all_rows.append(rec)
 
@@ -360,39 +299,30 @@ def _build_rows(cdds, user_dates, cfg, is_admin):
 
 # ── Excel writer ───────────────────────────────────────────────────────────────
 
-def _style(cell, fill=None, bold=False, color=None):
-    cell.border    = _BORDER
-    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    if fill:
-        cell.fill = fill
-    cell.font = Font(bold=bold, size=9, name="Calibri",
-                     color=color if color else "000000")
-
-
-def _write_df(ws, df, hdr_fill=_HDR_FILL):
+def _write_dataframe_tab(ws, df, hdr_fill=SYNC_HDR_FILL):
     for ci, col in enumerate(df.columns, 1):
         cell = ws.cell(row=1, column=ci, value=col)
-        _style(cell, fill=hdr_fill, bold=True, color="FFFFFF")
+        style_sync_cell(cell, fill=hdr_fill, bold=True, color="FFFFFF")
     for ri, row in enumerate(df.itertuples(index=False), 2):
         status = getattr(row, "Status", None)
         row_fill = (
-            _NEVER_FILL if status == "NEVER SYNCED"
-            else _LOW_FILL if status == "LOW"
+            SYNC_NEVER_FILL if status == "NEVER SYNCED"
+            else SYNC_LOW_FILL if status == "LOW"
             else None
         )
         for ci, val in enumerate(row, 1):
             cell = ws.cell(row=ri, column=ci, value=val)
-            _style(cell, fill=row_fill)
+            style_sync_cell(cell, fill=row_fill)
     # auto-width
     for ci, col in enumerate(df.columns, 1):
         lengths = [len(str(col))] + [len(str(v)) for v in df.iloc[:, ci - 1] if v is not None]
         max_len = max(lengths) if lengths else 10
         ws.column_dimensions[
-            __import__("openpyxl.utils", fromlist=["get_column_letter"]).get_column_letter(ci)
+            get_column_letter(ci)
         ].width = min(max_len + 2, 30)
 
 
-def _write_summary(ws, all_rows, cfg):
+def _write_summary_tab(ws, all_rows, cfg):
     lga_stats = defaultdict(lambda: {"total": 0, "HIGH": 0, "MODERATE": 0, "LOW": 0, "NEVER SYNCED": 0})
     for rec in all_rows:
         lg = rec["LGA"] or "Unknown"
@@ -402,14 +332,14 @@ def _write_summary(ws, all_rows, cfg):
     cols = ["#", "LGA", "Total CDDs", "HIGH", "MODERATE", "LOW", "NEVER SYNCED", "% Never Synced"]
     for ci, h in enumerate(cols, 1):
         cell = ws.cell(row=1, column=ci, value=h)
-        _style(cell, fill=_HDR_FILL, bold=True, color="FFFFFF")
+        style_sync_cell(cell, fill=SYNC_HDR_FILL, bold=True, color="FFFFFF")
 
     for ri, (lga, s) in enumerate(sorted(lga_stats.items()), 2):
         pct = f"{s['NEVER SYNCED']/s['total']*100:.1f}%" if s["total"] else "-"
         vals = [ri - 1, lga, s["total"], s["HIGH"], s["MODERATE"], s["LOW"], s["NEVER SYNCED"], pct]
         for ci, val in enumerate(vals, 1):
             cell = ws.cell(row=ri, column=ci, value=val)
-            _style(cell)
+            style_sync_cell(cell)
 
     # grand total
     tr = len(lga_stats) + 2
@@ -424,35 +354,65 @@ def _write_summary(ws, all_rows, cfg):
     ]
     for ci, val in enumerate(totals, 1):
         cell = ws.cell(row=tr, column=ci, value=val)
-        _style(cell, fill=_TOTAL_FILL, bold=True)
+        style_sync_cell(cell, fill=SYNC_TOTAL_FILL, bold=True)
 
     return lga_stats
 
 
 # ── public entry point ─────────────────────────────────────────────────────────
 
-def run(cfg):
-    log.info(f"[cdd_sync] {cfg['state_name']} Day {cfg['DAY']} ...")
+def collect(cfg):
+    """Stage 1 (all ES I/O): staff roster, per-day sync aggregation, today's cutoff counts.
+
+    Returns a JSON-safe dict, or None when the campaign is not queryable
+    (missing identifiers or an empty roster).
+    """
     is_admin = cfg["is_admin_console"]
 
     if is_admin:
         if not cfg["campaign_number"]:
             log.warning("[cdd_sync] is_admin_console=TRUE but campaign_number is empty — skipping")
             return None
-        cdds, key_list = _load_staff_admin(cfg)
-        user_dates     = _load_syncs_admin(cfg, key_list)
+        cdds, key_list = _load_staff_by_campaign(cfg)
+        user_dates     = _load_sync_dates_by_username(cfg, key_list)
     else:
         if not cfg["project_type_id"]:
             log.warning("[cdd_sync] is_admin_console=FALSE but project_type_id is empty — skipping")
             return None
-        cdds, key_list = _load_staff_project(cfg)
-        user_dates     = _load_syncs_project(cfg, key_list)
+        cdds, key_list = _load_staff_by_project_type(cfg)
+        user_dates     = _load_sync_dates_by_user_id(cfg, key_list)
 
     if not cdds:
         log.warning("[cdd_sync] 0 CDDs found — check campaign_number / project_type_id")
         return None
 
-    all_rows, day_labels = _build_rows(cdds, user_dates, cfg, is_admin)
+    all_rows, day_labels = _build_cdd_rows(cdds, user_dates, cfg, is_admin)
+
+    # Cutoff stats are a TODAY-only operational metric (same-day UTC cutoff), so
+    # they are meaningless in a whole-campaign cumulative run and skipped there.
+    if cfg.get("cumulative"):
+        synced_by_1700 = synced_by_1730 = synced_keys_1730 = None
+    else:
+        synced_by_1700   = _count_synced_by_cutoff(cfg, 17, 0)
+        synced_by_1730   = _count_synced_by_cutoff(cfg, 17, 30)
+        synced_keys_1730 = _get_synced_keys_by_cutoff(cfg, 17, 30)
+
+    log.info(f"[cdd_sync:collect] {len(all_rows)} CDDs, {len(day_labels)} campaign days")
+    return {
+        "is_admin":         is_admin,
+        "all_rows":         all_rows,
+        "day_labels":       day_labels,
+        "synced_by_1700":   synced_by_1700,
+        "synced_by_1730":   synced_by_1730,
+        "synced_keys_1730": sorted(synced_keys_1730) if synced_keys_1730 is not None else None,
+    }
+
+
+def render(cfg, data):
+    """Stage 2 (pure): build the CDD sync workbook from collected data."""
+    all_rows   = data["all_rows"]
+    day_labels = data["day_labels"]
+    is_admin   = data["is_admin"]
 
     COLS = (["LGA", "Health Facility", "Username", "User ID", "Days Synced"]
             + list(day_labels.values()) + ["Status", "Sync Dates"])
@@ -462,92 +422,78 @@ def run(cfg):
         if col not in df_all.columns:
             df_all[col] = ""
 
-    # Time-based sync counts. These are a TODAY-only operational metric (they key off
-    # extract_date and a same-day UTC cutoff), so they are meaningless in a whole-campaign
-    # cumulative report — skip them there. The per-LGA HIGH/MOD/LOW/NEVER breakdown already
-    # spans every campaign day (CAMPAIGN_DATES), which is the cumulative view.
-    if cfg.get("cumulative"):
-        synced_by_1700 = synced_by_1730 = synced_keys_1730 = None
-    else:
-        synced_by_1700 = _count_synced_by_cutoff(cfg, 17, 0)
-        synced_by_1730 = _count_synced_by_cutoff(cfg, 17, 30)
-        # Keys of CDDs who synced by 17:30 — used for the NOT SYNCED tab
-        synced_keys_1730 = _get_synced_keys_by_cutoff(cfg, 17, 30)
-
-    from openpyxl import Workbook as _WB
-    wb = _WB()
+    wb = Workbook()
     wb.remove(wb.active)
 
-    # SUMMARY
     ws_sum = wb.create_sheet("SUMMARY")
-    lga_stats = _write_summary(ws_sum, all_rows, cfg)
+    _write_summary_tab(ws_sum, all_rows, cfg)
 
-    # Append time-based stats below grand total in SUMMARY
     total_cdds_count = len(all_rows)
     last_row = ws_sum.max_row + 2
     time_rows = []
-    if synced_by_1700 is not None:
-        pct = f"{synced_by_1700/total_cdds_count*100:.1f}%" if total_cdds_count else "-"
-        time_rows.append(("Synced by 17:00 today (UTC)", synced_by_1700, pct))
-    if synced_by_1730 is not None:
-        pct = f"{synced_by_1730/total_cdds_count*100:.1f}%" if total_cdds_count else "-"
-        time_rows.append(("Synced by 17:30 today (UTC)", synced_by_1730, pct))
+    if data["synced_by_1700"] is not None:
+        pct = f"{data['synced_by_1700']/total_cdds_count*100:.1f}%" if total_cdds_count else "-"
+        time_rows.append(("Synced by 17:00 today (UTC)", data["synced_by_1700"], pct))
+    if data["synced_by_1730"] is not None:
+        pct = f"{data['synced_by_1730']/total_cdds_count*100:.1f}%" if total_cdds_count else "-"
+        time_rows.append(("Synced by 17:30 today (UTC)", data["synced_by_1730"], pct))
     for i, (label, count, pct) in enumerate(time_rows):
         r = last_row + i
         ws_sum.cell(r, 1, label)
         ws_sum.cell(r, 2, count)
         ws_sum.cell(r, 3, pct)
         for ci in range(1, 4):
-            _style(ws_sum.cell(r, ci), fill=_TOTAL_FILL, bold=True)
+            style_sync_cell(ws_sum.cell(r, ci), fill=SYNC_TOTAL_FILL, bold=True)
 
-    # Per-LGA
     for lga in sorted(df_all["LGA"].unique()):
         df_lga = df_all[df_all["LGA"] == lga][COLS].copy().reset_index(drop=True)
         df_lga.insert(0, "#", range(1, len(df_lga) + 1))
         safe = str(lga).translate(str.maketrans("/\\*?[]:", "-------"))[:31] or "Unknown"
-        ws = wb.create_sheet(safe)
-        _write_df(ws, df_lga)
+        _write_dataframe_tab(wb.create_sheet(safe), df_lga)
 
-    # NEVER SYNCED
     df_never = df_all[df_all["Status"] == "NEVER SYNCED"][
         ["LGA", "Health Facility", "Username", "User ID"]
     ].reset_index(drop=True)
     df_never.insert(0, "#", range(1, len(df_never) + 1))
-    ws_never = wb.create_sheet("NEVER SYNCED")
-    _write_df(ws_never, df_never)
+    _write_dataframe_tab(wb.create_sheet("NEVER SYNCED"), df_never)
 
-    # LOW SYNCED
     df_low = df_all[df_all["Status"] == "LOW"][
         ["LGA", "Health Facility", "Username", "User ID", "Days Synced", "Sync Dates", "Status"]
     ].reset_index(drop=True)
     df_low.insert(0, "#", range(1, len(df_low) + 1))
-    ws_low = wb.create_sheet("LOW SYNCED")
-    _write_df(ws_low, df_low)
+    _write_dataframe_tab(wb.create_sheet("LOW SYNCED"), df_low)
 
-    # NOT SYNCED BY 17:30 — CDDs who had no sync record before 17:30 UTC today
+    synced_keys_1730 = data["synced_keys_1730"]
     if synced_keys_1730 is not None:
-        lookup_key = "Username" if is_admin else "User ID"
-        not_synced = [
-            r for r in all_rows
-            if r[lookup_key].lower() not in synced_keys_1730
-        ]
+        synced_keys = set(synced_keys_1730)
+        lookup_key  = "Username" if is_admin else "User ID"
+        not_synced  = [r for r in all_rows if r[lookup_key].lower() not in synced_keys]
         df_ns = pd.DataFrame(not_synced if not_synced else [],
                              columns=["LGA", "Health Facility", "Username", "User ID",
                                       "Days Synced", "Sync Dates", "Status"])[
             ["LGA", "Health Facility", "Username", "User ID"]
         ].reset_index(drop=True)
         df_ns.insert(0, "#", range(1, len(df_ns) + 1))
-        ws_ns = wb.create_sheet("NOT SYNCED BY 1730")
-        _write_df(ws_ns, df_ns)
+        _write_dataframe_tab(wb.create_sheet("NOT SYNCED BY 1730"), df_ns)
         log.info(f"  not synced by 17:30 UTC: {len(not_synced):,} CDDs")
 
     out = cfg["sync_xlsx"]
     wb.save(out)
 
-    total_cdds   = len(all_rows)
-    never_count  = sum(1 for r in all_rows if r["Status"] == "NEVER SYNCED")
-    log.info(
-        f"[cdd_sync] saved -> {out}  "
-        f"({total_cdds} CDDs, {never_count} never synced)"
-    )
+    never_count = sum(1 for r in all_rows if r["Status"] == "NEVER SYNCED")
+    log.info(f"[cdd_sync:render] saved -> {out}  ({len(all_rows)} CDDs, {never_count} never synced)")
     return out
+
+
+def run(cfg):
+    log.info(f"[cdd_sync] {cfg['state_name']} Day {cfg['DAY']} ...")
+    data = collect(cfg)
+    if data is None:
+        return None
+    save_checkpoint(cfg, "cdd_sync", data)
+    return render(cfg, data)
+
+
+def rerun_from_checkpoint(cfg):
+    """Rebuild the CDD sync Excel from the saved checkpoint — no ES access needed."""
+    return render(cfg, load_checkpoint(cfg, "cdd_sync"))
