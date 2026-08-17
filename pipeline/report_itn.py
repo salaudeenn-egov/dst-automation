@@ -661,10 +661,10 @@ def _sync_section_itn(doc, sec_num, sync_lga_rows, sync_time_stats, sync_note,
     """
     CDD Sync Activity — ITN's equivalent of SPAQ's Section 5. Same HIGH/MODERATE/
     LOW/NEVER SYNCED status model and column layout as cdd_sync.py's Section 5.1/
-    5.1b. ONE disclosed structural difference: NEVER SYNCED always reads 0 — the
-    roster is derived from sync records themselves (no assigned-staff roster
-    available — see cdd_sync_itn.py's docstring), so a CDD with zero syncs can
-    never appear in it.
+    5.1b. ONE disclosed structural difference: the roster is derived from sync
+    records themselves (no assigned-staff roster available — see cdd_sync_itn.py's
+    docstring), so a CDD with zero syncs EVER cannot appear; NEVER SYNCED counts
+    only roster CDDs whose syncs all predate campaign_start.
     """
     add_heading(doc, f"{sec_num}.1  FLW Sync Summary", 5)
     if not roster_ever_synced:
@@ -672,10 +672,18 @@ def _sync_section_itn(doc, sec_num, sync_lga_rows, sync_time_stats, sync_note,
                        "may not have run yet).", size=9, color=GREY_RGB)
         return
     sync_pct = f"{roster_high/roster_ever_synced*100:.1f}%" if roster_ever_synced else "N/A"
+    # NEVER SYNCED from the SUMMARY rows (col 5 after the # strip) — no longer a
+    # hardcoded 0: window-scoping means pre-campaign-only CDDs now count as NEVER
+    never_total = 0
+    for r in (sync_lga_rows or []):
+        try:
+            never_total += int(r[5] or 0)
+        except (ValueError, TypeError, IndexError):
+            pass
     summary_rows = [
         ("Total CDDs Registered",   f"{roster_ever_synced:,}"),
         ("CDDs Synced (total day)", f"{roster_high:,}  ({sync_pct})"),
-        ("Never Synced",            "0"),
+        ("Never Synced",            f"{never_total:,}"),
     ]
     for label, (count, pct) in (sync_time_stats or {}).items():
         hour = label.replace("Synced by ", "").replace(" today (UTC)", "")
