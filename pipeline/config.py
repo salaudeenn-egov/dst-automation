@@ -64,6 +64,14 @@ def _bool(val):
     return str(val).strip().upper() in ("TRUE", "YES", "1", "Y")
 
 
+def _pad_cycle(val):
+    # Sheets returns a numeric cell as 2 (or 2.0); ES cycleIndex is "02"
+    s = str(val).strip()
+    if s.endswith(".0"):
+        s = s[:-2]
+    return s.zfill(2) if s.isdigit() else s
+
+
 # ── in-code feature defaults ───────────────────────────────────────────────────
 # ITN duplicate-distribution matrix (analyze_itn._classify_duplicates): the
 # code-side switch, so no Google Sheet column is needed. Flip to "TRUE" to
@@ -267,7 +275,9 @@ def build(row):
         "campaign_number":   str(row.get("campaign_number", "")).strip(),
         "project_type_id":   str(row.get("project_type_id", "")).strip(),
         "project_type":      str(row.get("project_type", "")).strip(),
-        "cycle_index":       str(row.get("cycle_index", "")).strip(),
+        # ES stores cycleIndex as zero-padded text ("01"/"02") — a bare sheet
+        # number (2) would term-match nothing, so pad digit-only values
+        "cycle_index":       _pad_cycle(row.get("cycle_index", "")),
 
         # ES date range field: "taskDates" (default) or "@timestamp"
         "task_date_field":   str(row.get("task_date_field", "taskDates")).strip() or "taskDates",
