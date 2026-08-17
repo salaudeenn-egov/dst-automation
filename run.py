@@ -59,43 +59,10 @@ def _pipeline_modules(cfg):
 
 def _update_sheet_status(cfg, status, step_failed="", error_msg="", drive_link=""):
     """Append a row to the Run Log tab in the config Google Sheet."""
-    from datetime import datetime
-    import gspread
-    from google.oauth2.service_account import Credentials
-
-    try:
-        creds_path = os.getenv("GOOGLE_CREDENTIALS_PATH")
-        sheet_id   = os.getenv("GOOGLE_SHEET_ID")
-        if not creds_path or not sheet_id:
-            return
-        creds = Credentials.from_service_account_file(
-            creds_path,
-            scopes=["https://www.googleapis.com/auth/spreadsheets",
-                    "https://www.googleapis.com/auth/drive"],
-        )
-        spreadsheet = gspread.Client(auth=creds).open_by_key(sheet_id)
-        runlog_tab  = os.getenv("GOOGLE_RUNLOG_TAB", "Run Log")
-        try:
-            ws = spreadsheet.worksheet(runlog_tab)
-        except gspread.WorksheetNotFound:
-            ws = spreadsheet.add_worksheet(runlog_tab, rows=1000, cols=10)
-            ws.append_row(["Timestamp","State","Campaign","Day","Time","Status","Step Failed","Error","Drive Link"])
-        now = datetime.now().strftime("%Y-%m-%d %H:%M")
-        row = [
-            now,
-            cfg.get("state_name", ""),
-            cfg.get("campaign_name", ""),
-            cfg.get("DAY", ""),
-            datetime.now().strftime("%H:%M"),
-            status,
-            step_failed,
-            str(error_msg)[:300] if error_msg else "",
-            drive_link or "",
-        ]
-        ws.append_row(row, value_input_option="USER_ENTERED")
-        log.info(f"[{cfg.get('state_name')}] Run Log updated: {status}")
-    except Exception as e:
-        log.warning(f"Run Log update failed (non-fatal): {e}")
+    from pipeline.run_log import append_run_log
+    append_run_log(cfg.get("state_name", ""), cfg.get("campaign_name", ""),
+                   cfg.get("DAY", ""), status,
+                   step_failed=step_failed, error=error_msg, drive_link=drive_link)
 
 
 def _slack_error(cfg_or_channel, state, step, error):

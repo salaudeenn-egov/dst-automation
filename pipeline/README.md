@@ -57,6 +57,20 @@ cdd_sync.rerun_from_checkpoint(cfg)      # rebuilds cdd_sync_dayN.xlsx
    at run time (ES data keeps changing as syncs land; a later re-query cannot
    reproduce the original numbers).
 
+Checkpoints are also pushed to Google Drive at the end of every published run,
+into the campaign's own folder: `<Instance>/<State>/<Campaign>/<Day N>/temp/`.
+To debug a run from any machine (e.g. after an ephemeral pod died):
+
+```python
+notify.download_checkpoint(cfg, "analyze")   # Drive temp/ -> local checkpoints/
+analyze.rerun_from_checkpoint(cfg)
+```
+
+Raw-file transfers live in `core/drive.py` (`upload_raw` / `download_raw`):
+no format conversion, overwrite-in-place, and no anyone-with-link permission —
+checkpoints contain beneficiary names and stay private to the shared drive.
+Report uploads (converted, link-shared) remain in `notify.py`, unchanged.
+
 ## Name resolution (child and household-head names)
 
 Names come only from the individual index, never from task additionalDetails:

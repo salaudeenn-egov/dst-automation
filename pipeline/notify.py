@@ -192,6 +192,53 @@ def upload_file(path, title, folder_id=None):
         return ""
 
 
+# ── campaign temp files (checkpoints) ──────────────────────────────────────────
+
+def temp_folder_id(cfg):
+    """Resolve (creating on demand) <Instance>/<State>/<Campaign>/<Day N>/temp."""
+    fid = campaign_folder_id(cfg)
+    if not fid:
+        return ""
+    from pipeline.core import drive
+    return drive.find_or_create_folder("temp", fid)
+
+
+def upload_checkpoints(cfg, stages=("analyze", "cdd_sync")):
+    """Push this run's checkpoint JSONs to the campaign's Drive temp folder.
+
+    Raw upload (no conversion, no public link — checkpoints carry beneficiary
+    names), overwriting any previous copy of the same run. Non-fatal throughout.
+    """
+    from pipeline.core import drive
+    from pipeline.core.checkpoint import checkpoint_path
+    uploaded = {}
+    try:
+        folder = temp_folder_id(cfg)
+        if not folder:
+            log.info("[notify] no Drive root configured — skipping checkpoint upload")
+            return uploaded
+        for stage in stages:
+            path = checkpoint_path(cfg, stage)
+            if os.path.exists(path):
+                uploaded[stage] = drive.upload_raw(path, os.path.basename(path), folder)
+    except Exception as e:
+        log.warning(f"[notify] checkpoint upload failed (non-fatal): {e}")
+    return uploaded
+
+
+def download_checkpoint(cfg, stage):
+    """Fetch a stage checkpoint from the campaign's Drive temp folder into the
+    local checkpoints directory, enabling rerun_from_checkpoint on any machine.
+    Returns the local path, or None when the checkpoint is not on Drive."""
+    from pipeline.core import drive
+    from pipeline.core.checkpoint import checkpoint_path
+    folder = temp_folder_id(cfg)
+    if not folder:
+        return None
+    path = checkpoint_path(cfg, stage)
+    return drive.download_raw(os.path.basename(path), folder, path)
+
+
 # ── public entry point ─────────────────────────────────────────────────────────
 
 def run(cfg, docx_path, slack_text, partner_docx_path=None, mode="both"):
@@ -259,5 +306,7 @@ def run(cfg, docx_path, slack_text, partner_docx_path=None, mode="both"):
             log.info(f"[notify] Partner Slack post done -> {partner_channel}")
         except Exception as e:
             log.warning(f"[notify] Partner channel post failed (non-fatal): {e}")
+
+    upload_checkpoints(cfg)
 
     return drive_link
