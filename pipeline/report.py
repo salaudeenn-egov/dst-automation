@@ -599,10 +599,11 @@ def _read_previous_report(cfg):
 
 def _claude(prompt, max_tokens=300):
     """
-    Generate narrative text via Groq's free tier (llama-3.3-70b-versatile by default).
+    Generate narrative text via Groq's free tier (openai/gpt-oss-120b by default;
+    llama-3.3-70b-versatile was decommissioned 2026-08-16).
     Groq-only for now — the Claude and Ollama providers were removed. Config:
         GROQ_API_KEY   (required)
-        GROQ_MODEL     (default llama-3.3-70b-versatile)
+        GROQ_MODEL     (default openai/gpt-oss-120b)
         GROQ_BASE_URL  (default https://api.groq.com/openai/v1)
     On any failure returns a "[Narrative not generated — ...]" placeholder so the
     report still builds (non-fatal).
@@ -613,17 +614,24 @@ def _claude(prompt, max_tokens=300):
         log.warning("GROQ_API_KEY not set — returning placeholder text")
         return "[Narrative not generated — GROQ_API_KEY missing]"
     base  = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
-    model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": 0.4,   # low — favours clean JSON + consistent prose
+    }
+    if "gpt-oss" in model:
+        # reasoning model: hidden reasoning tokens count against max_tokens, so
+        # keep reasoning short and pad the cap — callers' max_tokens stays the
+        # visible-output budget it was under llama
+        payload["reasoning_effort"] = "low"
+        payload["max_tokens"] = max_tokens + 500
     try:
         r = _rq.post(
             f"{base}/chat/completions",
             headers={"Authorization": f"Bearer {api_key}"},
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": max_tokens,
-                "temperature": 0.4,   # low — favours clean JSON + consistent prose
-            },
+            json=payload,
             timeout=120,
         )
         r.raise_for_status()
@@ -631,10 +639,13 @@ def _claude(prompt, max_tokens=300):
         choice = (data.get("choices") or [{}])[0]
         if choice.get("finish_reason") == "length":
             log.warning(
-                f"Groq response hit max_tokens={max_tokens} — output likely "
-                f"truncated. Consider raising the cap for this call."
+                f"Groq response hit max_tokens={payload['max_tokens']} — output "
+                f"likely truncated. Consider raising the cap for this call."
             )
         txt = (choice.get("message", {}).get("content") or "").strip()
+        # gpt-oss emits narrow no-break spaces (U+202F) e.g. in "88 %" — normalise
+        # to plain ASCII so Word/Slack output stays clean
+        txt = txt.replace(" ", " ").replace(" ", " ").replace(" %", "%")
         return txt or "[Narrative not generated — empty Groq response]"
     except Exception as e:
         log.warning(f"Groq call failed (non-fatal): {e}")
