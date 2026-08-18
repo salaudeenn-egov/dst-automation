@@ -579,13 +579,17 @@ def _aggregate_batch(task_hits, name_map, hh_name_map, fac_data, cfg):
             else:
                 m["drug1"] += 1
 
-        # dedup: full-string key avoids hash collisions
-        if child_name and age is not None:
-            dedup_key = f"{hh_head.lower()}|{child_name.lower()}|{ward.lower()}|{age}"
-            if dedup_key in m["seen_keys"]:
-                m["duplicates"] += 1
-            else:
-                m["seen_keys"].add(dedup_key)
+            # dedup TREATED records only: a redose (VISITED after SUCCESS) or a
+            # status progression (ABSENT/REFUSED then treated) creates a second
+            # record for the same child that is NOT a duplicate treatment. The
+            # key carries no status/date, so checking every record counted those
+            # legitimate sequences as duplicates and inflated the DQ metric.
+            if child_name:
+                dedup_key = f"{hh_head.lower()}|{child_name.lower()}|{ward.lower()}|{age}"
+                if dedup_key in m["seen_keys"]:
+                    m["duplicates"] += 1
+                else:
+                    m["seen_keys"].add(dedup_key)
 
 
 def _finalize_fac_data(fac_data, target_map, cfg):
@@ -745,13 +749,14 @@ def _aggregate(task_hits, name_map, hh_name_map, target_map, cfg):
             else:
                 m["drug1"] += 1   # SPAQ2 (12-59m) / AZM 12-59m
 
-        # dedup: (hh_head, child_name, ward, age)
-        if child_name and age is not None:
-            key = (hh_head.lower(), child_name.lower(), ward.lower(), age)
-            if key in m["seen_keys"]:
-                m["duplicates"] += 1
-            else:
-                m["seen_keys"].add(key)
+            # dedup TREATED records only (see _aggregate_batch — redoses and
+            # ABSENT/REFUSED->treated progressions are not duplicate treatments)
+            if child_name:
+                key = (hh_head.lower(), child_name.lower(), ward.lower(), age)
+                if key in m["seen_keys"]:
+                    m["duplicates"] += 1
+                else:
+                    m["seen_keys"].add(key)
 
     # resolve daily targets
     results = []
