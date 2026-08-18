@@ -10,7 +10,8 @@ dst_campaign_run         trigger-only: run one campaign report end to end
 common/
   slots.py               due-slot matching (pure functions, unit-tested)
   deployment_env.py      credential groups: sheet tab + env + secrets per group
-  tenant_lock.py         per-tenant lock + audit trail (Airflow metadata DB)
+  run_history.py         retime guard over the Run Log tab (sheet mode)
+  dst_kafka_status.py    run lifecycle events to Kafka (mdms mode)
   campaign_runner.py     the pipeline chain in one task, error classification
   alerts.py              Slack failure callback
 ```
@@ -51,7 +52,7 @@ common/
 | Run fails mid-pipeline | checkpoints still upload to the campaign's Drive `temp/` folder (finally block) — debuggable from any machine via `rerun_from_checkpoint` |
 | Row inactive / outside campaign window | routine no-op: marker `ok=None`, no audit row, no alert |
 | 3 consecutive failed runs | `max_consecutive_failed_dag_runs=3` auto-pauses the DAG (failure alerts have already fired each time) |
-| Manual trigger without conf | `claim_tenant_lock_for_run` fails fast with an explicit message |
+| Manual trigger without conf | `execute_campaign_pipeline` fails fast with an explicit message |
 
 ## Where files live
 
@@ -90,6 +91,5 @@ metadata and small XCom markers — never file contents.
 
 - `dst_campaign_runs` (Airflow metadata DB): one row per real report attempt —
   tenant, slot, status, error, Drive link. Routine no-ops leave no row.
-- `dst_tenant_locks`: live locks; a row older than the TTL means a run died.
 - Slack: every task failure alerts the campaign's own channel (falls back to
   `SLACK_CHANNEL`).

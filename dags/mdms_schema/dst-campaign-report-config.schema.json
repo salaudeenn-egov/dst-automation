@@ -1,0 +1,36 @@
+{
+  "_readme": "One-time MDMS schema creation for the DST campaign config mirror. POST to <mdms-url>/mdms-v2/schema/v1/_create (or the env's egov-mdms-service schema create endpoint) once per environment root tenant. Internal call — dummy authToken suffices.",
+  "RequestInfo": {
+    "apiId": "dst-automation",
+    "msgId": "create dst campaign report config schema",
+    "authToken": "",
+    "userInfo": { "id": 1 }
+  },
+  "SchemaDefinitions": [
+    {
+      "tenantId": "<ENV-ROOT-TENANT e.g. dev / mz>",
+      "code": "airflow-configs.dst-campaign-report-config",
+      "description": "DST daily campaign reporting config, mirrored one-way from the team's Google Sheet by the dst_config_sync DAG. One entry per campaign row; data.row carries the sheet columns verbatim (all strings). Do not edit entries by hand — the sheet overwrites them on the next sync tick.",
+      "definition": {
+        "type": "object",
+        "required": ["rowIdentity", "deploymentGroup", "row"],
+        "x-unique": ["rowIdentity"],
+        "properties": {
+          "rowIdentity": {
+            "type": "string",
+            "description": "tenant::campaignNumber (projectTypeId fallback) — stable across edits, new per campaign"
+          },
+          "deploymentGroup": {
+            "type": "string",
+            "description": "Sheet tab / credential group this campaign belongs to (e.g. nigeria_states, togo)"
+          },
+          "row": {
+            "type": "object",
+            "description": "The sheet row verbatim: state_name, tenant, drug_type, campaign_start, campaign_end, campaign_days, is_admin_console, campaign_number, project_type_id, project_type, cycle_index, report_times, partner_report_times, slack_channel, slack_channel_partners, target_csv, out_dir, secondary_product, task_date_field, task_campaign_filter, dose_index_filter, hfs_total, flws_total, lgas_total, active, campaign_name, google_sheet_id"
+          }
+        }
+      },
+      "isActive": true
+    }
+  ]
+}

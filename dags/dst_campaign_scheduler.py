@@ -29,9 +29,10 @@ except ImportError:
     from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
 from common.alerts import notify_slack_on_failure
-from common.deployment_env import group_environment, load_deployment_groups
+from common.deployment_env import (group_environment, load_deployment_groups,
+                                   resolve_dst_mode)
+from common.run_history import build_retime_guard
 from common.slots import find_due_slots
-from common.tenant_lock import has_successful_run_since
 
 log = logging.getLogger(__name__)
 
@@ -61,7 +62,13 @@ def dst_campaign_scheduler():
 
     @task(execution_timeout=timedelta(minutes=4))
     def find_due_campaigns(group):
-        """Read one group's sheet tab and return the slots due right now.
+        """Read one group's campaign rows and return the slots due right now.
+
+        Config source (DST_CONFIG_SOURCE): "sheet" (default) reads the Google
+        Sheet tab directly; "mdms" reads the mirror maintained by the
+        dst_config_sync listener DAG — with a per-tick fallback to the sheet
+        when MDMS is unreachable, so scheduling never stops for an MDMS outage
+        (the two sources are identical by construction).
 
         Wall-clock window (now - lookback, now]: Airflow 3's CronTriggerTimetable
         has a zero-width data interval, so the tick's own timestamps are useless
@@ -69,12 +76,26 @@ def dst_campaign_scheduler():
         """
         from pipeline import config
 
+        mode = resolve_dst_mode()
         with group_environment(group):
-            rows = config.get_active_rows()
+            if mode == "mdms":
+                from pipeline.mdms import get_active_rows_from_mdms
+                try:
+                    rows = get_active_rows_from_mdms(group)
+                except Exception as e:
+                    log.warning(f"[{group['name']}] MDMS unreachable — falling "
+                                f"back to the sheet for this tick: {e}")
+                    rows = config.get_active_rows()
+            else:
+                rows = config.get_active_rows()
+            # sheet mode: retime guard reads today's Run Log rows (one sheet
+            # read per tick). mdms mode: no guard — zero sheet/DB access on
+            # the scheduling path; run-id dedup still prevents duplicates.
+            guard = None if mode == "mdms" else build_retime_guard()
 
         now = datetime.now(timezone.utc)
         due = find_due_slots(group, rows, now, LOOKBACK_MINUTES,
-                             has_report_since=has_successful_run_since)
+                             has_report_since=guard)
         log.info(f"[{group['name']}] {len(rows)} rows -> {len(due)} due slot(s) "
                  f"in the last {LOOKBACK_MINUTES} min")
         for item in due:

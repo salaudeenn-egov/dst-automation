@@ -1,0 +1,49 @@
+# egov-persister config for the DST report automation lifecycle events.
+#
+# Consumes the Kafka topic save-dst-report-metadata (published by the
+# dst_campaign_run DAG in mdms mode — see dags/common/dst_kafka_status.py for
+# the producer and the exact event schema) and persists one row per lifecycle
+# event into dst_report_metadata (DDL: platform/dst_report_metadata.sql).
+#
+# Platform-side installation (same as any persister config):
+#   1. Add this file to the persister configs repo/folder the environment's
+#      egov-persister loads from.
+#   2. Create the table once (platform/dst_report_metadata.sql).
+#   3. Central instances: the producer tenant-prefixes the topic
+#      ({tenant}-save-dst-report-metadata); list each prefixed topic in
+#      fromTopic, comma-separated, the standard central-instance convention.
+serviceMaps:
+  serviceName: dst-report-automation
+  mappings:
+    - version: 1.0
+      description: Persists DST campaign report run lifecycle events
+      fromTopic: save-dst-report-metadata
+      isTransaction: true
+      queryMaps:
+        - query: >
+            INSERT INTO dst_report_metadata
+            (event_id, tenant_id, state_name, campaign_identifier, report_name,
+             trigger_frequency, mode, slot_date, slot_time, day, dag_run_id,
+             dag_name, status, status_order, error_message, drive_link,
+             timestamp_ms, event_timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+          basePath: $
+          jsonMaps:
+            - jsonPath: $.event_id
+            - jsonPath: $.tenant_id
+            - jsonPath: $.state_name
+            - jsonPath: $.campaign_identifier
+            - jsonPath: $.report_name
+            - jsonPath: $.trigger_frequency
+            - jsonPath: $.mode
+            - jsonPath: $.slot_date
+            - jsonPath: $.slot_time
+            - jsonPath: $.day
+            - jsonPath: $.dag_run_id
+            - jsonPath: $.dag_name
+            - jsonPath: $.status
+            - jsonPath: $.status_order
+            - jsonPath: $.error_message
+            - jsonPath: $.drive_link
+            - jsonPath: $.timestamp_ms
+            - jsonPath: $.timestamp

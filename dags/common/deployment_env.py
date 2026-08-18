@@ -101,3 +101,25 @@ def group_environment(group):
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = previous
+
+
+def resolve_dst_mode():
+    """The ONE universal, deployment-wide flag selecting how the system runs.
+
+    DST_MODE=sheet (default)  — purely Google Sheet: config read from the tab,
+                                run history on the Run Log tab, tenant lock and
+                                retime guard in our own Airflow's Postgres.
+    DST_MODE=mdms             — platform-integrated, ZERO database access:
+                                config from the MDMS mirror (sheet fallback on
+                                outage), run history as Kafka lifecycle events
+                                for the platform's persister, no lock/guard
+                                (deterministic run-ids prevent duplicates,
+                                same trade the platform's own system makes).
+
+    Set once per deployment in the environment — never per group or per DAG.
+    """
+    value = (os.getenv("DST_MODE") or "sheet").strip().lower()
+    if value not in ("sheet", "mdms"):
+        log.warning(f"unknown DST_MODE {value!r} — using sheet")
+        return "sheet"
+    return value

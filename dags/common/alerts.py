@@ -38,3 +38,23 @@ def notify_slack_on_failure(context):
         )
     except Exception as e:
         log.warning(f"[alerts] failure alert could not be sent: {e}")
+
+
+def send_slack_warning(text, channel=None):
+    """Post a warning to Slack (campaign channel or SLACK_CHANNEL fallback).
+    Never raises. Used e.g. by the config sync to nag about rejected rows
+    every tick until a human fixes the sheet."""
+    try:
+        token = os.getenv("SLACK_TOKEN")
+        channel = channel or os.getenv("SLACK_CHANNEL", "")
+        log.warning(text)
+        if not token or not channel:
+            return
+        requests.post(
+            "https://slack.com/api/chat.postMessage",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"channel": channel, "text": text},
+            timeout=10,
+        )
+    except Exception as e:
+        log.warning(f"[alerts] warning could not be sent: {e}")
