@@ -103,6 +103,7 @@ FLAG_COLOR = {
     "LOW":          "CC0000",   # red    <70%
     "NO TARGET":    "888888",
     "LOW ACTIVITY": "888888",
+    "NOT REPORTED": "888888",
 }
 
 _BATCH = 5000
@@ -726,8 +727,10 @@ def _cov_pct(numer, denom):
 
 
 def _band(net_cov_pct, net_target, records):
-    # Mirrors analyze.py's _band() priority order exactly: LOW ACTIVITY (too few
-    # records to be a meaningful signal) is checked FIRST, before target/coverage.
+    # Mirrors analyze.py's _band() priority order exactly. NOT REPORTED: zero
+    # records = only the target-book zero rows (any ES-seen LGA has >= 1).
+    if records == 0:
+        return "NOT REPORTED"
     if records < 10:
         return "LOW ACTIVITY"
     if net_target == 0:
@@ -739,7 +742,37 @@ def _band(net_cov_pct, net_target, records):
     return "LOW"
 
 
+def _lga_name_from_code(code):
+    """Readable LGA name from a boundary code: the segments after the last
+    numeric one (ADMIN2_TC_01_01_01_ALAYE_GOYMO -> "ALAYE GOYMO")."""
+    parts = str(code).split("_")
+    last_num = max((i for i, p in enumerate(parts) if p.isdigit()), default=-1)
+    return " ".join(parts[last_num + 1:]) or str(code)
+
+
 def _finalize_lga_rows(lga_rows, target_map):
+    """Rows are the UNION of LGAs that reported and the target book: a target-
+    book LGA with no data becomes an explicit zero row (status NOT REPORTED),
+    so the report's targets stay STANDARD irrespective of which LGAs synced —
+    same rule as SPAQ's facility-level fix in analyze.py."""
+    seen_codes = {r["lga_code"] for r in lga_rows}
+    for code, tgt in target_map.items():
+        if code in seen_codes:
+            continue
+        if not any(tgt.get(k, 0) > 0 for k in
+                   ("household_target", "population_target", "net_target")):
+            continue
+        zero = dict(
+            province="—", lga=_lga_name_from_code(code), lga_code=code,
+            facilities=0,
+            records=0, households_visited=0, nets_distributed=0, population_covered=0,
+            missing_hh_head=0, missing_gps=0,
+            manual_codes=0, scanned_codes=0, missing_codes=0,
+        )
+        for k in _DUP_KEYS:
+            zero[k] = None
+        lga_rows.append(zero)
+
     results = []
     for r in sorted(lga_rows, key=lambda x: (x["province"], x["lga"])):
         tgt = target_map.get(r["lga_code"],
@@ -1078,7 +1111,7 @@ def _write_dup_detail_tab(ws, detail_rows, fac_meta, banner_text, uname_map=None
         ws.column_dimensions[get_column_letter(ci)].width = 22
 
 
-BANDS = ["LOW", "MODERATE", "HIGH", "NO TARGET", "LOW ACTIVITY"]
+BANDS = ["LOW", "MODERATE", "HIGH", "NO TARGET", "LOW ACTIVITY", "NOT REPORTED"]
 
 
 # ── public entry point ─────────────────────────────────────────────────────────
@@ -1166,12 +1199,25 @@ def run(cfg):
     rows = _finalize_lga_rows(lga_rows_raw, target_map)
 
     g = _totals_row(rows) if rows else None
-    banner_text = (
-        f"Target Households: {g['household_target']:,}  |  "
-        f"Target Population: {g['population_target']:,}  |  "
-        f"Target ITNs: {g['net_target']:,}"
-        if g else "No data"
-    )
+    _bdays = None
+    if cfg.get("campaign_start") and cfg.get("campaign_end"):
+        _bdays = (cfg["campaign_end"] - cfg["campaign_start"]).days + 1
+    if g and not cfg.get("cumulative") and _bdays:
+        banner_text = (
+            f"Daily Targets (= Campaign Target \u00f7 {_bdays} campaign days) — "
+            f"Households: {g['household_target']:,}  |  "
+            f"Population: {g['population_target']:,}  |  "
+            f"ITNs: {g['net_target']:,}  "
+            f"(all targets/coverage in this sheet are DAILY)"
+        )
+    elif g:
+        banner_text = (
+            f"Overall Campaign Targets — Households: {g['household_target']:,}  |  "
+            f"Population: {g['population_target']:,}  |  "
+            f"ITNs: {g['net_target']:,}"
+        )
+    else:
+        banner_text = "No data"
 
     wb = Workbook()
     wb.remove(wb.active)

@@ -516,15 +516,29 @@ def _conclusion_prompt(cfg, g, hh_cov, pop_cov, net_cov, lga_d, roster_ever_sync
     )
 
 
-def _slack_prompt(cfg, g, hh_cov, pop_cov, net_cov, roster_ever_synced=0, roster_high=0):
+def _slack_prompt(cfg, g, cum_hh, cum_pop, cum_nets, campaign_len, elapsed_day,
+                  roster_ever_synced=0, roster_high=0):
+    """Coverage in the Slack message is CUMULATIVE only:
+    Cumulative Coverage % = Cumulative (Days 1-N) / Total Campaign Target x 100.
+    No daily target and no daily coverage are exposed to the narrative."""
     sync_pct = f"{roster_high/roster_ever_synced*100:.1f}%" if roster_ever_synced else "N/A"
+    n = campaign_len or 1
+    tot_hh   = g["hh_target"]  if cfg.get("cumulative") else g["hh_target"]  * n
+    tot_pop  = g["pop_target"] if cfg.get("cumulative") else g["pop_target"] * n
+    tot_net  = g["net_target"] if cfg.get("cumulative") else g["net_target"] * n
+    day_lbl  = elapsed_day or cfg.get("DAY", "?")
     facts = (
-        f"Campaign: {cfg['campaign_name']} in {cfg['state_name']}, LLIN bed-net distribution.\n"
-        f"Household Coverage: {hh_cov}\n"
-        f"Population Coverage: {pop_cov}\n"
-        f"ITN Coverage: {net_cov}\n"
-        f"Households visited: {g['hh_visited']:,} of {g['hh_target']:,}\n"
-        f"Nets distributed: {g['nets_distributed']:,} of {g['net_target']:,}\n"
+        f"Campaign: {cfg['campaign_name']} in {cfg['state_name']}, LLIN bed-net distribution, "
+        f"Day {day_lbl} of {campaign_len or '?'}.\n"
+        f"Cumulative ITN coverage (Days 1-{day_lbl} vs total campaign target): "
+        f"{_cov_str(cum_nets, tot_net)}\n"
+        f"Cumulative nets distributed (Days 1-{day_lbl}): {cum_nets:,} of {tot_net:,} total target\n"
+        f"Cumulative household coverage: {_cov_str(cum_hh, tot_hh)} "
+        f"({cum_hh:,} of {tot_hh:,})\n"
+        f"Cumulative population coverage: {_cov_str(cum_pop, tot_pop)} "
+        f"({cum_pop:,} of {tot_pop:,})\n"
+        f"Households visited this day: {g['hh_visited']:,}\n"
+        f"Nets distributed this day: {g['nets_distributed']:,}\n"
         # No duplicate figure: the legacy within-day dup_records number reads
         # as "double distribution" but only counts same-ID re-syncs — the
         # authoritative duplicate analysis lives in the internal report's
@@ -536,8 +550,10 @@ def _slack_prompt(cfg, g, hh_cov, pop_cov, net_cov, roster_ever_synced=0, roster
     return (
         facts
         + "\nWrite a single flowing paragraph (4 to 6 sentences) for a Slack field update "
-          "summarising the figures above, then end with the single most urgent action for "
-          "supervisors. Use the exact numbers given, do not invent any. Plain prose only — "
+          "summarising the figures above. Coverage must be described ONLY as cumulative "
+          "coverage against the total campaign target; never mention a daily target or "
+          "daily coverage. End with the single most urgent action for supervisors. "
+          "Use the exact numbers given, do not invent any. Plain prose only — "
           "one paragraph, no heading, no bullet points, no emojis, no asterisks."
     )
 
@@ -1043,7 +1059,26 @@ def _build_doc(cfg, *, g, hh_cov, pop_cov, net_cov, lga_d, facilities,
         cum_pop_covered      = last["cum_pop_covered"]      if last else g["pop_covered"]
         cum_nets_distributed = last["cum_nets_distributed"] if last else g["nets_distributed"]
 
+        # Cumulative block FIRST (headline, vs TOTAL campaign targets — same
+        # basis as the Slack message), daily block second.
+        _len = None
+        if cfg.get("campaign_start") and cfg.get("campaign_end"):
+            _len = (cfg["campaign_end"] - cfg["campaign_start"]).days + 1
+        _n = _len or 1
+        d_lbl = elapsed_day or '?'
         overview_rows += [
+            ("Total Campaign Target ITNs",    f"{g['net_target'] * _n:,}"),
+            (f"Cumulative Nets Distributed (Days 1-{d_lbl})",  f"{cum_nets_distributed:,}"),
+            (f"Cumulative ITN Coverage (Days 1-{d_lbl})",
+             _cov_str(cum_nets_distributed, g["net_target"] * _n)),
+            ("Total Campaign Target Households", f"{g['hh_target'] * _n:,}"),
+            (f"Cumulative Households Visited (Days 1-{d_lbl})", f"{cum_hh_visited:,}"),
+            (f"Cumulative HH Coverage (Days 1-{d_lbl})",
+             _cov_str(cum_hh_visited, g["hh_target"] * _n)),
+            ("Total Campaign Target Population", f"{g['pop_target'] * _n:,}"),
+            (f"Cumulative Population Covered (Days 1-{d_lbl})", f"{cum_pop_covered:,}"),
+            (f"Cumulative Pop Coverage (Days 1-{d_lbl})",
+             _cov_str(cum_pop_covered, g["pop_target"] * _n)),
             ("Daily Target Households",       f"{g['hh_target']:,}"),
             ("Households Visited Today",      f"{g['hh_visited']:,}"),
             ("Coverage vs Daily HH Target",   _cov_str(g["hh_visited"], g["hh_target"])),
@@ -1053,9 +1088,6 @@ def _build_doc(cfg, *, g, hh_cov, pop_cov, net_cov, lga_d, facilities,
             ("Daily Target ITNs",             f"{g['net_target']:,}"),
             ("Nets Distributed Today",        f"{g['nets_distributed']:,}"),
             ("Coverage vs Daily ITN Target",  _cov_str(g["nets_distributed"], g["net_target"])),
-            (f"Cumulative Households Visited (Days 1-{elapsed_day or '?'})",   f"{cum_hh_visited:,}"),
-            (f"Cumulative Population Covered (Days 1-{elapsed_day or '?'})",   f"{cum_pop_covered:,}"),
-            (f"Cumulative Nets Distributed (Days 1-{elapsed_day or '?'})",     f"{cum_nets_distributed:,}"),
         ]
     _two_col_table(doc, overview_rows)
     doc.add_paragraph()
@@ -1127,6 +1159,17 @@ def _build_doc(cfg, *, g, hh_cov, pop_cov, net_cov, lga_d, facilities,
 
     dist_sec = sec
     add_heading(doc, f"{dist_sec}.  Distribution Data Analysis", 4)
+    if not cum:
+        _fl = None
+        if cfg.get("campaign_start") and cfg.get("campaign_end"):
+            _fl = (cfg["campaign_end"] - cfg["campaign_start"]).days + 1
+        if _fl:
+            add_para(doc,
+                     f"All targets and coverage in this section are DAILY: "
+                     f"Daily Target = Total Campaign Target \u00f7 Campaign Length "
+                     f"(ITNs: {g['net_target'] * _fl:,} \u00f7 {_fl} days "
+                     f"= {g['net_target']:,} per day).",
+                     size=9, color=GREY_RGB)
     sub = 1
     add_heading(doc, f"{dist_sec}.{sub}  Performance by LGA", 5); sub += 1
     _perf_table(doc, lga_d)
@@ -1293,8 +1336,14 @@ def run(cfg):
                             roster_ever_synced, roster_high),
         max_tokens=600,
     )
+    _last = days_data[-1] if days_data else None
     slack_narrative = _claude(
-        _slack_prompt(cfg, g, hh_cov, pop_cov, net_cov, roster_ever_synced, roster_high),
+        _slack_prompt(cfg, g,
+                      _last["cum_hh_visited"] if _last else g["hh_visited"],
+                      _last["cum_pop_covered"] if _last else g["pop_covered"],
+                      _last["cum_nets_distributed"] if _last else g["nets_distributed"],
+                      campaign_days_for_target, elapsed_day,
+                      roster_ever_synced, roster_high),
         max_tokens=400,
     )
     slack_text = (
