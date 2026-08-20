@@ -11,6 +11,11 @@ from datetime import datetime, timedelta, timezone
 
 from pipeline.schedule_utils import compute_trigger_slots
 
+# The whole-campaign cumulative report fires once, at the very end of the
+# mop-up day, and goes to BOTH the internal and the partner channel.
+CUMULATIVE_TIME = "23:59"
+CUMULATIVE_MODE = "cumulative"
+
 
 def parse_sheet_date(value):
     """Parse the date formats the config sheet uses. Returns date or None."""
@@ -37,6 +42,20 @@ def build_trigger_run_id(group_name, tenant, mode, slot_date, slot_time):
     """Deterministic run id: the same slot can never fire twice
     (TriggerDagRunOperator skips when the run id already exists)."""
     return f"dst_{group_name}_{tenant}_{mode}_{slot_date}_{slot_time.replace(':', '')}"
+
+
+def _candidate_slots(row):
+    """Daily slots, plus the one-off cumulative slot when mopup_end_date is set.
+
+    An unset or unparseable mopup_end_date simply yields no cumulative slot —
+    the report is opt-in per campaign, never inferred from campaign_end, because
+    ES keeps absorbing late syncs for days after a campaign closes and the date
+    is a judgement call the campaign lead owns.
+    """
+    slots = list(compute_trigger_slots(row))
+    if parse_sheet_date(row.get("mopup_end_date")):
+        slots.append((CUMULATIVE_TIME, CUMULATIVE_MODE))
+    return slots
 
 
 def find_due_slots(group, rows, now_utc, lookback_minutes, has_report_since=None):
@@ -66,14 +85,20 @@ def find_due_slots(group, rows, now_utc, lookback_minutes, has_report_since=None
         if not tenant:
             continue
 
-        for slot_time, mode in compute_trigger_slots(row):
+        for slot_time, mode in _candidate_slots(row):
             hour, minute = (int(p) for p in slot_time.split(":"))
             for day in sorted(window_dates):
                 slot_dt = datetime(day.year, day.month, day.day, hour, minute,
                                    tzinfo=timezone.utc)
                 if not (window_start < slot_dt <= now_utc):
                     continue
-                if not campaign_window_contains(row, slot_dt.date()):
+                if mode == CUMULATIVE_MODE:
+                    # Deliberately outside the campaign window: the mop-up date
+                    # is normally days AFTER campaign_end, so the usual window
+                    # check would drop it. Match the configured date exactly.
+                    if parse_sheet_date(row.get("mopup_end_date")) != slot_dt.date():
+                        continue
+                elif not campaign_window_contains(row, slot_dt.date()):
                     continue
                 if has_report_since and has_report_since(tenant, mode, slot_dt):
                     continue

@@ -241,7 +241,6 @@ automation/
 │   ├── run_log.py      # Run Log tab (sheet mode)
 │   └── core/           # es / excel / word / llm / drive / checkpoint helpers
 ├── platform/           # egov persister config + DDL for mdms mode
-├── tests/              # plain-python unit tests, no Airflow required
 ├── run.py              # cumulative (whole-campaign) report CLI only
 ├── requirements.txt
 ├── .env                # Secrets — never committed

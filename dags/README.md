@@ -79,8 +79,6 @@ metadata and small XCom markers — never file contents.
 
 ## Testing
 
-- Pure logic: `python tests/test_scheduling.py` (13 cases — window matching,
-  midnight crossing, retime guard, mode dedup, error classification).
 - DAG parse check without a running Airflow:
   `docker run --rm --entrypoint bash -v <repo>:/repo:ro apache/airflow:3.1.6
    -c "export PYTHONPATH=/repo:/repo/dags && python -c 'import dst_campaign_scheduler, dst_campaign_run'"`

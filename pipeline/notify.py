@@ -9,8 +9,6 @@ No OAuth token required. Grant the service account Editor access to:
 import logging
 import os
 
-import gspread
-import openpyxl
 import requests
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
@@ -134,37 +132,6 @@ def _upload_to_drive(file_path, title, folder_id=None):
     return url
 
 
-# ── Google Sheets ──────────────────────────────────────────────────────────────
-
-def _write_to_sheets(cfg, perf_xlsx):
-    """Write performance rows to Google Sheet tab '{state_name} Day{N}'."""
-    sheet_id = cfg.get("google_sheet_id", "")
-    if not sheet_id:
-        log.info("[notify] google_sheet_id not set — skipping Sheets write")
-        return
-    try:
-        client      = gspread.Client(auth=_creds())
-        spreadsheet = client.open_by_key(sheet_id)
-        tab_name    = f"{cfg['state_name']} Day{cfg['DAY']}"
-
-        try:
-            ws = spreadsheet.worksheet(tab_name)
-            ws.clear()
-        except gspread.WorksheetNotFound:
-            ws = spreadsheet.add_worksheet(title=tab_name, rows=2000, cols=30)
-
-        wb   = openpyxl.load_workbook(perf_xlsx, read_only=True)
-        rows = list(wb["ALL FACILITIES"].iter_rows(min_row=2, values_only=True))
-        wb.close()
-
-        data = [[str(c) if c is not None else "" for c in row] for row in rows]
-        if data:
-            ws.update("A1", data)
-        log.info(f"[notify] Sheets updated: '{tab_name}'")
-    except Exception as e:
-        log.warning(f"[notify] Sheets write failed (non-fatal): {e}")
-
-
 # ── Slack ──────────────────────────────────────────────────────────────────────
 
 def _slack_post(channel, text, token):
@@ -201,6 +168,33 @@ def temp_folder_id(cfg):
         return ""
     from pipeline.core import drive
     return drive.find_or_create_folder("temp", fid)
+
+
+def upload_chart(cfg):
+    """Publish the run's progress chart to the campaign's Drive folder.
+
+    The PNG is embedded in the Word report but was otherwise the one artifact
+    that never left the machine; with Drive as the output store and a
+    disposable scratch dir, it would simply be lost. Raw upload (no Google
+    conversion), non-fatal.
+    """
+    from pipeline.core import drive
+    suffix = ("cumulative" if cfg.get("cumulative") else f"day{cfg.get('DAY','')}")
+    # SPAQ/AZM and ITN name the file differently
+    candidates = [f"progress_chart_{suffix}.png", f"itn_progress_chart_{suffix}.png"]
+    try:
+        folder = campaign_folder_id(cfg)
+        if not folder:
+            return ""
+        for name in candidates:
+            path = os.path.join(cfg["out_dir"], name)
+            if os.path.exists(path):
+                drive.upload_raw(path, name, folder)
+                log.info(f"[notify] chart published to Drive: {name}")
+                return name
+    except Exception as e:
+        log.warning(f"[notify] chart upload failed (non-fatal): {e}")
+    return ""
 
 
 def upload_checkpoints(cfg, stages=("analyze", "cdd_sync")):
@@ -267,13 +261,15 @@ def run(cfg, docx_path, slack_text, partner_docx_path=None, mode="both"):
         except Exception as e:
             log.warning(f"[notify] Drive upload failed (non-fatal): {e}")
 
-    # Post to Slack
+    # Post to Slack. A missing token skips only the POSTS — the Drive uploads
+    # at the end of this function must still run, or a token misconfiguration
+    # would silently cost us the chart and the checkpoints as well.
     if not token:
-        log.warning("[notify] SLACK_TOKEN not set — skipping Slack")
-        return
+        log.warning("[notify] SLACK_TOKEN not set — skipping Slack posts, "
+                    "Drive publication still runs")
 
     # Main channel — full report (only if configured; a failure must not block the partner post)
-    if do_internal and channel:
+    if token and do_internal and channel:
         try:
             message = slack_text
             if drive_link:
@@ -282,12 +278,12 @@ def run(cfg, docx_path, slack_text, partner_docx_path=None, mode="both"):
             log.info(f"[notify] Slack post done -> {channel}")
         except Exception as e:
             log.error(f"[notify] Slack failed (non-fatal): {e}")
-    elif do_internal:
+    elif token and do_internal:
         log.warning("[notify] slack_channel not set — skipping main post (partner post still runs)")
 
     # Partner channel — report without DQ sections (if configured)
     partner_channel = cfg.get("slack_channel_partners", "")
-    if do_partner and partner_channel and partner_docx_path and os.path.exists(partner_docx_path):
+    if token and do_partner and partner_channel and partner_docx_path and os.path.exists(partner_docx_path):
         # Upload and post in separate try blocks so Slack post fires even if Drive fails
         partner_link = ""
         try:
@@ -307,6 +303,7 @@ def run(cfg, docx_path, slack_text, partner_docx_path=None, mode="both"):
         except Exception as e:
             log.warning(f"[notify] Partner channel post failed (non-fatal): {e}")
 
+    upload_chart(cfg)
     upload_checkpoints(cfg)
 
     return drive_link

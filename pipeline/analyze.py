@@ -237,9 +237,10 @@ def _map_household_ids_to_head_ids(cfg, hh_clref_ids):
 
 
 def _load_targets(cfg):
-    csv_path = cfg["target_csv"]
+    from pipeline.core.drive import resolve_target_book
+    csv_path = resolve_target_book(cfg)
     if not csv_path:
-        log.warning("target_csv not set — all targets = 0")
+        log.warning("no target book configured — all targets = 0")
         return {}
 
     # Google Sheets URL: extract sheet_id and optional gid

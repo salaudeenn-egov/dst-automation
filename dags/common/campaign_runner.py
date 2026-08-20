@@ -14,6 +14,7 @@ Error classification (retry only what a retry can fix):
     data, and the marker records the degradation.
 """
 import logging
+from datetime import timedelta
 
 log = logging.getLogger(__name__)
 
@@ -28,6 +29,51 @@ except ImportError:
 
 DATA_ERRORS = (KeyError, ValueError, TypeError, AttributeError)
 ITN_DRUG_TYPES = {"ITN", "LLIN"}
+CUMULATIVE_MODE = "cumulative"
+
+
+def apply_cumulative(cfg):
+    """Turn a daily cfg into a whole-campaign one (ported from run.py's
+    run_cumulative, which was the only caller of the pipeline's ~89
+    cfg["cumulative"] branches).
+
+    Covers campaign_start through the mop-up end date inclusive, and measures
+    coverage against the FULL campaign target: analyze._load_targets uses
+    divisor 1 when cumulative is set, instead of dividing by campaign_days.
+    """
+    import os
+    from pipeline.config import _date_label
+
+    start = cfg["campaign_start"]
+    end = cfg.get("mopup_end_date") or cfg["campaign_end"]
+    if end < start:
+        raise ValueError(f"mop-up end {end} is before campaign_start {start}")
+
+    total_days = (end - start).days + 1
+    cfg.update({
+        "cumulative":         True,
+        "DAY":                total_days,
+        # labels read "Days 1-N"; the target maths is decoupled via the flag
+        "campaign_days":      total_days,
+        "GTE":                f"{start.isoformat()}T00:00:00.000Z",
+        "LTE":                f"{end.isoformat()}T23:59:59.999Z",
+        "CAMPAIGN_DATES":     [(start + timedelta(days=i)).isoformat()
+                               for i in range(total_days)],
+        "END_LABEL":          _date_label(end),
+        # the mop-up date is past campaign_end by design, so the daily
+        # in-window guard must not apply to this run
+        "in_campaign_window": True,
+    })
+
+    out_dir = cfg["out_dir"]
+    slug = str(cfg["state_name"]).replace(" ", "_")
+    cfg["perf_xlsx"] = os.path.join(out_dir, "performance_cumulative.xlsx")
+    cfg["sync_xlsx"] = os.path.join(out_dir, "cdd_sync_cumulative.xlsx")
+    cfg["docx_path"] = os.path.join(
+        out_dir, f"{slug}_Cumulative_Campaign_Report.docx")
+    cfg["partner_docx_path"] = os.path.join(
+        out_dir, f"{slug}_Cumulative_PartnerReport.docx")
+    return cfg
 
 
 def select_pipeline_modules(drug_type):
@@ -66,10 +112,13 @@ def execute_campaign(row, mode="both"):
 
     cfg = config.build(row)
     state = cfg["state_name"]
+    is_cumulative = mode == CUMULATIVE_MODE
 
     if not cfg["active"]:
         return {"ok": None, "reason": "row inactive"}
-    if not cfg["in_campaign_window"]:
+    if is_cumulative:
+        apply_cumulative(cfg)
+    elif not cfg["in_campaign_window"]:
         return {"ok": None,
                 "reason": f"outside campaign window "
                           f"({cfg['campaign_start']} to {cfg['campaign_end']})"}
@@ -78,7 +127,11 @@ def execute_campaign(row, mode="both"):
     marker = {"ok": True, "tenant": cfg["tenant"], "state": state,
               "mode": mode, "day": cfg["DAY"], "stages": {}, "drive_link": ""}
 
-    log.info(f"[runner] {state} Day {cfg['DAY']}/{cfg['campaign_days']} mode={mode}")
+    if is_cumulative:
+        log.info(f"[runner] {state} CUMULATIVE Days 1-{cfg['DAY']} "
+                 f"({cfg['campaign_start']} to {cfg.get('mopup_end_date') or cfg['campaign_end']})")
+    else:
+        log.info(f"[runner] {state} Day {cfg['DAY']}/{cfg['campaign_days']} mode={mode}")
     try:
         _run_stage("analyze", lambda: analyze_mod.run(cfg), marker)
 
@@ -96,7 +149,8 @@ def execute_campaign(row, mode="both"):
         drive_link = _run_stage(
             "notify",
             lambda: notify.run(cfg, docx_path, slack_text,
-                               partner_docx_path=partner_docx_path, mode=mode),
+                               partner_docx_path=partner_docx_path,
+                               mode="both" if is_cumulative else mode),
             marker)
         marker["drive_link"] = drive_link or ""
     finally:

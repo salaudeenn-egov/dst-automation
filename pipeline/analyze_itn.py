@@ -660,9 +660,10 @@ def _load_targets_itn(cfg):
       net/ITN target:      net_target | product_target | TargetBednets
     Any column not found defaults to 0 (reported, not silently assumed correct).
     """
-    csv_path = cfg.get("target_csv", "")
+    from pipeline.core.drive import resolve_target_book
+    csv_path = resolve_target_book(cfg)
     if not csv_path or not os.path.exists(csv_path):
-        log.warning(f"[analyze_itn] target_csv not found: {csv_path} — all targets = 0")
+        log.warning(f"[analyze_itn] target book not found: {csv_path} — all targets = 0")
         return {}
     df = pd.read_csv(csv_path)
     cols_lower = {c.lower(): c for c in df.columns}

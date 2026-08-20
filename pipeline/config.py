@@ -4,6 +4,7 @@ Reads one row per active campaign and returns a fully resolved config dict.
 """
 import os
 import logging
+import tempfile
 from datetime import date, timedelta, datetime
 
 import gspread
@@ -220,9 +221,17 @@ def build(row):
     gte = f"{today.isoformat()}T00:00:00.000Z"
     lte = f"{today.isoformat()}T23:59:59.999Z"
 
-    out_dir = str(row.get("out_dir", "")).strip() or os.path.join(
-        os.path.dirname(__file__), "output", tenant
-    )
+    # Local SCRATCH only — Google Drive is the output store. Every durable
+    # artifact (reports, Excels, chart, checkpoints) is published to the
+    # campaign's Drive folder, so this directory is disposable and the code
+    # picks it itself: no env var, no sheet column to get wrong.
+    # It must never sit inside the package — under Kubernetes the code is
+    # typically a read-only git-sync mount and makedirs() would raise
+    # "Read-only file system" before any work starts.
+    # The legacy out_dir column is still honoured for the JupyterHub boxes,
+    # which read their reports off local disk; it is deprecated.
+    out_dir = (str(row.get("out_dir", "")).strip()
+               or os.path.join(tempfile.gettempdir(), "dst", tenant))
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(os.path.join(out_dir, "logs"), exist_ok=True)
 
@@ -248,6 +257,9 @@ def build(row):
         # dates
         "campaign_start":  campaign_start,
         "campaign_end":    campaign_end,
+        # Optional. When set, the whole-campaign cumulative report fires at
+        # 23:59 UTC on this date and is posted to BOTH channels. Blank = never.
+        "mopup_end_date":  _parse_date(row.get("mopup_end_date", "")),
         "extract_date":    today,   # always today — no sheet override
         "campaign_days":   campaign_days_cfg,
         "DAY":             day,
@@ -306,14 +318,20 @@ def build(row):
         "secondary_products": _parse_secondary_products(row),
 
         # targets / counts
-        "target_csv":      str(row.get("target_csv", "")).strip(),
-        "hfs_total":       int(float(row.get("hfs_total", 0) or 0)),
-        "flws_total":      int(float(row.get("flws_total", 0) or 0)),
+        # target_file is the current name (a file name inside DST_TARGET_FOLDER_ID);
+        # target_csv is the legacy column and still wins nothing but compatibility,
+        # so prod sheets keep working until they are renamed. Same dual-read
+        # pattern as secondary_products/secondary_product above.
+        "target_csv":      str(row.get("target_file", "") or
+                               row.get("target_csv", "")).strip(),
+        # hfs_total / flws_total were read here and consumed nowhere; the
+        # reported HF count is computed live from the facility rows.
+        # lgas_total stays: report.py uses it as an optional override of the
+        # count of LGAs that actually reported.
         "lgas_total":      int(float(row.get("lgas_total", 0) or 0)),
 
         # output
         "out_dir":         out_dir,
-        "google_sheet_id": str(row.get("google_sheet_id", "")).strip(),
         "slack_channel":          str(row.get("slack_channel", "")).strip(),
         "slack_channel_partners": str(row.get("slack_channel_partners", "")).strip(),
 
