@@ -1339,7 +1339,11 @@ def _build_trajectory(cfg, g):
             "chart_path":  _generate_progress_chart(days_data, cfg, overall_target=g["target"]),
         }
 
-    days_data   = _load_daily_totals_from_files(cfg)
+    # ES first, exactly as the cumulative branch does. out_dir is a disposable
+    # per-run temp dir under Airflow, so days 1..N-1 never exist on disk: reading
+    # only files made cum_treated equal to TODAY, and that value is what the
+    # Slack post presents as "Cumulative children treated (Days 1-N)".
+    days_data   = _load_daily_totals_from_es(cfg) or _load_daily_totals_from_files(cfg)
     cum_treated = sum(d["treated"] for d in days_data)
     cum_target  = sum(d["target"]  for d in days_data)
     return {

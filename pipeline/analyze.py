@@ -284,8 +284,19 @@ def _load_targets(cfg):
         return {}
     else:
         df = pd.read_csv(csv_path)
-    col_name = "facility_name" if "facility_name" in df.columns else df.columns[0]
-    col_tgt  = "individual_target" if "individual_target" in df.columns else df.columns[1]
+    if "facility_name" in df.columns and "individual_target" in df.columns:
+        col_name, col_tgt = "facility_name", "individual_target"
+    else:
+        if len(df.columns) < 2:
+            raise ValueError(
+                f"target book has {len(df.columns)} column(s) {list(df.columns)} — "
+                f"need facility_name and individual_target")
+        col_name, col_tgt = df.columns[0], df.columns[1]
+        # falling back to POSITION silently produced plausible-but-false coverage
+        # for every facility when a book was re-exported with different headers
+        log.error("target book lacks facility_name/individual_target; falling back "
+                  "to positional columns %r (name) and %r (target) — verify these",
+                  col_name, col_tgt)
     # Cumulative report measures against the FULL campaign target (undivided);
     # daily reports divide the total by campaign_days. divisor=1 keeps the overall target.
     divisor = 1 if cfg.get("cumulative") else cfg["campaign_days"]

@@ -13,7 +13,9 @@ Error classification (retry only what a retry can fix):
   - cdd_sync failures never kill the run — the report proceeds without sync
     data, and the marker records the degradation.
 """
+import json
 import logging
+import os
 from datetime import timedelta
 
 log = logging.getLogger(__name__)
@@ -30,8 +32,21 @@ except ImportError:
 # FileNotFoundError is included because a missing target book (drive.py's
 # download_target_book) is a configuration error: three identical attempts
 # three minutes apart cannot conjure the file, they just delay the alert.
+# IndexError belongs here for the same reason as the rest: a malformed target
+# book or a short tuple unpack fails identically on every attempt.
 DATA_ERRORS = (KeyError, ValueError, TypeError, AttributeError,
-               FileNotFoundError)
+               FileNotFoundError, IndexError)
+
+# Checked BEFORE DATA_ERRORS. A JSON decode failure is a ValueError subclass,
+# so an ES/Drive 502 served as an HTML error page — the textbook transient —
+# was being classified as permanent and failing without a retry.
+_TRANSIENT_FIRST = [json.JSONDecodeError]
+try:
+    from requests.exceptions import JSONDecodeError as _RequestsJSONDecodeError
+    _TRANSIENT_FIRST.append(_RequestsJSONDecodeError)
+except ImportError:
+    pass
+TRANSIENT_ERRORS = tuple(_TRANSIENT_FIRST)
 ITN_DRUG_TYPES = {"ITN", "LLIN"}
 CUMULATIVE_MODE = "cumulative"
 
@@ -98,6 +113,9 @@ def _run_stage(stage_name, fn, marker):
         result = fn()
         marker["stages"][stage_name] = "ok"
         return result
+    except TRANSIENT_ERRORS as e:
+        marker["stages"][stage_name] = f"failed: {e}"
+        raise
     except DATA_ERRORS as e:
         marker["stages"][stage_name] = f"failed: {e}"
         raise AirflowFailException(
@@ -144,8 +162,17 @@ def execute_campaign(row, mode="both"):
         _run_stage("analyze", lambda: analyze_mod.run(cfg), marker)
 
         try:
-            cdd_sync_mod.run(cfg)
-            marker["stages"]["cdd_sync"] = "ok"
+            produced = cdd_sync_mod.run(cfg)
+            if produced is None and not os.path.exists(cfg.get("sync_xlsx", "")):
+                # cdd_sync returns None without raising when campaign_number /
+                # project_type_id is blank or zero CDDs match. Marking that "ok"
+                # made the audit row assert a healthy run while the report said
+                # "CDDs synced: 0 of 0" as though it were measured.
+                marker["stages"]["cdd_sync"] = "degraded: produced no sync workbook"
+                log.error("[runner] cdd_sync produced no workbook — sync numbers "
+                          "will be absent from the report")
+            else:
+                marker["stages"]["cdd_sync"] = "ok"
         except Exception as e:
             marker["stages"]["cdd_sync"] = f"degraded: {e}"
             log.error(f"[runner] cdd_sync failed (non-fatal — report continues "

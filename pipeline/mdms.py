@@ -256,6 +256,7 @@ def sync_rows_to_mdms(group, sheet_rows):
     existing = search_entries(group)
     plan = plan_sync(sheet_rows, existing, group.get("name"))
     counts = apply_sync(plan, group)
+    counts["skip_deactivation"] = plan["skip_deactivation"]
     counts["rejected_details"] = [f"{identity}: {'; '.join(problems)}"
                                   for identity, problems in plan["rejected"]]
     log.info(f"[mdms-sync] {group.get('name')}: {counts}")

@@ -79,6 +79,12 @@ def dst_config_sync():
             rows = config.get_active_rows()
             counts = sync_rows_to_mdms(group, rows)
 
+        if counts and counts.get("skip_deactivation"):
+            send_slack_warning(
+                f"DST CONFIG SYNC [{group['name']}]: the sheet tab read back EMPTY, "
+                f"so deactivation was skipped. Campaigns removed from the sheet are "
+                f"still ACTIVE in MDMS and will keep producing reports.",
+                group_name=group["name"])
         if counts is None:
             log.info(f"[{group['name']}] MDMS_URL not set — nothing to sync")
         elif counts.get("rejected"):
