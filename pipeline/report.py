@@ -30,6 +30,7 @@ STATUS_COLOR = {
     "LOW":          RGBColor(0xCC, 0x00, 0x00),   # red
     "NO TARGET":    RGBColor(0x88, 0x88, 0x88),
     "LOW ACTIVITY": RGBColor(0x88, 0x88, 0x88),
+    "NOT REPORTED": RGBColor(0x88, 0x88, 0x88),
 }
 
 # Cell background fills for coverage colour-coding
@@ -39,6 +40,7 @@ COV_FILL = {
     "LOW":          "FFC7CE",   # light red
     "NO TARGET":    "F2F2F2",
     "LOW ACTIVITY": "F2F2F2",
+    "NOT REPORTED": "F2F2F2",
 }
 
 def _cov_band(pct):
@@ -599,10 +601,11 @@ def _read_previous_report(cfg):
 
 def _claude(prompt, max_tokens=300):
     """
-    Generate narrative text via Groq's free tier (llama-3.3-70b-versatile by default).
+    Generate narrative text via Groq's free tier (openai/gpt-oss-120b by default;
+    llama-3.3-70b-versatile was decommissioned 2026-08-16).
     Groq-only for now — the Claude and Ollama providers were removed. Config:
         GROQ_API_KEY   (required)
-        GROQ_MODEL     (default llama-3.3-70b-versatile)
+        GROQ_MODEL     (default openai/gpt-oss-120b)
         GROQ_BASE_URL  (default https://api.groq.com/openai/v1)
     On any failure returns a "[Narrative not generated — ...]" placeholder so the
     report still builds (non-fatal).
@@ -613,17 +616,24 @@ def _claude(prompt, max_tokens=300):
         log.warning("GROQ_API_KEY not set — returning placeholder text")
         return "[Narrative not generated — GROQ_API_KEY missing]"
     base  = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
-    model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": 0.4,   # low — favours clean JSON + consistent prose
+    }
+    if "gpt-oss" in model:
+        # reasoning model: hidden reasoning tokens count against max_tokens, so
+        # keep reasoning short and pad the cap — callers' max_tokens stays the
+        # visible-output budget it was under llama
+        payload["reasoning_effort"] = "low"
+        payload["max_tokens"] = max_tokens + 500
     try:
         r = _rq.post(
             f"{base}/chat/completions",
             headers={"Authorization": f"Bearer {api_key}"},
-            json={
-                "model": model,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": max_tokens,
-                "temperature": 0.4,   # low — favours clean JSON + consistent prose
-            },
+            json=payload,
             timeout=120,
         )
         r.raise_for_status()
@@ -631,10 +641,13 @@ def _claude(prompt, max_tokens=300):
         choice = (data.get("choices") or [{}])[0]
         if choice.get("finish_reason") == "length":
             log.warning(
-                f"Groq response hit max_tokens={max_tokens} — output likely "
-                f"truncated. Consider raising the cap for this call."
+                f"Groq response hit max_tokens={payload['max_tokens']} — output "
+                f"likely truncated. Consider raising the cap for this call."
             )
         txt = (choice.get("message", {}).get("content") or "").strip()
+        # gpt-oss emits narrow no-break spaces (U+202F) e.g. in "88 %" — normalise
+        # to plain ASCII so Word/Slack output stays clean
+        txt = txt.replace(" ", " ").replace(" ", " ").replace(" %", "%")
         return txt or "[Narrative not generated — empty Groq response]"
     except Exception as e:
         log.warning(f"Groq call failed (non-fatal): {e}")
@@ -708,7 +721,8 @@ def _issues_prompt(cfg, g, cov_pct, lga_d, facilities, sync_rows, sync_time_stat
     if sync_time_stats:
         for _, (count, pct) in sync_time_stats.items():
             by17 = f" by17:{count:,}({pct})"
-    low_act = [f for f in facilities if f["rec"] < 10]
+    low_act = [f for f in facilities
+               if f["rec"] < 10 and f["status"] != "NOT REPORTED"]
     prev = _extract_prev_stats(prev_report)
     is_last = cfg["DAY"] == cfg["campaign_days"]
     cum = cfg.get("cumulative")
@@ -774,8 +788,12 @@ def _fmt_slack_heading(cfg):
             f"(Day {cfg['DAY']} of {cfg['campaign_days']}, {cfg['DATE_LABEL']})*")
 
 
-def _slack_prompt(cfg, g, cov_pct, docx_name, sync_rows, sync_time_stats, prev_report):
-    """Prompt for a single flowing summary paragraph (figures woven into prose)."""
+def _slack_prompt(cfg, g, cum_treated, docx_name, sync_rows, sync_time_stats, prev_report):
+    """Prompt for a single flowing summary paragraph (figures woven into prose).
+
+    Coverage in the Slack message is CUMULATIVE only:
+    Cumulative Coverage % = Cumulative Treated (Days 1-N) / Total Campaign Target x 100.
+    No daily target and no daily coverage are exposed to the narrative."""
     drug_type = cfg["drug_type"]
     d1 = "SPAQ2 (12-59 months)" if drug_type == "SPAQ" else "AZM 12-59 months"
     d2 = "SPAQ1 (3-11 months)"  if drug_type == "SPAQ" else "AZM 1-11 months"
@@ -797,14 +815,19 @@ def _slack_prompt(cfg, g, cov_pct, docx_name, sync_rows, sync_time_stats, prev_r
     scope = (f"Cumulative Days 1-{cfg['DAY']} ({cfg['START_LABEL']} to {cfg['END_LABEL']})"
              if cum else
              f"Day {cfg['DAY']} of {cfg['campaign_days']} ({cfg['DATE_LABEL']})")
-    tgt_word = "campaign target" if cum else "daily target"
+
+    # Cumulative coverage vs the TOTAL campaign target — the only coverage shown.
+    total_target = g["target"] if cum else g["target"] * cfg["campaign_days"]
+    treated_cum  = g["treated"] if cum else cum_treated
+    cum_cov      = _cov_str(treated_cum, total_target)
 
     facts = (
         f"Campaign: {cfg['campaign_name']} in {cfg['state_name']}, {scope}, {cfg['drug_type']}.\n"
-        f"Coverage: {cov_pct}\n"
-        f"Children treated: {g['treated']:,}\n"
-        f"{tgt_word.capitalize()}: {g['target']:,}\n"
-        f"Records submitted: {g['records']:,}\n"
+        f"Cumulative coverage (Days 1-{cfg['DAY']} vs total campaign target): {cum_cov}\n"
+        f"Cumulative children treated (Days 1-{cfg['DAY']}): {treated_cum:,}\n"
+        f"Total campaign target: {total_target:,}\n"
+        f"Children treated this day: {g['treated']:,}\n"
+        f"Records submitted this day: {g['records']:,}\n"
         f"{d2}: {g['drug2']:,}\n"
         f"{d1}: {g['drug1']:,}\n"
         f"Not administered: {not_admin:,}\n"
@@ -818,8 +841,10 @@ def _slack_prompt(cfg, g, cov_pct, docx_name, sync_rows, sync_time_stats, prev_r
     return (
         facts
         + "\nWrite a single flowing paragraph (4 to 6 sentences) for a Slack field update "
-          "summarising the figures above. Weave the key numbers into the prose naturally and "
-          "note the coverage trend"
+          "summarising the figures above. Weave the key numbers into the prose naturally. "
+          "Coverage must be described ONLY as cumulative coverage against the total "
+          "campaign target; never mention a daily target or daily coverage. "
+          "Note the coverage trend"
         + (" versus the previous report" if prev else "")
         + ", then end with the single most urgent action for supervisors "
           "(prioritise data sync when sync coverage is low). "
@@ -992,9 +1017,14 @@ def _fac_perf_table(doc, facilities, perf_link="", secondary_specs=None, cumulat
 
 
 def _low_activity_table(doc, facilities):
-    low_act = [f for f in facilities if f["rec"] < 10]
+    silent = [f for f in facilities if f["status"] == "NOT REPORTED"]
+    if silent:
+        add_para(doc, f"{len(silent):,} target-book facilities submitted no data "
+                      f"at all this day (full list in the performance Excel).",
+                 size=9, color=GREY_RGB)
+    low_act = [f for f in facilities if f["rec"] < 10 and f["status"] != "NOT REPORTED"]
     if not low_act:
-        add_para(doc, "No facilities with fewer than 10 records on this day.")
+        add_para(doc, "No reporting facilities with fewer than 10 records on this day.")
         return
     header = ["Health Facility", "LGA", "Target", "Records", "Treated", "Status"]
     table  = doc.add_table(rows=1, cols=len(header))
@@ -1202,6 +1232,10 @@ def _build_doc(cfg, *, g, cov_pct, lga_d, facilities, hfs_active, lgas_total,
             ("Not Administered",          f"{not_admin:,}"),
         ]
     else:
+        # Cumulative block FIRST (headline numbers, measured against the TOTAL
+        # campaign target — same basis as the Slack message), daily block second.
+        total_campaign_target = g["target"] * cfg["campaign_days"]
+        cum_cov_total = _cov_str(cum_treated, total_campaign_target)
         overview_rows = [
             ("State / Country",               cfg['state_name']),
             ("Activity",                      f"{cfg['drug_type']} Distribution  —  Day {cfg['DAY']} of {cfg['campaign_days']}"),
@@ -1209,15 +1243,16 @@ def _build_doc(cfg, *, g, cov_pct, lga_d, facilities, hfs_active, lgas_total,
             ("Data Extract Timestamp",        f"{cfg['DATE_LABEL']}, {datetime.now().strftime('%H:%M')}"),
             ("Campaign Dates",                f"{cfg['START_LABEL']} to {cfg['END_LABEL']}"),
             ("LGAs / Districts Covered",      f"{hfs_active} of {lgas_total}"),
-            # ── Coverage ───────────────────────────────────────────────────────
+            # ── Cumulative vs total campaign target ────────────────────────────
+            ("Total Campaign Target",         f"{total_campaign_target:,}"),
+            (f"Cumulative Records (Days 1–{cfg['DAY']})",  f"{cum_records:,}"),
+            (f"Cumulative Treated (Days 1–{cfg['DAY']})",  f"{cum_treated:,}"),
+            (f"Cumulative Coverage (Days 1–{cfg['DAY']})", cum_cov_total),
+            # ── This day ───────────────────────────────────────────────────────
             ("Daily Population Target",       f"{g['target']:,}"),
             ("Total Records Submitted",       f"{g['records']:,}"),
             ("Children Treated",              f"{g['treated']:,}"),
             ("Coverage vs Daily Target",      cov_pct),
-            # ── Cumulative ─────────────────────────────────────────────────────
-            (f"Cumulative Records (Days 1–{cfg['DAY']})",  f"{cum_records:,}"),
-            (f"Cumulative Treated (Days 1–{cfg['DAY']})",  f"{cum_treated:,}"),
-            (f"Cumulative Coverage (Days 1–{cfg['DAY']})", cum_cov),
             # ── Drug split ─────────────────────────────────────────────────────
             (d1_label,                        f"{g['drug1']:,}"),
             (d2_label,                        f"{g['drug2']:,}"),
@@ -1322,6 +1357,13 @@ def _build_doc(cfg, *, g, cov_pct, lga_d, facilities, hfs_active, lgas_total,
 
     # Section 3
     add_heading(doc, "3.  Distribution Data Analysis", 4)
+    if not cum:
+        add_para(doc,
+                 f"All targets and coverage in this section are DAILY: "
+                 f"Daily Target = Total Campaign Target ÷ Campaign Days "
+                 f"({g['target'] * cfg['campaign_days']:,} ÷ {cfg['campaign_days']} "
+                 f"= {g['target']:,} per day).",
+                 size=9, color=GREY_RGB)
 
     add_heading(doc, "3.1  Performance by LGA", 5)
     _perf_table(doc, lga_d)
@@ -1445,6 +1487,11 @@ def run(cfg):
     d2_label   = "SPAQ1 (3-11m)"  if drug_type == "SPAQ" else "AZM 1-11m"
 
     lga_d, facilities          = _load_perf(perf_path, drug_type)
+    # NOT REPORTED zero rows (LGA "—") must stay in the TOTALS — that is the
+    # standard-target denominator — but must NOT reach display/narrative
+    # surfaces: the pseudo-group is permanently 0% and would e.g. always win
+    # "worst LGA" in the conclusion. Tables and prompts use this filtered copy.
+    lga_display = {k: v for k, v in lga_d.items() if k != "—"}
     sync_rows, sync_time_stats = _load_sync_summary(sync_path)
     # Secondary products (ORS / VAS / ...): per-product totals + per-facility counts.
     secondary_specs  = cfg.get("secondary_products", []) or []
@@ -1457,8 +1504,9 @@ def run(cfg):
                 f.setdefault("secondary", {})[spec["label"]] = fac_d.get(f["fac"].lower(), 0)
     g                          = _grand_totals(lga_d)
     cov_pct           = _cov_str(g["treated"], g["target"])
-    hfs_active        = len({f["lga"] for f in facilities})
-    lgas_total        = cfg.get("lgas_total") or len(lga_d)
+    hfs_active        = len({f["lga"] for f in facilities
+                              if f["status"] != "NOT REPORTED"})
+    lgas_total        = cfg.get("lgas_total") or len(lga_display)
 
     log.info(f"  {len(facilities)} facilities, {len(lga_d)} LGAs, coverage {cov_pct}")
 
@@ -1526,15 +1574,15 @@ def run(cfg):
 
     # Claude calls
     log.info("  calling Claude for issues log ...")
-    issues_data = _claude_issues(cfg, g, cov_pct, lga_d, facilities,
+    issues_data = _claude_issues(cfg, g, cov_pct, lga_display, facilities,
                                  sync_rows, sync_time_stats, prev_report)
     log.info(f"  {len(issues_data)} issues generated")
     log.info("  calling Claude for conclusion ...")
-    conclusion = _claude(_conclusion_prompt(cfg, g, cov_pct, lga_d, sync_rows, sync_time_stats, prev_report),
+    conclusion = _claude(_conclusion_prompt(cfg, g, cov_pct, lga_display, sync_rows, sync_time_stats, prev_report),
                          max_tokens=600)
     log.info("  calling Claude for Slack text ...")
     _slack_narrative = _claude(
-        _slack_prompt(cfg, g, cov_pct, os.path.basename(cfg["docx_path"]),
+        _slack_prompt(cfg, g, cum_treated, os.path.basename(cfg["docx_path"]),
                       sync_rows, sync_time_stats, prev_report),
         max_tokens=400,
     )
@@ -1543,7 +1591,7 @@ def run(cfg):
 
     # Bundle render params — shared between main + partner docs
     _render = dict(
-        g=g, cov_pct=cov_pct, lga_d=lga_d, facilities=facilities,
+        g=g, cov_pct=cov_pct, lga_d=lga_display, facilities=facilities,
         hfs_active=hfs_active, lgas_total=lgas_total,
         d1_label=d1_label, d2_label=d2_label,
         days_data=days_data, cum_records=cum_records, cum_treated=cum_treated,

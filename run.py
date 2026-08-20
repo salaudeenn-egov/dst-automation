@@ -42,6 +42,19 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 from pipeline import config, analyze, cdd_sync, report, notify
+from pipeline import analyze_itn, cdd_sync_itn, report_itn
+
+# Drug-type dispatch: ITN/LLIN campaigns (household bed-net distribution) use a
+# fully separate module set (see analyze_itn.py's docstring for why — SPAQ/AZM's
+# per-child age/dose logic doesn't apply to household-based delivery). Every
+# other drug_type (SPAQ, AZM, ...) keeps using the original analyze/cdd_sync/report.
+_ITN_DRUG_TYPES = {"ITN", "LLIN"}
+
+
+def _pipeline_modules(cfg):
+    if cfg.get("drug_type") in _ITN_DRUG_TYPES:
+        return analyze_itn, cdd_sync_itn, report_itn
+    return analyze, cdd_sync, report
 
 
 def _update_sheet_status(cfg, status, step_failed="", error_msg="", drive_link=""):
@@ -127,8 +140,10 @@ def run_campaign(row):
 
     log.info(f"[{state}] ── Day {cfg['DAY']} / {cfg['campaign_days']} ─────────────")
 
+    analyze_mod, cdd_sync_mod, report_mod = _pipeline_modules(cfg)
+
     try:
-        analyze.run(cfg)
+        analyze_mod.run(cfg)
     except Exception as e:
         log.error(f"[{state}] analyze FAILED: {e}", exc_info=True)
         _slack_error(cfg, state, "analyze", e)
@@ -136,14 +151,14 @@ def run_campaign(row):
         return
 
     try:
-        cdd_sync.run(cfg)
+        cdd_sync_mod.run(cfg)
     except Exception as e:
         log.error(f"[{state}] cdd_sync FAILED: {e}", exc_info=True)
         _slack_error(cfg, state, "cdd_sync", e)
         # non-fatal — continue to report with no sync data
 
     try:
-        docx_path, partner_docx_path, slack_text = report.run(cfg)
+        docx_path, partner_docx_path, slack_text = report_mod.run(cfg)
     except Exception as e:
         log.error(f"[{state}] report FAILED: {e}", exc_info=True)
         _slack_error(cfg, state, "report", e)
@@ -230,16 +245,18 @@ def run_cumulative(row, end_date):
 
     log.info(f"[{state}] ── CUMULATIVE Days 1-{total_days}  ({start} to {end}) ─────────────")
 
-    analyze.run(cfg)
+    analyze_mod, cdd_sync_mod, report_mod = _pipeline_modules(cfg)
+
+    analyze_mod.run(cfg)
 
     try:
-        cdd_sync.run(cfg)
+        cdd_sync_mod.run(cfg)
     except Exception as e:
         log.error(f"[{state}] cdd_sync FAILED (non-fatal — continuing to report): {e}", exc_info=True)
 
     # report.run already uploaded the performance + CDD-sync Excels to Drive and embedded
     # those links inside both docs (no_upload=False); it stashes the links back on cfg.
-    docx_path, partner_docx_path, _slack_text = report.run(cfg)
+    docx_path, partner_docx_path, _slack_text = report_mod.run(cfg)
 
     # Upload the two Word reports to Drive too (Slack is NOT touched — cumulative never
     # calls notify.run(), so nothing is posted to any channel).
@@ -252,13 +269,21 @@ def run_cumulative(row, end_date):
     partner_link   = (notify.upload_file(partner_docx_path, partner_title, folder_id=_fid)
                       if partner_docx_path and os.path.exists(partner_docx_path) else "")
 
-    # Collect the files actually written for the summary list
+    # Collect the files actually written for the summary list. Two possible
+    # chart filename patterns — SPAQ/AZM's progress_chart_day{N}.png vs ITN's
+    # itn_progress_chart_day{N}.png (report_itn.py names it off the last logged
+    # itn_history/ day, which may differ from total_days if a day was missed).
+    chart_candidates = [
+        os.path.join(out_dir, f"progress_chart_day{total_days}.png"),
+        os.path.join(out_dir, f"itn_progress_chart_day{total_days}.png"),
+    ]
+    chart_path = next((p for p in chart_candidates if os.path.exists(p)), chart_candidates[0])
     candidates = [
         ("Performance Excel", cfg["perf_xlsx"]),
         ("CDD Sync Excel",    cfg["sync_xlsx"]),
         ("Internal Report",   docx_path),
         ("Partner Report",    partner_docx_path),
-        ("Progress Chart",    os.path.join(out_dir, f"progress_chart_day{total_days}.png")),
+        ("Progress Chart",    chart_path),
     ]
     files = [(label, p) for label, p in candidates if p and os.path.exists(p)]
 

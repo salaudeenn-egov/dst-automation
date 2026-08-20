@@ -30,6 +30,7 @@ FLAG_COLOR = {
     "LOW":          "CC0000",   # red    <70%
     "NO TARGET":    "888888",
     "LOW ACTIVITY": "888888",
+    "NOT REPORTED": "888888",
 }
 
 _BATCH = 5000
@@ -466,6 +467,10 @@ def _load_targets(cfg):
 
 
 def _band(treat_rate, daily_target, records, drug_type):
+    # NOT REPORTED: zero records = the facility sent nothing at all (only the
+    # target-book zero rows can have 0 — any ES-seen facility has >= 1 record)
+    if records == 0:
+        return "NOT REPORTED"
     # LOW ACTIVITY: <10 records regardless of coverage rate
     if records < 10:
         return "LOW ACTIVITY"
@@ -579,17 +584,44 @@ def _aggregate_batch(task_hits, name_map, hh_name_map, fac_data, cfg):
             else:
                 m["drug1"] += 1
 
-        # dedup: full-string key avoids hash collisions
-        if child_name and age is not None:
-            dedup_key = f"{hh_head.lower()}|{child_name.lower()}|{ward.lower()}|{age}"
-            if dedup_key in m["seen_keys"]:
-                m["duplicates"] += 1
-            else:
-                m["seen_keys"].add(dedup_key)
+            # dedup TREATED records only: a redose (VISITED after SUCCESS) or a
+            # status progression (ABSENT/REFUSED then treated) creates a second
+            # record for the same child that is NOT a duplicate treatment. The
+            # key carries no status/date, so checking every record counted those
+            # legitimate sequences as duplicates and inflated the DQ metric.
+            if child_name:
+                dedup_key = f"{hh_head.lower()}|{child_name.lower()}|{ward.lower()}|{age}"
+                if dedup_key in m["seen_keys"]:
+                    m["duplicates"] += 1
+                else:
+                    m["seen_keys"].add(dedup_key)
 
 
 def _finalize_fac_data(fac_data, target_map, cfg):
-    """Convert running fac_data dict into the final sorted results list."""
+    """Convert running fac_data dict into the final sorted results list.
+
+    Rows are the UNION of facilities that reported today and the target book:
+    a target-book facility with no records today becomes an explicit zero row
+    (status NOT REPORTED = target present, no data synced; LGA shown as a
+    dash — the CSV carries no LGA information). This keeps the report's
+    Daily Target STANDARD — full campaign target / campaign_days —
+    irrespective of which facilities synced. Without it the denominator
+    silently shrank to the reporting subset (Chad Cycle 2: Day 1 target
+    59,645 vs Day 2 83,340 from the same unchanged CSV, 118% "coverage").
+    """
+    matched = {f.lower() for f in fac_data}
+    for name, tgt_entry in target_map.items():
+        if name not in matched and tgt_entry.get("daily", 0) > 0:
+            fac_data[name.upper()] = dict(
+                lga="—", fac=name.upper(), records=0, treated=0,
+                drug1=0, drug2=0, absent=0, refused=0,
+                ineligible=0, referred=0, died=0, migrated=0,
+                redose=0, age_over59=0, age_zero=0,
+                missing_hh=0, missing_child=0, missing_gender=0, duplicates=0,
+                delivery_comments=0, missing_lat_lon=0,
+                wards=set(), seen_keys=set(),
+            )
+
     results = []
     for fac, m in sorted(fac_data.items(), key=lambda x: (x[1]["lga"], x[0])):
         tgt_entry   = target_map.get(fac.lower(), {"4day": 0, "daily": 0})
@@ -745,13 +777,14 @@ def _aggregate(task_hits, name_map, hh_name_map, target_map, cfg):
             else:
                 m["drug1"] += 1   # SPAQ2 (12-59m) / AZM 12-59m
 
-        # dedup: (hh_head, child_name, ward, age)
-        if child_name and age is not None:
-            key = (hh_head.lower(), child_name.lower(), ward.lower(), age)
-            if key in m["seen_keys"]:
-                m["duplicates"] += 1
-            else:
-                m["seen_keys"].add(key)
+            # dedup TREATED records only (see _aggregate_batch — redoses and
+            # ABSENT/REFUSED->treated progressions are not duplicate treatments)
+            if child_name:
+                key = (hh_head.lower(), child_name.lower(), ward.lower(), age)
+                if key in m["seen_keys"]:
+                    m["duplicates"] += 1
+                else:
+                    m["seen_keys"].add(key)
 
     # resolve daily targets
     results = []
@@ -1001,7 +1034,7 @@ def _write_tab(ws, rows, headers, drug_type, cfg, banner_text):
 
 # ── public entry point ─────────────────────────────────────────────────────────
 
-BANDS = ["LOW", "MODERATE", "HIGH", "NO TARGET", "LOW ACTIVITY"]
+BANDS = ["LOW", "MODERATE", "HIGH", "NO TARGET", "LOW ACTIVITY", "NOT REPORTED"]
 
 
 def run(cfg):
@@ -1095,7 +1128,9 @@ def run(cfg):
     else:
         banner_text = (
             f"Campaign Target: {total_target * cfg['campaign_days']:,}  |  "
-            f"Daily Target (Day {cfg['DAY']}): {total_daily:,}"
+            f"Daily Target (Day {cfg['DAY']}): {total_daily:,}  "
+            f"(= Campaign Target ÷ {cfg['campaign_days']} campaign days; "
+            f"all targets/coverage in this sheet are vs the DAILY target)"
         )
 
     wb = Workbook()
