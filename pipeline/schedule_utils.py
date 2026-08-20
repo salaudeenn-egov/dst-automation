@@ -1,4 +1,4 @@
-"""Trigger-slot computation shared by scheduler.py and the Airflow scheduler DAG.
+"""Trigger-slot computation for the Airflow scheduler DAG.
 
 A slot is (time "HH:MM" UTC, mode). Modes: "both" posts internal + partner,
 "internal" / "partner" post one channel only.

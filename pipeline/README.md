@@ -1,8 +1,8 @@
 # Pipeline developer guide
 
-Business logic for the DST campaign reporting pipeline. `run.py` (manual) and
-`scheduler.py` (unattended) orchestrate these modules today; the Airflow DAGs will
-call the same `run(cfg)` entry points.
+Business logic for the DST campaign reporting pipeline. The Airflow DAGs
+(`dags/`) orchestrate these modules by calling their `run(cfg)` entry points;
+`run.py` remains only as the CLI for whole-campaign cumulative reports.
 
 ## Module map
 

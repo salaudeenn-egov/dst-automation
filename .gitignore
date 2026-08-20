@@ -16,9 +16,6 @@ output/
 logs/
 *.log
 
-# Runtime
-scheduler.pid
-
 # Target data
 data-*.csv
 

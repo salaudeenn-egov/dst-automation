@@ -1,7 +1,7 @@
 # Airflow DAGs — developer guide
 
-Two DAGs replace `scheduler.py`'s polling loop. The pipeline business logic in
-`pipeline/` is untouched — these DAGs only orchestrate it.
+Airflow owns all scheduling. The pipeline business logic in `pipeline/` is
+untouched — these DAGs only orchestrate it.
 
 ```
 dst_campaign_scheduler   every 5 min: read the Google Sheet, find due slots,
@@ -40,7 +40,7 @@ common/
 | Same slot seen by several ticks (wide lookback) | deterministic run id `dst_{group}_{tenant}_{mode}_{date}_{hhmm}` + `skip_when_already_exists` — a slot can never fire twice |
 | Airflow down over a slot | first tick after recovery catches anything inside the lookback |
 | `report_times` edited backwards after the old time fired | retime guard: a past-due slot is skipped when a successful run for that (tenant, mode-or-both) already exists at/after the slot time today; failed runs do not count, so a retimed slot can replace a failed report |
-| Same time in internal and partner lists | merged into one `both` run (`compute_trigger_slots`, shared with scheduler.py so the two orchestrators cannot drift) |
+| Same time in internal and partner lists | merged into one `both` run (`compute_trigger_slots` in `pipeline/schedule_utils.py`) |
 | Window crossing midnight | candidate slots are built for every date the window touches |
 | Invalid time cell (`25:00`, `bad`) | logged and skipped; other slots unaffected |
 | Sheet unreachable at tick | task retries once, then the tick fails with a Slack alert; next tick starts fresh |

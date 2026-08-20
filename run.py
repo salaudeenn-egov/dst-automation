@@ -10,7 +10,7 @@ import os
 
 def _ensure_deps():
     try:
-        import dotenv, gspread, openpyxl, anthropic, requests, pandas, docx, matplotlib
+        import dotenv, gspread, openpyxl, requests, pandas, docx, matplotlib
     except ImportError:
         print("[bootstrap] Installing missing dependencies ...")
         req = os.path.join(os.path.dirname(__file__), "requirements.txt")

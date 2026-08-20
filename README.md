@@ -12,16 +12,22 @@ Fetches treatment data from Elasticsearch, generates facility-level performance 
 Google Sheet (campaign config)
         │
         ▼
-   scheduler.py  ──── runs at configured times each day
+   dst_campaign_scheduler  ──── Airflow DAG, every 5 min: which slots are due?
         │
         ▼
-   config.py  ──── reads sheet row, computes DAY / GTE / LTE / date labels
+   dst_campaign_run        ──── one DAG run per due slot, row passed in conf
+        │
+        ▼
+   pipeline/config.py  ──── reads the row, computes DAY / GTE / LTE / date labels
         │
         ├──▶  analyze.py   ──── ES task scroll → individual/HH lookup → performance.xlsx
         ├──▶  cdd_sync.py  ──── ES staff + sync aggregation → cdd_sync.xlsx
-        ├──▶  report.py    ──── both xlsx + Claude API → Word report + Slack text
+        ├──▶  report.py    ──── both xlsx + Groq narrative → Word report + Slack text
         └──▶  notify.py    ──── Drive upload + Slack post
 ```
+
+Orchestration is Apache Airflow — see `dags/README.md`. ITN/LLIN campaigns use
+the `_itn` module variants, selected by the `drug_type` column.
 
 ---
 
@@ -42,7 +48,7 @@ pip install -r requirements.txt
 | Google Sheets | Campaign config + run log | `credential.json` (service account) |
 | Google Drive | Report file uploads | `drive_token.json` (Gmail OAuth) |
 | Slack | Report notifications | `SLACK_TOKEN` in `.env` |
-| Anthropic Claude | Report narrative + Slack text | `ANTHROPIC_API_KEY` in `.env` |
+| Groq | Report narrative + Slack text | `GROQ_API_KEY` in `.env` |
 
 ### Credential Files
 | File | Purpose | How to Obtain |
@@ -90,36 +96,22 @@ Set the path in the `target_csv` column of the Google Sheet.
 
 ## Running
 
-### Start the scheduler (recommended)
-Runs in the background, survives terminal close. Auto-restarts on crash.
-```bash
-cd ~/dst/auto/automation
-nohup python scheduler.py > logs/watchdog.log 2>&1 &
-echo "Scheduler PID: $!"
-```
+Scheduling is owned by Airflow. Unpause `dst_campaign_scheduler` and it triggers
+`dst_campaign_run` for every due slot; there is no daemon to start or stop.
+Setup, Airflow Variables and the edge-case table are in `dags/README.md`.
 
-### Run once manually
-```bash
-python run.py
-```
+### Run one campaign by hand
+Trigger `dst_campaign_run` from the Airflow UI with a conf payload containing the
+campaign row (`{"row": {...}, "mode": "both"}`) — see `dags/dst_campaign_run.py`.
 
-### Check scheduler is running
+### Whole-campaign cumulative report
 ```bash
-ps aux | grep scheduler.py
-tail -20 logs/watchdog.log
+python run.py --cumulative --state "Chad"
 ```
+`run.py` is retained ONLY for this; the daily path runs in Airflow.
 
-### Stop the scheduler
-```bash
-pkill -f scheduler.py
-```
-
-### Restart the scheduler
-```bash
-pkill -f scheduler.py
-nohup python scheduler.py > logs/watchdog.log 2>&1 &
-echo "Scheduler PID: $!"
-```
+### Backdate an extract
+Set `TEST_EXTRACT_DATE=YYYY-MM-DD` in the environment of the run.
 
 ---
 
@@ -139,7 +131,7 @@ One row per active campaign. The sheet ID is set via `GOOGLE_SHEET_ID` in `.env`
 | `is_admin_console` | TRUE | ✓ | `TRUE` for Nigeria states |
 | `campaign_number` | CMP-2026-06-22-000401 | ✓ | From DIGIT HCM admin console |
 | `target_csv` | /path/to/targets.csv | ✓ | Facility targets file (CSV or Google Sheet URL) |
-| `out_dir` | /home/jovyan/dst/auto/output/bauchi | ✓ | Output directory for reports |
+| `out_dir` | output/bauchi (optional; defaults to pipeline/output/<tenant>) | ✓ | Output directory for reports |
 | `slack_channel` | C0ALY7EQVSR | ✓ | Slack channel ID |
 | `report_times` | 05:30,07:30,09:30,11:30 | ✓ | **UTC times**, comma-separated |
 | `hfs_total` | 274 | | Total registered health facilities |
@@ -164,8 +156,8 @@ All times in the sheet must be **UTC**. IST = UTC+5:30.
 Copy `.env.example` to `.env` and fill in all values.
 
 ```env
-# Anthropic Claude API
-ANTHROPIC_API_KEY=sk-ant-...
+# Groq (narrative generation, OpenAI-compatible endpoint)
+GROQ_API_KEY=gsk_...
 
 # Slack
 SLACK_TOKEN=xoxb-...
@@ -208,7 +200,8 @@ output/bauchi/
 
 ## Schedule Behaviour
 
-- Scheduler reads from Google Sheet **every hour** — update `report_times` in the sheet and it picks up within the hour (or restart to apply immediately)
+- `dst_campaign_scheduler` re-reads the Google Sheet on **every 5-minute tick** — a sheet edit is live within 5 minutes, with no restart and nothing cached
+- Each slot fires at most once: the trigger run id is deterministic per (group, tenant, mode, date, time)
 - `DAY` is auto-computed daily from `campaign_start` — no manual updates needed across campaign days
 - Outside `campaign_start` → `campaign_end` window, runs are skipped automatically
 - Multiple campaigns can run in parallel — add one row per state in the sheet
@@ -233,13 +226,23 @@ The pipeline computes the following data quality metrics per facility:
 
 ```
 automation/
-├── run.py              # Orchestrator — iterates active campaigns
-├── config.py           # Google Sheet reader + config builder
-├── analyze.py          # ES task scroll + name lookups → performance Excel
-├── cdd_sync.py         # ES staff + sync aggregation → CDD sync Excel
-├── report.py           # Excel + Claude API → Word report + Slack text
-├── notify.py           # Google Drive upload + Slack post
-├── scheduler.py        # Schedule runner (watchdog mode)
+├── dags/               # Airflow DAGs — the orchestrator (see dags/README.md)
+│   ├── dst_campaign_scheduler.py
+│   ├── dst_campaign_run.py
+│   ├── dst_config_sync.py
+│   └── common/         # slot matching, deployment groups, alerts, Kafka events
+├── pipeline/           # the business logic (see pipeline/README.md)
+│   ├── config.py       # sheet row → resolved config
+│   ├── analyze.py      # ES task scroll + name lookups → performance Excel
+│   ├── cdd_sync.py     # ES staff + sync aggregation → CDD sync Excel
+│   ├── report.py       # Excel + Groq narrative → Word report + Slack text
+│   ├── notify.py       # Google Drive upload + Slack post
+│   ├── mdms.py         # sheet → MDMS mirror (mdms mode)
+│   ├── run_log.py      # Run Log tab (sheet mode)
+│   └── core/           # es / excel / word / llm / drive / checkpoint helpers
+├── platform/           # egov persister config + DDL for mdms mode
+├── tests/              # plain-python unit tests, no Airflow required
+├── run.py              # cumulative (whole-campaign) report CLI only
 ├── requirements.txt
 ├── .env                # Secrets — never committed
 ├── .env.example        # Template for .env
@@ -250,9 +253,10 @@ automation/
 
 ## Troubleshooting
 
-**Scheduler not firing at expected time**
+**A slot did not fire at the expected time**
 - All `report_times` in the sheet must be UTC, not IST
-- Check: `tail -50 logs/watchdog.log`
+- Check the `dst_campaign_scheduler` task log for that tick: it logs the row
+  count and every due slot it matched
 
 **`GOOGLE_CREDENTIALS_PATH not set or missing`**
 - Verify path in `.env` points to `credential.json` on the server

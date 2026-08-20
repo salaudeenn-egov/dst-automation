@@ -31,7 +31,7 @@ def _resolve_creds_path():
     configured = os.getenv("GOOGLE_CREDENTIALS_PATH", "")
     if configured and os.path.exists(configured):
         return configured
-    # Fall back: credential.json next to run.py (project root, one level above pipeline/)
+    # Fall back: credential.json at the project root, one level above pipeline/)
     fallback = os.path.join(os.path.dirname(__file__), "..", "credential.json")
     fallback = os.path.abspath(fallback)
     if os.path.exists(fallback):

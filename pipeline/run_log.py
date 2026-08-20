@@ -1,8 +1,8 @@
 """The "Run Log" tab of the config Google Sheet — the run history in sheet mode.
 
-One row per report attempt, written by both orchestrators (run.py and the
-Airflow finalize task) in the identical format, and read back by the Airflow
-scheduler's retime guard. There is no database anywhere: this tab is the
+One row per report attempt, written by the Airflow finalize task (and by
+run.py's cumulative path in the identical format), and read back by the
+Airflow scheduler's retime guard. There is no database anywhere: this tab is the
 system of record in sheet mode (mdms mode publishes Kafka events instead).
 All writes are non-fatal — a Sheets hiccup must never mask a run's outcome.
 """
