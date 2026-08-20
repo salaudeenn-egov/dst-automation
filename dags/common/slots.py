@@ -100,7 +100,7 @@ def find_due_slots(group, rows, now_utc, lookback_minutes, has_report_since=None
                         continue
                 elif not campaign_window_contains(row, slot_dt.date()):
                     continue
-                if has_report_since and has_report_since(tenant, mode, slot_dt):
+                if has_report_since and has_report_since(tenant, mode, slot_dt, state):
                     continue
                 slot_date = slot_dt.date().isoformat()
                 due.append({

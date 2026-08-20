@@ -27,7 +27,11 @@ except ImportError:
         class AirflowFailException(Exception):
             pass
 
-DATA_ERRORS = (KeyError, ValueError, TypeError, AttributeError)
+# FileNotFoundError is included because a missing target book (drive.py's
+# download_target_book) is a configuration error: three identical attempts
+# three minutes apart cannot conjure the file, they just delay the alert.
+DATA_ERRORS = (KeyError, ValueError, TypeError, AttributeError,
+               FileNotFoundError)
 ITN_DRUG_TYPES = {"ITN", "LLIN"}
 CUMULATIVE_MODE = "cumulative"
 
@@ -60,6 +64,9 @@ def apply_cumulative(cfg):
         "CAMPAIGN_DATES":     [(start + timedelta(days=i)).isoformat()
                                for i in range(total_days)],
         "END_LABEL":          _date_label(end),
+        # without this the cumulative Word/Slack output carries TODAY's date
+        # label instead of the campaign's end date
+        "DATE_LABEL":         _date_label(end),
         # the mop-up date is past campaign_end by design, so the daily
         # in-window guard must not apply to this run
         "in_campaign_window": True,

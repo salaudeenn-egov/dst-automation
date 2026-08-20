@@ -17,7 +17,7 @@ apply_sync() does the HTTP. Every edge case lives in the plan and is
 unit-testable without a network.
 
 Entry data shape (top-level fields drive schema uniqueness):
-    {"rowIdentity": "<tenant>::<campaign key>",
+    {"rowIdentity": "<tenant>::<campaign key>::<cycle>::<campaign_start>",
      "deploymentGroup": "<sheet tab / group name>",
      "row": {...the sheet row verbatim, all values as strings...}}
 

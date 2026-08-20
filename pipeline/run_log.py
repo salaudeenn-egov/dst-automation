@@ -43,7 +43,10 @@ def _open_runlog_worksheet():
         try:
             ws = spreadsheet.worksheet(tab_name)
         except gspread.WorksheetNotFound:
-            ws = spreadsheet.add_worksheet(tab_name, rows=1000, cols=12)
+            # width derived from _HEADER: a hardcoded value silently truncated
+            # the append once columns were added, and the failure was swallowed
+            ws = spreadsheet.add_worksheet(tab_name, rows=1000,
+                                           cols=max(len(_HEADER), 12))
             ws.append_row(_HEADER)
         return ws
     except Exception as e:
@@ -113,6 +116,8 @@ def fetch_today_runs():
             if not str(stamp).startswith(today):
                 continue
             runs.append({
+                # legacy rows (and run.py's) have no Tenant column; the guard
+                # falls back to State so they are not silently unmatchable
                 "tenant": cell(row, "Tenant").lower(),
                 "state": cell(row, "State"),
                 "status": cell(row, "Status").upper(),

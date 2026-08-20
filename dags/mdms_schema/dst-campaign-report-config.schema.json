@@ -26,7 +26,7 @@
         "properties": {
           "rowIdentity": {
             "type": "string",
-            "description": "tenant::campaignNumber (projectTypeId fallback) — stable across edits, new per campaign"
+            "description": "tenant::campaignNumber::cycle::campaignStart (projectTypeId then state_name fall back for the campaign part). Cycle and start are in the key because a campaign number is NOT unique per cycle — Chad C1 and C2 share CMP-2026-06-27-000416. Stable across edits; a new cycle is a new entry."
           },
           "deploymentGroup": {
             "type": "string",

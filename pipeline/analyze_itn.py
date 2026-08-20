@@ -662,10 +662,22 @@ def _load_targets_itn(cfg):
     """
     from pipeline.core.drive import resolve_target_book
     csv_path = resolve_target_book(cfg)
-    if not csv_path or not os.path.exists(csv_path):
+    if not csv_path:
+        log.warning("[analyze_itn] no target book configured — all targets = 0")
+        return {}
+    if csv_path.startswith("https://docs.google.com/spreadsheets/"):
+        # same Sheets-URL form analyze.py accepts; without this the URL fails
+        # os.path.exists and the ITN report publishes 0% coverage silently
+        from pipeline.analyze import _read_target_sheet_url
+        df = _read_target_sheet_url(csv_path)
+        if df is None:
+            log.warning(f"[analyze_itn] could not read target sheet {csv_path} — all targets = 0")
+            return {}
+    elif not os.path.exists(csv_path):
         log.warning(f"[analyze_itn] target book not found: {csv_path} — all targets = 0")
         return {}
-    df = pd.read_csv(csv_path)
+    else:
+        df = pd.read_csv(csv_path)
     cols_lower = {c.lower(): c for c in df.columns}
 
     def _find(*aliases):

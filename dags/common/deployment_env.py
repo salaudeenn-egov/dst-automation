@@ -147,8 +147,3 @@ def mdms_enabled():
         f"DST_MDMS_ENABLED={raw!r} is not a boolean. Use true or false — "
         f"refusing to guess, because the two modes read config from different "
         f"places and write run history to different places.")
-
-
-def resolve_dst_mode():
-    """Legacy string form, kept for log messages and existing call sites."""
-    return "mdms" if mdms_enabled() else "sheet"

@@ -45,3 +45,12 @@ Redelivery is safe: the INSERT is ON CONFLICT (event_id) DO NOTHING.
 
 No component of ours reads or writes any database; the persister owns the
 one DB write, exactly like the platform's own hcm report automation.
+
+## One-time note when upgrading an existing MDMS mirror
+
+`rowIdentity` gained the cycle and campaign_start parts. Entries written under
+the old two-part key will not match, so the first `dst_config_sync` tick after
+deploy CREATES every campaign afresh and deactivates the old entries in the
+same pass. It self-heals in one tick and duplicate scheduling is prevented by
+the deterministic trigger run id, but the mirror briefly holds both. Purge the
+deactivated entries afterwards if you want a clean list.

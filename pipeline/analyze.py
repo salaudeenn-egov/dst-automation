@@ -236,6 +236,38 @@ def _map_household_ids_to_head_ids(cfg, hh_clref_ids):
     return head_map
 
 
+def _read_target_sheet_url(url):
+    """Read a target book held as a Google Sheet. Returns a DataFrame, or None
+    if the URL is unparseable. Shared with analyze_itn so both drug families
+    accept the same target_file forms."""
+    import re
+
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", url)
+    if not m:
+        log.warning(f"Could not parse sheet ID from target book URL: {url}")
+        return None
+    sheet_id = m.group(1)
+    gid_m = re.search(r"[#&]gid=(\d+)", url)
+
+    from pipeline.config import _resolve_creds_path
+    creds = Credentials.from_service_account_file(
+        _resolve_creds_path(),
+        scopes=["https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive"])
+    spreadsheet = gspread.Client(auth=creds).open_by_key(sheet_id)
+    if gid_m:
+        ws = next((w for w in spreadsheet.worksheets()
+                   if str(w.id) == gid_m.group(1)), spreadsheet.sheet1)
+    else:
+        ws = spreadsheet.sheet1
+    df = pd.DataFrame(ws.get_all_records())
+    log.info(f"target book loaded from Google Sheet: {sheet_id} ({len(df)} rows)")
+    return df
+
+
 def _load_targets(cfg):
     from pipeline.core.drive import resolve_target_book
     csv_path = resolve_target_book(cfg)
@@ -243,44 +275,12 @@ def _load_targets(cfg):
         log.warning("no target book configured — all targets = 0")
         return {}
 
-    # Google Sheets URL: extract sheet_id and optional gid
     if csv_path.startswith("https://docs.google.com/spreadsheets/"):
-        import re
-        import gspread
-        from google.oauth2.service_account import Credentials
-        from dotenv import load_dotenv
-        load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
-
-        m = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", csv_path)
-        if not m:
-            log.warning(f"Could not parse sheet ID from target_csv URL: {csv_path}")
+        df = _read_target_sheet_url(csv_path)
+        if df is None:
             return {}
-        sheet_id = m.group(1)
-        gid_m = re.search(r"[#&]gid=(\d+)", csv_path)
-
-        from pipeline.config import _resolve_creds_path
-        creds = Credentials.from_service_account_file(
-            _resolve_creds_path(),
-            scopes=[
-                "https://www.googleapis.com/auth/spreadsheets",
-                "https://www.googleapis.com/auth/drive",
-            ],
-        )
-        client = gspread.Client(auth=creds)
-        spreadsheet = client.open_by_key(sheet_id)
-        if gid_m:
-            ws = next(
-                (s for s in spreadsheet.worksheets() if str(s.id) == gid_m.group(1)),
-                spreadsheet.sheet1,
-            )
-        else:
-            ws = spreadsheet.sheet1
-
-        records = ws.get_all_records()
-        df = pd.DataFrame(records)
-        log.info(f"target_csv loaded from Google Sheet: {sheet_id} ({len(df)} rows)")
     elif not os.path.exists(csv_path):
-        log.warning(f"target_csv not found: {csv_path} — all targets = 0")
+        log.warning(f"target book not found: {csv_path} — all targets = 0")
         return {}
     else:
         df = pd.read_csv(csv_path)
