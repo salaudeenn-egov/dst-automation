@@ -20,6 +20,7 @@ FLAG_COLOR = {
     "LOW":          "CC0000",
     "NO TARGET":    "888888",
     "LOW ACTIVITY": "888888",
+    "NOT REPORTED": "888888",
 }
 
 

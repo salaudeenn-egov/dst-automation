@@ -16,6 +16,7 @@ STATUS_COLOR = {
     "LOW":          RGBColor(0xCC, 0x00, 0x00),
     "NO TARGET":    RGBColor(0x88, 0x88, 0x88),
     "LOW ACTIVITY": RGBColor(0x88, 0x88, 0x88),
+    "NOT REPORTED": RGBColor(0x88, 0x88, 0x88),
 }
 
 COV_FILL = {
@@ -24,6 +25,7 @@ COV_FILL = {
     "LOW":          "FFC7CE",
     "NO TARGET":    "F2F2F2",
     "LOW ACTIVITY": "F2F2F2",
+    "NOT REPORTED": "F2F2F2",
 }
 
 
