@@ -57,16 +57,29 @@ def _request_info():
 
 
 def row_identity(row):
-    """Stable identity of a campaign across edits: tenant + campaign key.
+    """Stable identity of a campaign across edits: tenant + campaign + cycle + start.
 
     Editing times/dates/channels keeps the identity (-> update); a genuinely
-    new campaign (new campaign_number) is a new identity (-> create). Falls
-    back to project_type_id for non-admin tenants, then state_name."""
+    new campaign or a new cycle is a new identity (-> create). Falls back to
+    project_type_id for non-admin tenants, then state_name.
+
+    cycle_index and campaign_start are part of the key because a campaign
+    number is NOT unique per cycle: on the production sheet Chad cycles 1 and 2
+    both carry CMP-2026-06-27-000416, as do Bauchi, Kogi, Nasarawa, Oyo, FCT,
+    Plateau, Borno, Kebbi, Sokoto and Zamfara. With tenant::campaign alone,
+    plan_sync's first-row-wins rule rejected every ACTIVE row in favour of an
+    older archived one, so mdms mode ran nothing at all. Cycle alone fixes
+    Nigeria; campaign_start is needed for Togo and Taraba, whose rows differ
+    only by date.
+    """
     tenant = str(row.get("tenant", "")).strip().lower()
     campaign_key = (str(row.get("campaign_number", "")).strip()
                     or str(row.get("project_type_id", "")).strip()
                     or str(row.get("state_name", "")).strip().lower())
-    return f"{tenant}::{campaign_key}"
+    # '2' and '02' are the same cycle - normalise before keying
+    cycle = str(row.get("cycle_index", "")).strip().lstrip("0") or "-"
+    start = str(row.get("campaign_start", "")).strip() or "-"
+    return f"{tenant}::{campaign_key}::{cycle}::{start}"
 
 
 def normalize_row(row):
@@ -92,6 +105,10 @@ def validate_row(row):
         problems.append(
             f"no valid time in report_times {row.get('report_times')!r} "
             f"or partner_report_times {row.get('partner_report_times')!r}")
+    # Optional, but a typo here means the cumulative report silently never runs
+    mopup = str(row.get("mopup_end_date", "")).strip()
+    if mopup and not _parse_date(mopup):
+        problems.append(f"mopup_end_date unparseable: {mopup!r}")
     return problems
 
 

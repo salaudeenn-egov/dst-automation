@@ -4,17 +4,25 @@
     "apiId": "dst-automation",
     "msgId": "create dst campaign report config schema",
     "authToken": "",
-    "userInfo": { "id": 1 }
+    "userInfo": {
+      "id": 1
+    }
   },
   "SchemaDefinitions": [
     {
       "tenantId": "<ENV-ROOT-TENANT e.g. dev / mz>",
       "code": "airflow-configs.dst-campaign-report-config",
-      "description": "DST daily campaign reporting config, mirrored one-way from the team's Google Sheet by the dst_config_sync DAG. One entry per campaign row; data.row carries the sheet columns verbatim (all strings). Do not edit entries by hand — the sheet overwrites them on the next sync tick.",
+      "description": "DST daily campaign reporting config, mirrored one-way from the team's Google Sheet by the dst_config_sync DAG. One entry per campaign row; data.row carries the 22 sheet columns as strings. Do not edit entries by hand - the sheet overwrites them on the next sync tick.",
       "definition": {
         "type": "object",
-        "required": ["rowIdentity", "deploymentGroup", "row"],
-        "x-unique": ["rowIdentity"],
+        "required": [
+          "rowIdentity",
+          "deploymentGroup",
+          "row"
+        ],
+        "x-unique": [
+          "rowIdentity"
+        ],
         "properties": {
           "rowIdentity": {
             "type": "string",
@@ -26,7 +34,105 @@
           },
           "row": {
             "type": "object",
-            "description": "The sheet row verbatim: state_name, tenant, drug_type, campaign_start, campaign_end, campaign_days, is_admin_console, campaign_number, project_type_id, project_type, cycle_index, report_times, partner_report_times, slack_channel, slack_channel_partners, target_csv, out_dir, secondary_product, task_date_field, task_campaign_filter, dose_index_filter, hfs_total, flws_total, lgas_total, active, campaign_name, google_sheet_id"
+            "description": "The campaign config row, mirrored from the Google Sheet. All values are strings. Legacy aliases still accepted by the pipeline but not part of this schema: target_csv (-> target_file), out_dir, lgas_total, project_type, secondary_products.",
+            "required": [
+              "active",
+              "state_name",
+              "tenant",
+              "drug_type",
+              "campaign_start",
+              "campaign_end"
+            ],
+            "properties": {
+              "active": {
+                "type": "string",
+                "description": "TRUE schedules this campaign; anything else is ignored"
+              },
+              "campaign_name": {
+                "type": "string",
+                "description": "Report titles and Drive folder name"
+              },
+              "state_name": {
+                "type": "string",
+                "description": "Display label and Run Log key"
+              },
+              "tenant": {
+                "type": "string",
+                "description": "ES tenant code, lowercase - drives index names"
+              },
+              "drug_type": {
+                "type": "string",
+                "description": "SPAQ | AZM | ITN | LLIN; ITN/LLIN select the household-grain modules"
+              },
+              "campaign_start": {
+                "type": "string",
+                "description": "YYYY-MM-DD; the day number is computed from this"
+              },
+              "campaign_end": {
+                "type": "string",
+                "description": "YYYY-MM-DD; no daily run fires outside the window"
+              },
+              "mopup_end_date": {
+                "type": "string",
+                "description": "Optional YYYY-MM-DD. Set = the whole-campaign cumulative report runs at 23:59 UTC that day and posts to BOTH channels. Blank = never"
+              },
+              "campaign_days": {
+                "type": "string",
+                "description": "Divisor for the daily target"
+              },
+              "is_admin_console": {
+                "type": "string",
+                "description": "TRUE scopes by campaign_number, FALSE by project_type_id"
+              },
+              "campaign_number": {
+                "type": "string",
+                "description": "CMP-...; required when is_admin_console=TRUE"
+              },
+              "project_type_id": {
+                "type": "string",
+                "description": "UUID; required when is_admin_console=FALSE"
+              },
+              "cycle_index": {
+                "type": "string",
+                "description": "Zero-padded in ES ('02'); _pad_cycle normalises bare digits"
+              },
+              "task_date_field": {
+                "type": "string",
+                "description": "taskDates (default) or @timestamp"
+              },
+              "dose_index_filter": {
+                "type": "string",
+                "description": "TRUE adds doseIndex=1 to the treatment query"
+              },
+              "task_campaign_filter": {
+                "type": "string",
+                "description": "TRUE applies the campaign filter to the task query; required where several project types share a tenant and date range"
+              },
+              "target_file": {
+                "type": "string",
+                "description": "File name of the target book inside DST_TARGET_FOLDER_ID; blank falls back to <tenant>_target.csv"
+              },
+              "slack_channel": {
+                "type": "string",
+                "description": "Internal Slack channel id"
+              },
+              "report_times": {
+                "type": "string",
+                "description": "UTC, comma separated - internal slots"
+              },
+              "slack_channel_partners": {
+                "type": "string",
+                "description": "Partner Slack channel id; blank means no partner report is built"
+              },
+              "secondary_product": {
+                "type": "string",
+                "description": "Extra product counted alongside the primary drug; blank disables"
+              },
+              "partner_report_times": {
+                "type": "string",
+                "description": "UTC, comma separated - partner slots"
+              }
+            }
           }
         }
       },
