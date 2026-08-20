@@ -125,7 +125,8 @@ def execute_campaign(row, mode="both"):
 
     analyze_mod, cdd_sync_mod, report_mod = select_pipeline_modules(cfg["drug_type"])
     marker = {"ok": True, "tenant": cfg["tenant"], "state": state,
-              "mode": mode, "day": cfg["DAY"], "stages": {}, "drive_link": ""}
+              "mode": mode, "day": cfg["DAY"], "stages": {},
+              "drive_link": "", "drive_folder_url": ""}
 
     if is_cumulative:
         log.info(f"[runner] {state} CUMULATIVE Days 1-{cfg['DAY']} "
@@ -154,6 +155,14 @@ def execute_campaign(row, mode="both"):
             marker)
         marker["drive_link"] = drive_link or ""
     finally:
+        # The campaign folder holds every artifact this run published, so it is
+        # what the audit row points at. cfg caches the id, so this is free.
+        try:
+            fid = notify.campaign_folder_id(cfg)
+            if fid:
+                marker["drive_folder_url"] = f"https://drive.google.com/drive/folders/{fid}"
+        except Exception as e:
+            log.warning(f"[runner] could not resolve Drive folder url: {e}")
         # Even a failed run leaves its checkpoints on Drive for offline debugging
         # (the pod's local disk disappears with the pod).
         try:

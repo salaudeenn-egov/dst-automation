@@ -1,11 +1,25 @@
 """Slack alerting for DAG failures — the team must hear about a dead report
-before the stakeholders ask where it is."""
+before the stakeholders ask where it is.
+
+Channel precedence: DST_ALERT_CHANNEL, then SLACK_CHANNEL, then the campaign's
+own slack_channel as a last resort. A technical failure belongs in an ops
+channel, NOT in the campaign channel where partners read the numbers — that
+was the previous order and it would have posted tracebacks to stakeholders.
+"""
 import logging
 import os
 
 import requests
 
 log = logging.getLogger(__name__)
+
+
+def alert_channel(row=None):
+    """Where operational alerts go. A dedicated ops channel wins; the
+    campaign's reporting channel is only a last resort."""
+    return (os.getenv("DST_ALERT_CHANNEL", "").strip()
+            or os.getenv("SLACK_CHANNEL", "").strip()
+            or str((row or {}).get("slack_channel", "")).strip())
 
 
 def notify_slack_on_failure(context):
@@ -18,11 +32,11 @@ def notify_slack_on_failure(context):
         row = conf.get("row") or {}
 
         state = row.get("state_name") or conf.get("state_name") or "?"
-        channel = (str(row.get("slack_channel", "")).strip()
-                   or os.getenv("SLACK_CHANNEL", ""))
+        channel = alert_channel(row)
         token = os.getenv("SLACK_TOKEN")
 
-        message = (f"DST PIPELINE FAILURE [{state}] "
+        run_id = getattr(context.get("dag_run"), "run_id", "?")
+        message = (f"DST PIPELINE FAILURE [{state}] run={run_id} "
                    f"dag={getattr(ti, 'dag_id', '?')} task={getattr(ti, 'task_id', '?')}\n"
                    f"{type(exception).__name__ if exception else 'Failure'}: {exception}")
         log.error(message)
@@ -46,7 +60,7 @@ def send_slack_warning(text, channel=None):
     every tick until a human fixes the sheet."""
     try:
         token = os.getenv("SLACK_TOKEN")
-        channel = channel or os.getenv("SLACK_CHANNEL", "")
+        channel = channel or alert_channel()
         log.warning(text)
         if not token or not channel:
             return

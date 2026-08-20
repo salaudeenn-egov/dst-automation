@@ -33,7 +33,7 @@ except ImportError:
 
 from common.alerts import notify_slack_on_failure
 from common.campaign_runner import execute_campaign
-from common.deployment_env import group_environment, resolve_dst_mode
+from common.deployment_env import group_environment, mdms_enabled
 from common.dst_kafka_status import push_run_event
 
 log = logging.getLogger(__name__)
@@ -83,7 +83,7 @@ def dst_campaign_run():
         row = conf.get("row") or {}
         group = conf.get("group") or {"name": "default", "env": {}}
         mode = conf.get("mode", "both")
-        dst_mode = resolve_dst_mode()
+        use_mdms = mdms_enabled()
 
         marker = ti.xcom_pull(task_ids=EXECUTE_TASK_ID)
         if marker is not None and marker.get("ok") is None:
@@ -91,24 +91,50 @@ def dst_campaign_run():
             return
 
         failed = marker is None
-        degraded = (not failed and any(str(v).startswith("degraded")
-                                       for v in marker.get("stages", {}).values()))
+        stages = {} if failed else marker.get("stages", {})
+        degraded = any(str(v).startswith("degraded") for v in stages.values())
+        # Which stage died. The exception text stays in the Airflow task log,
+        # reachable from dag_run_id — the audit row records the stage, not a
+        # truncated traceback.
+        step_failed = next((name for name, outcome in stages.items()
+                            if str(outcome).startswith("failed")), "")
+        if failed and not step_failed:
+            step_failed = EXECUTE_TASK_ID
         error = ("execute_campaign_pipeline failed — see task log" if failed
                  else "cdd_sync degraded" if degraded else "")
         drive_link = "" if failed else marker.get("drive_link", "")
+        drive_folder_url = "" if failed else marker.get("drive_folder_url", "")
         day = "" if failed else marker.get("day", "")
 
-        if dst_mode == "mdms":
-            push_run_event("REPORT_FAILED" if failed else "REPORT_COMPLETED",
-                           conf, dag_run.run_id, error_message=error or None,
-                           drive_link=drive_link, day=day)
-        else:
+        # The sheet is the fallback for BOTH halves of mdms mode. Config already
+        # falls back (the scheduler reads the tab when MDMS is unreachable);
+        # this is the other half — if the Kafka publish does not land, the
+        # outcome goes to the Run Log tab rather than being lost. push_run_event
+        # never raises and returns False when the broker is unset or unhappy,
+        # so a deployment with no Kafka still keeps a complete audit trail.
+        published = False
+        if use_mdms:
+            published = push_run_event(
+                "REPORT_FAILED" if failed else "REPORT_COMPLETED",
+                conf, dag_run.run_id, step_failed=step_failed,
+                drive_folder_url=drive_folder_url, day=day)
+            if not published:
+                log.warning("[finalize] Kafka publish did not land — falling "
+                            "back to the Run Log tab so the outcome is not lost")
+        if not published:
             with group_environment(group):
                 append_run_log(conf.get("state_name", ""),
                                row.get("campaign_name", ""), day,
                                "FAILED" if failed else "SUCCESS",
-                               step_failed=EXECUTE_TASK_ID if failed else "",
-                               error=error, drive_link=drive_link, mode=mode)
+                               step_failed=step_failed,
+                               error=error,
+                               drive_link=drive_folder_url or drive_link,
+                               mode=mode,
+                               tenant=conf.get("tenant", ""),
+                               cycle_index=row.get("cycle_index", ""),
+                               slot_date=conf.get("slot_date", ""),
+                               slot_time=conf.get("slot_time", ""),
+                               dag_run_id=dag_run.run_id)
 
         if failed:
             raise RuntimeError("execute_campaign_pipeline failed — outcome "

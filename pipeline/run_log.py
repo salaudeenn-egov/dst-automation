@@ -8,12 +8,17 @@ All writes are non-fatal — a Sheets hiccup must never mask a run's outcome.
 """
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 log = logging.getLogger(__name__)
 
-_HEADER = ["Timestamp", "State", "Campaign", "Day", "Time",
-           "Status", "Step Failed", "Error", "Drive Link", "Mode"]
+# Mirrors dst_report_metadata (platform/dst_report_metadata.sql) field for
+# field, so switching DST_MDMS_ENABLED does not change what you can audit.
+# Read back by NAME, never by position, so a tab written before a column was
+# added still parses.
+_HEADER = ["Timestamp UTC", "Tenant", "State", "Campaign", "Cycle", "Day",
+           "Slot Date", "Slot Time", "Mode", "Status", "Step Failed", "Error",
+           "Drive Folder", "DAG Run Id"]
 
 
 def _open_runlog_worksheet():
@@ -46,18 +51,27 @@ def _open_runlog_worksheet():
         return None
 
 
-def append_run_log(state_name, campaign_name, day, status,
-                   step_failed="", error="", drive_link="", mode=""):
-    """Append one outcome row. Returns True on success, False otherwise."""
+def append_run_log(state_name, campaign_name, day, status, step_failed="",
+                   error="", drive_link="", mode="", tenant="", cycle_index="",
+                   slot_date="", slot_time="", dag_run_id=""):
+    """Append one outcome row. Returns True on success, False otherwise.
+
+    Timestamp is UTC: slots are UTC, and a naive local timestamp made the
+    retime guard compare times across a timezone offset. Slot Date/Slot Time
+    are the SCHEDULED slot, not the moment of writing — a 17:00 slot that
+    finishes at 17:04 must still read as the 17:00 slot, or the guard cannot
+    tell whether that slot already produced a report.
+    """
     ws = _open_runlog_worksheet()
     if ws is None:
         return False
     try:
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         ws.append_row(
-            [now.strftime("%Y-%m-%d %H:%M"), state_name, campaign_name, str(day),
-             now.strftime("%H:%M"), status, step_failed,
-             str(error)[:300] if error else "", drive_link or "", mode],
+            [now.strftime("%Y-%m-%d %H:%M"), tenant, state_name, campaign_name,
+             str(cycle_index or ""), str(day), slot_date, slot_time, mode,
+             status, step_failed, str(error)[:300] if error else "",
+             drive_link or "", dag_run_id],
             value_input_option="USER_ENTERED")
         log.info(f"[run-log] appended: {state_name} Day {day} -> {status}")
         return True
@@ -67,27 +81,44 @@ def append_run_log(state_name, campaign_name, day, status,
 
 
 def fetch_today_runs():
-    """Return today's Run Log rows as dicts: {state, status, time "HH:MM", mode}.
+    """Today's Run Log rows as dicts: {tenant, state, status, slot_time, mode}.
 
-    Rows written before the Mode column existed default to mode "both" — the
-    safe direction for the retime guard (they cover every slot mode). Returns
-    an empty list when the sheet is unavailable; callers accept that as
-    "history unknown" (a rare duplicate fire is preferred over never firing).
+    Columns are resolved by HEADER NAME, so rows written before Tenant/Slot
+    Time existed still parse — those fall back to the old positions and to
+    mode "both", the safe direction for the retime guard (it covers every
+    slot mode). Returns [] when the sheet is unavailable; callers treat that
+    as "history unknown" and prefer a rare duplicate over never firing.
     """
     ws = _open_runlog_worksheet()
     if ws is None:
         return []
     try:
-        today = datetime.now().strftime("%Y-%m-%d")
+        values = ws.get_all_values()
+        if not values:
+            return []
+        header = [h.strip() for h in values[0]]
+        idx = {name: i for i, name in enumerate(header)}
+
+        def cell(row, name, default=""):
+            i = idx.get(name)
+            return row[i].strip() if i is not None and i < len(row) else default
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         runs = []
-        for row in ws.get_all_values()[1:]:
-            if not row or not str(row[0]).startswith(today):
+        for row in values[1:]:
+            if not row:
+                continue
+            stamp = (cell(row, "Timestamp UTC") or cell(row, "Timestamp")
+                     or (row[0] if row else ""))
+            if not str(stamp).startswith(today):
                 continue
             runs.append({
-                "state":  row[1] if len(row) > 1 else "",
-                "status": (row[5] if len(row) > 5 else "").strip().upper(),
-                "time":   str(row[0])[11:16],
-                "mode":   (row[9] if len(row) > 9 else "").strip() or "both",
+                "tenant": cell(row, "Tenant").lower(),
+                "state": cell(row, "State"),
+                "status": cell(row, "Status").upper(),
+                # the scheduled slot; legacy rows only recorded the write time
+                "slot_time": cell(row, "Slot Time") or str(stamp)[11:16],
+                "mode": cell(row, "Mode") or "both",
             })
         return runs
     except Exception as e:

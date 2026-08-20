@@ -19,19 +19,23 @@ log = logging.getLogger(__name__)
 def build_retime_guard():
     """One sheet read, then a pure closure for find_due_slots.
 
-    has_report_since(state_name, mode, slot_dt) -> True when a SUCCESS row for
-    this campaign already exists today at or after the slot's time, with a
+    has_report_since(tenant, mode, slot_dt) -> True when a SUCCESS row for this
+    tenant already exists today for a slot at or after this one, with a
     covering mode ("both" covers internal and partner). FAILED runs do not
     count, so a retimed slot may replace a failed report.
     """
     today_runs = fetch_today_runs()
     log.info(f"[retime-guard] {len(today_runs)} run(s) recorded today")
 
-    def has_report_since(state_name, mode, slot_dt):
+    def has_report_since(tenant, mode, slot_dt):
+        """Keyed on TENANT, which is what find_due_slots passes. It previously
+        compared against the Run Log's State column while the caller passed the
+        lowercase tenant, so the guard never matched anything and a retimed
+        slot re-fired. Compares the recorded SLOT time, not the write time."""
         covering = {mode, "both"}
         slot_hhmm = slot_dt.strftime("%H:%M")
-        return any(r["state"] == state_name and r["status"] == "SUCCESS"
-                   and r["mode"] in covering and r["time"] >= slot_hhmm
+        return any(r["tenant"] == tenant and r["status"] == "SUCCESS"
+                   and r["mode"] in covering and r["slot_time"] >= slot_hhmm
                    for r in today_runs)
 
     return has_report_since

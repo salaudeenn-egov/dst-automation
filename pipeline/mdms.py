@@ -3,7 +3,7 @@ Google Sheet.
 
 The sheet stays the only human surface (tabs = deployment groups, rows =
 tenant campaigns); the dst_config_sync DAG mirrors each tab into MDMS, and the
-scheduler reads MDMS instead of the sheet (DST_CONFIG_SOURCE=mdms). Same read
+scheduler reads MDMS instead of the sheet (DST_MDMS_ENABLED=true). Same read
 pattern as the platform's hcm_campaign_scheduler, including internal calls
 with a dummy authToken (auth is enforced at the gateway, which in-cluster
 service-to-service traffic never crosses).
@@ -263,10 +263,10 @@ def sync_rows_to_mdms(group, sheet_rows):
 
 
 def get_active_rows_from_mdms(group):
-    """The scheduler's MDMS read path (DST_CONFIG_SOURCE=mdms): returns row
+    """The scheduler's MDMS read path (DST_MDMS_ENABLED=true): returns row
     dicts identical in shape to config.get_active_rows()."""
     if not _base_url():
-        raise ValueError("DST_CONFIG_SOURCE=mdms but MDMS_URL is not set")
+        raise ValueError("DST_MDMS_ENABLED=true but MDMS_URL is not set")
     rows = [(e.get("data") or {}).get("row", {})
             for e in search_entries(group) if e.get("isActive", True)]
     log.info(f"MDMS group '{group.get('name')}': {len(rows)} row(s) loaded")

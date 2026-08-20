@@ -13,8 +13,12 @@ Safety rules (encoded and unit-tested in pipeline/mdms.py::plan_sync):
   - duplicate identities -> first row wins, rest rejected with an alert
   - another tab's entries are never touched
 
-No-ops harmlessly on deployments without MDMS_URL configured, so this DAG can
-ship everywhere and activate purely via environment.
+Runs ONLY when DST_MDMS_ENABLED=true. Sheet mode touches MDMS nowhere: config
+is read straight from the tab and run history is written to the Run Log tab, so
+mirroring rows into MDMS would be pure waste — a Sheets read and a set of MDMS
+writes every 10 minutes for a mirror nothing reads. The DAG therefore skips
+itself in sheet mode rather than relying on MDMS_URL being unset, and can ship
+to every deployment unchanged.
 """
 import logging
 from datetime import datetime, timedelta, timezone
@@ -25,7 +29,14 @@ except ImportError:
     from airflow.decorators import dag, task
 
 from common.alerts import notify_slack_on_failure, send_slack_warning
-from common.deployment_env import group_environment, load_deployment_groups
+from common.deployment_env import (group_environment, load_deployment_groups,
+                                   mdms_enabled)
+
+try:
+    from airflow.exceptions import AirflowSkipException
+except ImportError:  # pragma: no cover - Airflow always provides this
+    class AirflowSkipException(Exception):
+        pass
 
 log = logging.getLogger(__name__)
 
@@ -47,6 +58,11 @@ def dst_config_sync():
 
     @task
     def list_groups():
+        """Skips the whole tick in sheet mode, so the UI shows plainly that
+        no MDMS traffic happened rather than a green run that did nothing."""
+        if not mdms_enabled():
+            raise AirflowSkipException(
+                "DST_MDMS_ENABLED is false — sheet mode involves MDMS nowhere")
         return load_deployment_groups()
 
     @task(execution_timeout=timedelta(minutes=5))
@@ -55,6 +71,9 @@ def dst_config_sync():
         so the sync history is visible in the Airflow UI per group."""
         from pipeline import config
         from pipeline.mdms import sync_rows_to_mdms
+
+        if not mdms_enabled():
+            raise AirflowSkipException("DST_MDMS_ENABLED is false — nothing to sync")
 
         with group_environment(group):
             rows = config.get_active_rows()

@@ -103,23 +103,52 @@ def group_environment(group):
                 os.environ[key] = previous
 
 
-def resolve_dst_mode():
-    """The ONE universal, deployment-wide flag selecting how the system runs.
+def mdms_enabled():
+    """The ONE deployment-wide switch: is this an MDMS-backed deployment?
 
-    DST_MODE=sheet (default)  — purely Google Sheet: config read from the tab,
-                                run history on the Run Log tab, tenant lock and
-                                retime guard in our own Airflow's Postgres.
-    DST_MODE=mdms             — platform-integrated, ZERO database access:
-                                config from the MDMS mirror (sheet fallback on
-                                outage), run history as Kafka lifecycle events
-                                for the platform's persister, no lock/guard
-                                (deterministic run-ids prevent duplicates,
-                                same trade the platform's own system makes).
+        DST_MDMS_ENABLED=false (default)  purely Google Sheet — config read from
+                                          the tab, run history on the Run Log tab.
+        DST_MDMS_ENABLED=true             platform-integrated — config from the
+                                          MDMS mirror, run history as Kafka
+                                          lifecycle events for the persister.
+
+    Boolean rather than a mode string on purpose: the value space is two, so a
+    typo cannot silently select a working-but-wrong mode. An unparseable value
+    RAISES instead of defaulting, because the two modes read config from
+    different places and write history to different places — quietly guessing
+    is worse than a loud failure the operator can see in the task log.
+
+    Either way the sheet is the fallback: if MDMS cannot be read the scheduler
+    reads the tab for that tick, and if Kafka cannot be written the outcome is
+    appended to the Run Log tab. A deployment with no MDMS write access still
+    works end to end.
 
     Set once per deployment in the environment — never per group or per DAG.
+    DST_MODE (sheet|mdms) is still honoured for deployments not yet migrated.
     """
-    value = (os.getenv("DST_MODE") or "sheet").strip().lower()
-    if value not in ("sheet", "mdms"):
-        log.warning(f"unknown DST_MODE {value!r} — using sheet")
-        return "sheet"
-    return value
+    raw = os.getenv("DST_MDMS_ENABLED")
+    if raw is None:
+        legacy = (os.getenv("DST_MODE") or "").strip().lower()
+        if legacy in ("mdms", "sheet"):
+            log.info(f"using legacy DST_MODE={legacy}; prefer DST_MDMS_ENABLED")
+            return legacy == "mdms"
+        if legacy:
+            raise ValueError(
+                f"DST_MODE={legacy!r} is not 'sheet' or 'mdms'. Set "
+                f"DST_MDMS_ENABLED=true|false instead.")
+        return False
+
+    value = str(raw).strip().lower()
+    if value in ("true", "1", "yes", "y", "on"):
+        return True
+    if value in ("false", "0", "no", "n", "off", ""):
+        return False
+    raise ValueError(
+        f"DST_MDMS_ENABLED={raw!r} is not a boolean. Use true or false — "
+        f"refusing to guess, because the two modes read config from different "
+        f"places and write run history to different places.")
+
+
+def resolve_dst_mode():
+    """Legacy string form, kept for log messages and existing call sites."""
+    return "mdms" if mdms_enabled() else "sheet"
