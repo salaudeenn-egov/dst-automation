@@ -399,7 +399,10 @@ def _aggregate_batch(task_hits, name_map, hh_name_map, fac_data, cfg):
             m["missing_child"] += 1
         if not hh_head:
             m["missing_hh"] += 1
-        if not add.get("gender"):
+        # gender lives in Data.gender for most tenants but in additionalDetails
+        # for the admin-console ones (Kebbi) - check BOTH. Reading only one side
+        # reports 100% missing for every tenant that uses the other.
+        if not (doc.get("gender") or add.get("gender")):
             m["missing_gender"] += 1
 
         if age is None:

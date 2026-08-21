@@ -37,6 +37,21 @@ except ImportError:
 DATA_ERRORS = (KeyError, ValueError, TypeError, AttributeError,
                FileNotFoundError, IndexError)
 
+def _is_permanent_http(exc):
+    """True for HTTP statuses that a retry cannot possibly fix.
+
+    A 404 index_not_found means the tenant prefix or index name is wrong; 401/403
+    mean the credentials are wrong. Retrying twice at three minutes just delays
+    the alert by six minutes — observed live 2026-08-21, when a tenant with no ES
+    indices burned three attempts on
+    "404 Client Error: Not Found for url: .../ba-project-task-index-v1/_search".
+    Everything else (5xx, timeouts, connection resets) stays retryable.
+    """
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    return status in (400, 401, 403, 404)
+
+
 # Checked BEFORE DATA_ERRORS. A JSON decode failure is a ValueError subclass,
 # so an ES/Drive 502 served as an HTML error page — the textbook transient —
 # was being classified as permanent and failing without a retry.
@@ -123,6 +138,13 @@ def _run_stage(stage_name, fn, marker):
             f"identically: {type(e).__name__}: {e}") from e
     except Exception as e:
         marker["stages"][stage_name] = f"failed: {e}"
+        # Ordering matters: DATA_ERRORS above must win first. Only what is left
+        # over gets the HTTP-status test, so a 404/401/403 fails fast while every
+        # other network fault stays retryable.
+        if _is_permanent_http(e):
+            raise AirflowFailException(
+                f"{stage_name} failed with an HTTP status a retry cannot fix "
+                f"(wrong index name, tenant prefix, or credentials): {e}") from e
         raise
 
 
@@ -148,6 +170,10 @@ def execute_campaign(row, mode="both"):
                 "reason": f"outside campaign window "
                           f"({cfg['campaign_start']} to {cfg['campaign_end']})"}
 
+    # Reset before the run: this list is how notify reports artifacts that never
+    # reached Drive (see notify.FAILED_UPLOADS).
+    notify.FAILED_UPLOADS.clear()
+
     analyze_mod, cdd_sync_mod, report_mod = select_pipeline_modules(cfg["drug_type"])
     marker = {"ok": True, "tenant": cfg["tenant"], "state": state,
               "mode": mode, "day": cfg["DAY"], "stages": {},
@@ -163,23 +189,53 @@ def execute_campaign(row, mode="both"):
 
         try:
             produced = cdd_sync_mod.run(cfg)
-            if produced is None and not os.path.exists(cfg.get("sync_xlsx", "")):
+            # run() returns the workbook path on success and None on the no-op,
+            # so the return alone is the signal. Do NOT fall back to "the file
+            # exists" — a stale workbook from an earlier run would mask a
+            # cdd_sync that did nothing this time.
+            if produced is None:
                 # cdd_sync returns None without raising when campaign_number /
                 # project_type_id is blank or zero CDDs match. Marking that "ok"
                 # made the audit row assert a healthy run while the report said
                 # "CDDs synced: 0 of 0" as though it were measured.
-                marker["stages"]["cdd_sync"] = "degraded: produced no sync workbook"
+                marker["stages"]["cdd_sync"] = (
+                    "degraded: CDD sync numbers are MISSING from the report — no "
+                    "CDD or sync records matched this campaign. Check "
+                    "campaign_number / project_type_id in the sheet, that field "
+                    "staff are registered for this campaign, and that CDD_ROLE "
+                    "matches this tenant's role name")
                 log.error("[runner] cdd_sync produced no workbook — sync numbers "
                           "will be absent from the report")
             else:
                 marker["stages"]["cdd_sync"] = "ok"
         except Exception as e:
-            marker["stages"]["cdd_sync"] = f"degraded: {e}"
+            marker["stages"]["cdd_sync"] = (
+                f"degraded: CDD sync numbers are MISSING from the report — the "
+                f"sync step errored: {type(e).__name__}: {e}")
             log.error(f"[runner] cdd_sync failed (non-fatal — report continues "
                       f"without sync data): {e}", exc_info=True)
 
         docx_path, partner_docx_path, slack_text = _run_stage(
             "report", lambda: report_mod.run(cfg), marker)
+
+        # The LLM is non-fatal by design, but "non-fatal" was also SILENT: the
+        # placeholder string is posted to partners as the report body while the
+        # run reports success. Surface it so the outcome is recorded and alerted.
+        if "[Narrative not generated" in str(slack_text):
+            marker["stages"]["report"] = (
+                "degraded: the report body has NO written summary — it carries the "
+                "placeholder '[Narrative not generated]' because Groq failed after "
+                "3 attempts. Check GROQ_API_KEY and GROQ_MODEL (a decommissioned "
+                "model returns 404) before sharing this with partners")
+            log.error("[runner] narrative generation failed — the report body "
+                      "carries a placeholder")
+
+        if notify.FAILED_UPLOADS:
+            lost = ", ".join(sorted(set(notify.FAILED_UPLOADS)))
+            marker["stages"]["report"] = (
+                f"degraded: these files are NOT on Google Drive after 3 upload "
+                f"attempts, so links to them will not work: {lost}")
+            log.error(f"[runner] these artifacts never reached Drive: {lost}")
 
         drive_link = _run_stage(
             "notify",

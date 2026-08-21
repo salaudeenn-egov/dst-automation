@@ -12,6 +12,7 @@ path there).
 import logging
 
 from pipeline.run_log import append_run_log, fetch_today_runs
+from pipeline.schedule_utils import parse_report_times
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +35,14 @@ def build_retime_guard():
         slot re-fired. Compares the recorded SLOT time, not the write time."""
         covering = {mode, "both"}
         slot_hhmm = slot_dt.strftime("%H:%M")
+
+        def normalised(value):
+            """Google Sheets strips a leading zero, so a slot written as 07:24 can
+            read back as 7:24. These times were compared as STRINGS, and
+            "7:24" > "07:24" lexically — so a single-digit hour sorted after every
+            two-digit one and the guard's >= test silently inverted."""
+            parsed = parse_report_times(value)
+            return parsed[0] if parsed else str(value)
         def same_campaign(r):
             # rows written before the Tenant column existed (and every row
             # run.py writes) carry only State — fall back to it rather than
@@ -42,13 +51,15 @@ def build_retime_guard():
                                              and state_name
                                              and r["state"] == state_name)
         return any(same_campaign(r) and r["status"] == "SUCCESS"
-                   and r["mode"] in covering and r["slot_time"] >= slot_hhmm
+                   and r["mode"] in covering
+                   and normalised(r["slot_time"]) >= slot_hhmm
                    for r in today_runs)
 
     return has_report_since
 
 
-def record_outcome(conf, dag_run_id, marker, use_mdms, group_environment):
+def record_outcome(conf, dag_run_id, marker, use_mdms, group_environment,
+                   error_detail=""):
     """Record one run's outcome on the channel the deployment flag selects.
 
     Kept out of the DAG file so it can be exercised without an Airflow
@@ -61,6 +72,7 @@ def record_outcome(conf, dag_run_id, marker, use_mdms, group_environment):
     tab if the publish does not land, so a broker outage cannot silently erase
     the audit trail.
     """
+    from common.alerts import send_slack_warning
     from common.dst_kafka_status import push_run_event
 
     row = conf.get("row") or {}
@@ -74,11 +86,55 @@ def record_outcome(conf, dag_run_id, marker, use_mdms, group_environment):
                         if str(outcome).startswith("failed")), "")
     if failed and not step_failed:
         step_failed = "execute_campaign_pipeline"
-    error = ("execute_campaign_pipeline failed — see task log" if failed
-             else "cdd_sync degraded" if degraded else "")
+    # The Error column is the audit trail a human actually reads, so it carries
+    # the REAL text. Two things were wrong here:
+    #   - on failure it said only "see task log", which is useless to anyone
+    #     without Airflow access (on a hosted deployment, everyone);
+    #   - on degradation it said "cdd_sync degraded" unconditionally, so a run
+    #     degraded by a failed Drive upload or an ungenerated narrative was
+    #     reported as a cdd_sync problem — naming the wrong culprit is worse
+    #     than naming none.
+    degraded_text = "; ".join(f"{name}: {outcome}"
+                              for name, outcome in stages.items()
+                              if str(outcome).startswith("degraded"))
+    if failed:
+        error = error_detail or (
+            f"execute_campaign_pipeline failed and pushed no detail — see the "
+            f"task log for run {dag_run_id}")
+    elif degraded:
+        error = degraded_text
+    else:
+        error = ""
     drive_folder_url = "" if failed else marker.get("drive_folder_url", "")
     drive_link = "" if failed else marker.get("drive_link", "")
     day = "" if failed else marker.get("day", "")
+
+    # A degraded run SUCCEEDS - Airflow is green and on_failure_callback never
+    # fires - so without this the only trace was a spreadsheet cell nobody
+    # reads, while a report with missing sync numbers or a placeholder
+    # narrative had already gone to the partner channel.
+    if degraded and not failed:
+        # Written for whoever is on call, not for whoever wrote the pipeline. The
+        # previous version read "cdd_sync (degraded: produced no sync workbook)":
+        # a module name, an internal artifact, and no statement of impact, cause
+        # or action. Name the campaign, say what is missing from the report, and
+        # say what to do.
+        problems = "\n".join(
+            "  - " + str(outcome).replace("degraded:", "").strip()
+            for outcome in stages.values() if str(outcome).startswith("degraded"))
+        campaign = row.get("campaign_name") or row.get("campaign_number") or "?"
+        where = " ".join(x for x in (conf.get("slot_date", ""),
+                                     conf.get("slot_time", "")) if x)
+        day_part = f" / Day {day}" if day else ""
+        send_slack_warning(
+            f"DST REPORT INCOMPLETE — {conf.get('state_name', '?')} / "
+            f"{campaign}{day_part}\n"
+            f"Slot {where} ({mode}). The report WAS published and sent, but it is "
+            f"missing data:\n"
+            f"{problems}\n"
+            f"Action: review the report before sharing it with partners, then fix "
+            f"the cause above and re-run the slot if the numbers matter.",
+            group_name=(group or {}).get("name", ""))
 
     published = False
     if use_mdms:

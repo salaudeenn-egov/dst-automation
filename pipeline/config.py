@@ -11,9 +11,53 @@ import gspread
 from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
 
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
-
 log = logging.getLogger(__name__)
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _dotenv_is_local_only():
+    """Whether to read the repo-root .env at all.
+
+    The .env is LOCAL convenience — `python run.py` on a laptop or a JupyterHub
+    box. A managed deployment (Airflow) owns its own environment, supplied by the
+    process env and Airflow Variables, and the repo .env must not be able to
+    inject anything into it.
+
+    override=False is NOT sufficient protection. It defers to variables that
+    already EXIST, but a deployment also states intent by leaving a variable
+    ABSENT: ES_INDEX_PREFIX unset means tenant-prefixed indices, set-but-empty
+    means un-prefixed (see build()). The repo — and its .env — is mounted into
+    the Airflow containers, so loading it supplied the `ES_INDEX_PREFIX=` line
+    meant for Togo and silently switched every tenant to un-prefixed indices.
+    On 2026-08-21 a run read project-task-index-v1 instead of
+    so-project-task-index-v1, matched 0 of 84 seeded docs, and published a
+    complete report describing nothing — task SUCCESS, silently wrong extract.
+    It even defeated the documented fix: a `{"ES_INDEX_PREFIX": null}` override
+    in dst_groups removes the key, but group_environment runs BEFORE this module
+    is imported, so the load put it straight back.
+
+    This only began biting once the dotenv PATH was corrected; while it pointed
+    at the non-existent pipeline/.env the load was a silent no-op.
+
+    DST_LOAD_DOTENV forces the decision; otherwise Airflow's own environment is
+    the signal.
+    """
+    flag = os.getenv("DST_LOAD_DOTENV", "").strip().lower()
+    if flag in ("0", "false", "no"):
+        return False
+    if flag in ("1", "true", "yes"):
+        return True
+    return not any(key in os.environ for key in
+                   ("AIRFLOW_HOME", "AIRFLOW_CTX_DAG_ID",
+                    "AIRFLOW__CORE__EXECUTOR"))
+
+
+if _dotenv_is_local_only():
+    load_dotenv(dotenv_path=os.path.join(_REPO_ROOT, ".env"), override=False)
+else:
+    log.info("[config] managed deployment — repo .env NOT loaded; configuration "
+             "comes from the process environment and Airflow Variables only")
 
 _SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -173,6 +217,84 @@ def get_active_rows():
     return rows
 
 
+# Values a human types into the sheet. Anything outside these sets changes which
+# ES query runs or which pipeline is selected, so guessing produces a
+# plausible-looking report about the wrong thing.
+VALID_DRUG_TYPES = ("SPAQ", "AZM", "ITN", "LLIN")
+_TRUE_WORDS = ("TRUE", "YES", "1", "Y", "ON")
+_FALSE_WORDS = ("FALSE", "NO", "0", "N", "OFF")
+
+
+def _validate_row(row, campaign_start, campaign_end, campaign_days):
+    """Reject contradictory config LOUDLY, naming the field and the value.
+
+    Every check here was a silent failure before: the run either produced a
+    report about nothing, or a report whose numbers were quietly wrong, or it
+    died mid-pipeline with an exception that named no field. Because these raise
+    ValueError, campaign_runner classifies them as data errors — the task fails
+    IMMEDIATELY with no retries, and the message travels into the Slack alert, so
+    the alert alone is enough to fix the sheet without opening a log.
+
+    Skipped entirely for an inactive row: nobody is waiting on its report, and
+    failing a row somebody has deliberately parked is just noise.
+    """
+    state = row.get("state_name") or row.get("tenant") or "?"
+    if not _bool(row.get("active", "TRUE")):
+        return
+
+    def bad(message):
+        raise ValueError(f"[{state}] {message}")
+
+    if campaign_end < campaign_start:
+        bad(f"campaign_end ({campaign_end.isoformat()}) is BEFORE campaign_start "
+            f"({campaign_start.isoformat()}). The dates are probably swapped. "
+            f"Nothing would ever be in window, so no report would ever run and "
+            f"nothing would warn you.")
+
+    raw_days = str(row.get("campaign_days", "") or "").strip()
+    if raw_days:
+        try:
+            numeric_days = int(float(raw_days))
+        except (TypeError, ValueError):
+            numeric_days = None          # non-numeric already fell back to 4
+        if numeric_days is not None and numeric_days <= 0:
+            bad(f"campaign_days is {raw_days!r}. It is the DIVISOR for every "
+                f"coverage percentage: 0 raises ZeroDivisionError mid-run (after "
+                f"two pointless retries) and a negative value inverts every "
+                f"figure. Set it to the number of days in the campaign.")
+
+    raw_mopup = str(row.get("mopup_end_date", "") or "").strip()
+    if raw_mopup:
+        parsed_mopup = _parse_date(raw_mopup)
+        if not parsed_mopup:
+            bad(f"mopup_end_date is {raw_mopup!r}, which is not a date. Use "
+                f"YYYY-MM-DD, or leave it blank if this campaign has no mop-up.")
+        if parsed_mopup < campaign_start:
+            bad(f"mopup_end_date ({raw_mopup}) is before campaign_start "
+                f"({campaign_start.isoformat()}). The cumulative report covers "
+                f"campaign_start through mop-up, so this range is empty.")
+
+    raw_cycle = str(row.get("cycle_index", "") or "").strip()
+    if raw_cycle and not raw_cycle.replace(".0", "").isdigit():
+        bad(f"cycle_index is {raw_cycle!r}, which is not a number. ES matches "
+            f"cycleIndex EXACTLY (as a zero-padded string like '02'), so this "
+            f"matches no document and the report comes out silently EMPTY.")
+
+    raw_drug = str(row.get("drug_type", "") or "").strip().upper()
+    if raw_drug and raw_drug not in VALID_DRUG_TYPES:
+        bad(f"drug_type is {raw_drug!r}. Valid values are "
+            f"{', '.join(VALID_DRUG_TYPES)}. It selects the pipeline, so a typo "
+            f"silently runs the SPAQ per-child pipeline over an ITN campaign and "
+            f"produces a wrong-shaped report.")
+
+    raw_admin = str(row.get("is_admin_console", "") or "").strip().upper()
+    if raw_admin and raw_admin not in _TRUE_WORDS + _FALSE_WORDS:
+        bad(f"is_admin_console is {raw_admin!r}. Use TRUE or FALSE. It chooses "
+            f"whether ES is filtered by campaignNumber or by projectTypeId, so an "
+            f"unrecognised value silently selects the wrong query and returns "
+            f"nothing.")
+
+
 def build(row):
     """
     Build a fully resolved config dict from a Google Sheet row.
@@ -194,7 +316,9 @@ def build(row):
 
     if not campaign_start or not campaign_end:
         raise ValueError(
-            f"[{row.get('state_name')}] campaign_start / campaign_end missing or unparseable"
+            f"[{row.get('state_name')}] campaign_start / campaign_end missing or "
+            f"unparseable: campaign_start={row.get('campaign_start')!r}, "
+            f"campaign_end={row.get('campaign_end')!r}. Use YYYY-MM-DD or DD/MM/YYYY."
         )
 
     if not os.getenv("ES_URL"):
@@ -207,6 +331,8 @@ def build(row):
         campaign_days_cfg = int(float(row.get("campaign_days", 4) or 4))
     except (ValueError, TypeError):
         campaign_days_cfg = 4
+
+    _validate_row(row, campaign_start, campaign_end, campaign_days_cfg)
     day = (today - campaign_start).days + 1
     day = max(1, min(day, campaign_days_cfg))
 
@@ -230,8 +356,18 @@ def build(row):
     # "Read-only file system" before any work starts.
     # The legacy out_dir column is still honoured for the JupyterHub boxes,
     # which read their reports off local disk; it is deprecated.
+    # Per CAMPAIGN, not per tenant. Two campaigns on one tenant run
+    # concurrently (Bauchi SMC + ITN, Chad C1 + C2) and Airflow allows 16
+    # parallel runs, so a tenant-only directory made both write
+    # performance_dayN.xlsx, cdd_sync_dayN.xlsx and the same checkpoints - one
+    # run could overwrite the Excel another was about to read back, publishing
+    # the wrong campaign's numbers with no error. Verified live 2026-08-20.
+    # A sheet-supplied out_dir is left exactly as given: the JupyterHub boxes
+    # run one campaign per tenant and expect their known paths.
+    from pipeline.schedule_utils import campaign_key
     out_dir = (str(row.get("out_dir", "")).strip()
-               or os.path.join(tempfile.gettempdir(), "dst", tenant))
+               or os.path.join(tempfile.gettempdir(), "dst", tenant,
+                               campaign_key(row)))
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(os.path.join(out_dir, "logs"), exist_ok=True)
 

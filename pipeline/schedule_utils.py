@@ -4,8 +4,24 @@ A slot is (time "HH:MM" UTC, mode). Modes: "both" posts internal + partner,
 "internal" / "partner" post one channel only.
 """
 import logging
+import re
 
 log = logging.getLogger(__name__)
+
+
+def campaign_key(row):
+    """Short, id-safe discriminator for one campaign within a tenant.
+
+    A tenant can run several campaigns at once - Bauchi has had SMC and ITN
+    live together, and multi-cycle SMC is routine - so the tenant alone
+    identifies neither a run nor its working directory.
+    """
+    raw = (str(row.get("campaign_number", "")).strip()
+           or str(row.get("project_type_id", "")).strip()
+           or str(row.get("campaign_name", "")).strip())
+    cycle = str(row.get("cycle_index", "")).strip().lstrip("0")
+    key = re.sub(r"[^A-Za-z0-9]+", "", raw)[-10:] or "x"
+    return f"{key}{('c' + cycle) if cycle else ''}"
 
 
 def parse_report_times(raw):
@@ -24,7 +40,9 @@ def parse_report_times(raw):
             hour, minute = int(hour), int(minute)
             if not (0 <= hour <= 23 and 0 <= minute <= 59):
                 raise ValueError
-            times.append(f"{hour:02d}:{minute:02d}")
+            value = f"{hour:02d}:{minute:02d}"
+            if value not in times:      # "17:00,17:00" must not schedule twice
+                times.append(value)
         except ValueError:
             log.warning(f"invalid report time {candidate!r} — skipped")
     return times

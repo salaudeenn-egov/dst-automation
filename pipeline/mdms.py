@@ -82,6 +82,18 @@ def row_identity(row):
     return f"{tenant}::{campaign_key}::{cycle}::{start}"
 
 
+def protection_key(row):
+    """Looser key used ONLY to decide what must not be deactivated.
+
+    The full identity includes campaign_start, so a typo in that cell produces a
+    NEW identity and the live entry looks removed from the sheet - which would
+    deactivate a running campaign for a single mistyped character, exactly what
+    the reject-and-keep rule exists to prevent. Matching on tenant+campaign+cycle
+    keeps the entry alive while the typo is rejected.
+    """
+    return "::".join(row_identity(row).split("::")[:3])
+
+
 def normalize_row(row):
     return {str(k).strip(): str(v).strip() for k, v in row.items()}
 
@@ -166,9 +178,17 @@ def plan_sync(sheet_rows, existing_entries, group_name):
     if not sheet_rows:
         plan["skip_deactivation"] = True
     else:
+        # protected = every identity the sheet still mentions, INCLUDING rows that
+        # failed validation (see protection_key)
+        protected = {protection_key(normalize_row(r)) for r in sheet_rows}
         for identity, entry in by_identity.items():
-            if identity not in seen and entry.get("isActive", True):
-                plan["deactivate"].append(entry)
+            if identity in seen or entry.get("isActive", True) is False:
+                continue
+            if "::".join(identity.split("::")[:3]) in protected:
+                log.warning(f"[mdms-sync] {identity} not matched this tick but the "
+                            f"sheet still lists the campaign - keeping it active")
+                continue
+            plan["deactivate"].append(entry)
     return plan
 
 

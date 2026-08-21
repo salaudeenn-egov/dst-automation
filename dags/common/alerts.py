@@ -23,7 +23,12 @@ def _slack_token(group_name=""):
     a no-op on any deployment following the documented secrets pattern. Fall
     back to reading the group's secrets Variable directly.
     """
-    token = os.getenv("SLACK_TOKEN", "").strip()
+    # dst_config.resolved reads the Variable directly, which matters here: this
+    # runs AFTER group_environment restored os.environ, so a token that only
+    # ever lived in a Variable is invisible to os.getenv.
+    from common import dst_config
+
+    token = (dst_config.resolved("SLACK_TOKEN", "") or "").strip()
     if token or not group_name:
         return token
     try:
@@ -60,8 +65,10 @@ def _post(channel, text, token, blocks=None):
 def alert_channel(row=None):
     """Where operational alerts go. A dedicated ops channel wins; the
     campaign's reporting channel is only a last resort."""
-    return (os.getenv("DST_ALERT_CHANNEL", "").strip()
-            or os.getenv("SLACK_CHANNEL", "").strip()
+    from common import dst_config
+
+    return ((dst_config.resolved("DST_ALERT_CHANNEL", "") or "").strip()
+            or (dst_config.resolved("SLACK_CHANNEL", "") or "").strip()
             or str((row or {}).get("slack_channel", "")).strip())
 
 

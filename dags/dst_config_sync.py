@@ -28,6 +28,7 @@ try:
 except ImportError:
     from airflow.decorators import dag, task
 
+from common import dst_config
 from common.alerts import notify_slack_on_failure, send_slack_warning
 from common.deployment_env import (group_environment, load_deployment_groups,
                                    mdms_enabled)
@@ -60,10 +61,11 @@ def dst_config_sync():
     def list_groups():
         """Skips the whole tick in sheet mode, so the UI shows plainly that
         no MDMS traffic happened rather than a green run that did nothing."""
-        if not mdms_enabled():
-            raise AirflowSkipException(
-                "DST_MDMS_ENABLED is false — sheet mode involves MDMS nowhere")
-        return load_deployment_groups()
+        with dst_config.apply():
+            if not mdms_enabled():
+                raise AirflowSkipException(
+                    "DST_MDMS_ENABLED is false — sheet mode involves MDMS nowhere")
+            return load_deployment_groups()
 
     @task(execution_timeout=timedelta(minutes=5))
     def sync_group_to_mdms(group):
@@ -72,12 +74,13 @@ def dst_config_sync():
         from pipeline import config
         from pipeline.mdms import sync_rows_to_mdms
 
-        if not mdms_enabled():
-            raise AirflowSkipException("DST_MDMS_ENABLED is false — nothing to sync")
+        with dst_config.apply():
+            if not mdms_enabled():
+                raise AirflowSkipException("DST_MDMS_ENABLED is false — nothing to sync")
 
-        with group_environment(group):
-            rows = config.get_active_rows()
-            counts = sync_rows_to_mdms(group, rows)
+            with group_environment(group):
+                rows = config.get_active_rows()
+                counts = sync_rows_to_mdms(group, rows)
 
         if counts and counts.get("skip_deactivation"):
             send_slack_warning(

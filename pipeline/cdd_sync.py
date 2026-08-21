@@ -6,6 +6,7 @@ Two variants:
   is_admin_console=FALSE (Chad/Togo): filter staff by projectTypeId, sync by syncedUserId
 """
 import logging
+import os
 from collections import defaultdict
 from datetime import timedelta, datetime, timezone
 
@@ -21,6 +22,20 @@ from pipeline.core.excel import (
 )
 
 log = logging.getLogger(__name__)
+
+# The CDD role is DEPLOYMENT config, not a constant. It was hardcoded in nine
+# separate term filters below, so standing up Togo meant hand-editing all nine
+# to COMMUNITY_DISTRIBUTOR on every pipeline sync — a swap that was lost and
+# re-applied more than once. deployment_env.py already DOCUMENTED a CDD_ROLE
+# group env key; nothing ever read it. Now it does.
+#
+# Deliberately separate from the ITN role (CDD_ROLE_ITN in cdd_sync_itn.py):
+# one deployment runs both campaign types at once — Bauchi has had SMC and ITN
+# live in the same window — so a single shared key would break one of them.
+def _cdd_role():
+    return os.getenv("CDD_ROLE", "DISTRIBUTOR").strip() or "DISTRIBUTOR"
+
+
 
 
 def _epoch_ms_to_date(val):
@@ -41,7 +56,7 @@ def _load_staff_by_campaign(cfg):
         ],
         "query": {"bool": {"must": [
             {"term": {"Data.campaignNumber.keyword": cfg["campaign_number"]}},
-            {"term": {"Data.role.keyword": "DISTRIBUTOR"}},
+            {"term": {"Data.role.keyword": _cdd_role()}},
         ]}},
     }
     hits = scroll_all(cfg["es_url"], cfg["ES_INDEX_STAFF"], query,
@@ -70,7 +85,7 @@ def _load_sync_dates_by_username(cfg, uname_list):
     must = [
         {"terms": {"Data.taskDates":              cfg["CAMPAIGN_DATES"]}},
         {"terms": {"Data.syncedUserName.keyword": uname_list}},
-        {"term": {"Data.role.keyword": "DISTRIBUTOR"}},
+        {"term": {"Data.role.keyword": _cdd_role()}},
         {"term":  {"Data.campaignNumber.keyword": cfg["campaign_number"]}},
     ]
     sources = [
@@ -100,7 +115,7 @@ def _load_staff_by_project_type(cfg):
         ],
         "query": {"bool": {"must": [
             {"term": {"Data.projectTypeId.keyword": cfg["project_type_id"]}},
-            {"term": {"Data.role.keyword": "DISTRIBUTOR"}},
+            {"term": {"Data.role.keyword": _cdd_role()}},
             {"term": {"Data.isDeleted":             False}},
         ]}},
     }
@@ -169,7 +184,7 @@ def _count_synced_by_cutoff(cfg, cutoff_hour, cutoff_min=0):
         # is non-zero (projectTypeId doesn't exist on this index).
         must_filter = [
             {"term":  {"Data.campaignNumber.keyword": cfg["campaign_number"]}},
-            {"term":  {"Data.role.keyword": "DISTRIBUTOR"}},
+            {"term":  {"Data.role.keyword": _cdd_role()}},
             {"terms": {"Data.taskDates": [today]}},
             {"range": {"Data.createdTime": {"lte": cutoff_ms}}},
         ]
@@ -177,7 +192,7 @@ def _count_synced_by_cutoff(cfg, cutoff_hour, cutoff_min=0):
     elif cfg["is_admin_console"]:
         must_filter = [
             {"term":  {"Data.campaignNumber.keyword": cfg["campaign_number"]}},
-            {"term": {"Data.role.keyword": "DISTRIBUTOR"}},
+            {"term": {"Data.role.keyword": _cdd_role()}},
             {"terms": {"Data.taskDates": [today]}},
             {"range": {"Data.createdTime": {"lte": cutoff_ms}}},
         ]
@@ -185,7 +200,7 @@ def _count_synced_by_cutoff(cfg, cutoff_hour, cutoff_min=0):
     else:
         must_filter = [
             {"term":  {"Data.projectTypeId.keyword": cfg["project_type_id"]}},
-            {"term": {"Data.role.keyword": "DISTRIBUTOR"}},
+            {"term": {"Data.role.keyword": _cdd_role()}},
             {"terms": {"Data.taskDates": [today]}},
             {"range": {"Data.createdTime": {"lte": cutoff_ms}}},
         ]
@@ -227,7 +242,7 @@ def _get_synced_keys_by_cutoff(cfg, cutoff_hour=17, cutoff_min=30):
         # Chad: sync index has campaignNumber (not projectTypeId); role DISTRIBUTOR.
         must_filter = [
             {"term":  {"Data.campaignNumber.keyword": cfg["campaign_number"]}},
-            {"term":  {"Data.role.keyword": "DISTRIBUTOR"}},
+            {"term":  {"Data.role.keyword": _cdd_role()}},
             {"terms": {"Data.taskDates": [today]}},
             {"range": {"Data.createdTime": {"lte": cutoff_ms}}},
         ]
@@ -235,7 +250,7 @@ def _get_synced_keys_by_cutoff(cfg, cutoff_hour=17, cutoff_min=30):
     elif cfg["is_admin_console"]:
         must_filter = [
             {"term":  {"Data.campaignNumber.keyword": cfg["campaign_number"]}},
-            {"term": {"Data.role.keyword": "DISTRIBUTOR"}},
+            {"term": {"Data.role.keyword": _cdd_role()}},
             {"terms": {"Data.taskDates": [today]}},
             {"range": {"Data.createdTime": {"lte": cutoff_ms}}},
         ]
@@ -243,7 +258,7 @@ def _get_synced_keys_by_cutoff(cfg, cutoff_hour=17, cutoff_min=30):
     else:
         must_filter = [
             {"term":  {"Data.projectTypeId.keyword": cfg["project_type_id"]}},
-            {"term": {"Data.role.keyword": "DISTRIBUTOR"}},
+            {"term": {"Data.role.keyword": _cdd_role()}},
             {"terms": {"Data.taskDates": [today]}},
             {"range": {"Data.createdTime": {"lte": cutoff_ms}}},
         ]

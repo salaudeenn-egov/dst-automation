@@ -7,9 +7,12 @@ data interval (data_interval_start == data_interval_end), so the classic
 "[previous tick, this tick)" window does not exist. Each tick therefore matches
 slots against [now - lookback, now] computed from datetime.now(UTC).
 """
+import logging
 from datetime import datetime, timedelta, timezone
 
-from pipeline.schedule_utils import compute_trigger_slots
+from pipeline.schedule_utils import campaign_key, compute_trigger_slots
+
+log = logging.getLogger(__name__)
 
 # The whole-campaign cumulative report fires once, at the very end of the
 # mop-up day, and goes to BOTH the internal and the partner channel.
@@ -38,10 +41,36 @@ def campaign_window_contains(row, day):
     return bool(start and end and start <= day <= end)
 
 
-def build_trigger_run_id(group_name, tenant, mode, slot_date, slot_time):
+def build_trigger_run_id(group_name, tenant, mode, slot_date, slot_time, camp="x"):
     """Deterministic run id: the same slot can never fire twice
-    (TriggerDagRunOperator skips when the run id already exists)."""
-    return f"dst_{group_name}_{tenant}_{mode}_{slot_date}_{slot_time.replace(':', '')}"
+    (TriggerDagRunOperator skips when the run id already exists).
+
+    The campaign key is part of it because tenant+mode+slot alone COLLIDED for
+    two live campaigns on one tenant - the second was silently skipped and its
+    report never ran.
+    """
+    return (f"dst_{group_name}_{tenant}_{camp}_{mode}_"
+            f"{slot_date}_{slot_time.replace(':', '')}")
+
+
+def _warn_if_never_schedulable(row):
+    """An ACTIVE row with no usable time is silent non-reporting.
+
+    Nothing failed, nothing was skipped for a stated reason — the campaign simply
+    never produces a report, and the only way to notice is that stakeholders ask
+    where it is. Say it once per tick, naming the campaign.
+    """
+    from pipeline.schedule_utils import parse_report_times
+
+    internal = parse_report_times(row.get("report_times"))
+    partner = parse_report_times(row.get("partner_report_times"))
+    if internal or partner or row.get("mopup_end_date"):
+        return
+    log.warning(
+        f"[{row.get('state_name') or row.get('tenant')}] campaign "
+        f"{row.get('campaign_name') or row.get('campaign_number')!r} is ACTIVE but "
+        f"has no valid report_times or partner_report_times, so it will NEVER "
+        f"produce a report. Fix the times cell (UTC, HH:MM) or set active=FALSE.")
 
 
 def _candidate_slots(row):
@@ -84,6 +113,7 @@ def find_due_slots(group, rows, now_utc, lookback_minutes, has_report_since=None
         state = str(row.get("state_name", "")).strip()
         if not tenant:
             continue
+        _warn_if_never_schedulable(row)
 
         for slot_time, mode in _candidate_slots(row):
             hour, minute = (int(p) for p in slot_time.split(":"))
@@ -105,7 +135,8 @@ def find_due_slots(group, rows, now_utc, lookback_minutes, has_report_since=None
                 slot_date = slot_dt.date().isoformat()
                 due.append({
                     "trigger_run_id": build_trigger_run_id(
-                        group["name"], tenant, mode, slot_date, slot_time),
+                        group["name"], tenant, mode, slot_date, slot_time,
+                        campaign_key(row)),
                     "conf": {
                         "group": group,
                         "row": row,

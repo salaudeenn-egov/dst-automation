@@ -13,8 +13,17 @@ Configuration sources, resolved at TASK RUNTIME (never at DAG-parse time):
     In "env": a null value REMOVES the variable (tenant-prefixed indices need
     ES_INDEX_PREFIX absent); "" sets it present-and-empty (Togo's un-prefixed
     cluster). This distinction is load-bearing — see pipeline/config.py.
-  - Airflow Variable "dst_secrets_<name>": JSON dict of that group's secrets
-    (ES_USER, ES_PASS, SLACK_TOKEN, ...), set via the Airflow UI, never in git.
+  - Airflow Variable "dst_secrets_<name>": CREDENTIALS ONLY for that group
+    (ES_USER, ES_PASS, SLACK_TOKEN, GROQ_API_KEY), set via the Airflow UI,
+    never in git.
+
+    Do NOT put routing or behaviour here - GOOGLE_SHEET_ID, ES_URL,
+    ES_INDEX_PREFIX, GOOGLE_DRIVE_FOLDER_ID, GROQ_MODEL and the like belong to
+    the deployment environment. This blob silently overrides the environment,
+    so a forgotten entry redirects real work: one stale Variable simultaneously
+    pointed run history at the PRODUCTION sheet, pinned a decommissioned LLM
+    model, and switched the ES index convention - none of it visible until the
+    override logging below was added.
   - With no dst_groups Variable, a single default group falls back to the
     process environment (.env) — local runs work with zero Airflow setup.
 """
@@ -56,8 +65,18 @@ def _get_airflow_variable(name):
 
 def load_deployment_groups():
     """Return the configured groups, or the env-driven default group."""
+    from common import dst_config
+
     raw = _get_airflow_variable("dst_groups")
     if not raw.strip():
+        # dst_config is the single-Variable deployment: one credential set, one
+        # sheet tab, tenants as ROWS. dst_groups only earns its keep when a
+        # second credential set (Taraba, Togo) joins the same Airflow.
+        if dst_config.is_configured():
+            group = dst_config.as_group()
+            log.info(f"dst_config Variable in use — single deployment group "
+                     f"{group['name']!r} on tab {group['sheet_tab']!r}")
+            return [group]
         log.info("dst_groups Variable not set — using the env-driven default group")
         return [_default_group()]
 
@@ -69,8 +88,16 @@ def load_deployment_groups():
 
 
 def _load_group_secrets(group_name):
+    from common import dst_config
+
     raw = _get_airflow_variable(f"dst_secrets_{group_name}")
     if not raw.strip():
+        if dst_config.is_configured():
+            # Not a misconfiguration: dst_config carries the credentials and has
+            # already applied them. Warning here would cry wolf every task.
+            log.info(f"dst_secrets_{group_name} unset — credentials come from "
+                     f"the dst_config Variable")
+            return {}
         log.warning(f"secrets Variable 'dst_secrets_{group_name}' is empty — "
                     f"tasks will rely on the process environment")
         return {}
@@ -86,6 +113,25 @@ def group_environment(group):
     overrides["GOOGLE_SHEET_TAB"] = group.get("sheet_tab") or "Sheet1"
     if group.get("name") and group["name"] != "default":
         overrides.update(_load_group_secrets(group["name"]))
+
+    # A group's secrets Variable SILENTLY replaces deployment configuration.
+    # A stale one pinned GROQ_MODEL to a decommissioned model, ES_INDEX_PREFIX
+    # to the wrong convention and GOOGLE_SHEET_ID to PRODUCTION - three real
+    # incidents from one forgotten Variable, none visible in any log. Anything
+    # a group changes is now stated up front. Values are never logged: keys
+    # only, since this blob holds credentials.
+    changed = [k for k, v in overrides.items()
+               if str(os.environ.get(k)) != str(v) and k in os.environ]
+    if changed:
+        log.warning(f"[{group.get('name')}] group config REPLACES the deployment "
+                    f"environment for: {', '.join(sorted(changed))}")
+    routing = sorted(k for k in changed
+                     if k in ("GOOGLE_SHEET_ID", "ES_URL", "ES_INDEX_PREFIX",
+                              "GOOGLE_DRIVE_FOLDER_ID"))
+    if routing:
+        log.warning(f"[{group.get('name')}] those include ROUTING keys "
+                    f"({', '.join(routing)}) - this group writes and reads "
+                    f"somewhere other than the deployment default")
 
     snapshot = {key: os.environ.get(key) for key in overrides}
     try:

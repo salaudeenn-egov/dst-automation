@@ -42,6 +42,16 @@ def _open_runlog_worksheet():
         tab_name = os.getenv("GOOGLE_RUNLOG_TAB", "Run Log")
         try:
             ws = spreadsheet.worksheet(tab_name)
+            # An existing tab predates any column added since it was created.
+            # Appending a row WIDER than the grid silently writes nothing, which
+            # is how a run logged "appended" while the tab stayed empty. Widen
+            # and rewrite the header so tabs survive an upgrade.
+            if ws.col_count < len(_HEADER):
+                ws.resize(rows=max(ws.row_count, 1000), cols=len(_HEADER))
+                log.info(f"[run-log] widened '{tab_name}' to {len(_HEADER)} columns")
+            if ws.row_values(1)[:len(_HEADER)] != _HEADER:
+                ws.update([_HEADER], "A1")
+                log.info(f"[run-log] header of '{tab_name}' upgraded")
         except gspread.WorksheetNotFound:
             # width derived from _HEADER: a hardcoded value silently truncated
             # the append once columns were added, and the failure was swallowed

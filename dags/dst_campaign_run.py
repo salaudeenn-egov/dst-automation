@@ -31,6 +31,7 @@ try:
 except ImportError:
     from airflow.decorators import dag, task
 
+from common import dst_config
 from common.alerts import notify_slack_on_failure
 from common.campaign_runner import execute_campaign
 from common.deployment_env import group_environment, mdms_enabled
@@ -58,18 +59,39 @@ def dst_campaign_run():
 
     @task(retries=2, retry_delay=timedelta(minutes=3),
           execution_timeout=timedelta(minutes=60))
-    def execute_campaign_pipeline(dag_run=None):
+    def execute_campaign_pipeline(dag_run=None, ti=None):
         """Run the whole pipeline chain for this campaign row (see
-        common/campaign_runner.py for stage and error semantics)."""
+        common/campaign_runner.py for stage and error semantics).
+
+        On failure the exception text is pushed to XCom under "failure" BEFORE
+        re-raising. A raising task pushes no return value, so finalize_run had
+        nothing to write and the Run Log said only "see task log" — useless to
+        anyone without Airflow access, which on a hosted deployment is everyone.
+        """
         conf = dag_run.conf or {}
         if not conf.get("row"):
             raise ValueError("dag_run.conf is missing 'row' — this DAG must be "
                              "triggered by dst_campaign_scheduler, or manually "
                              "with a full conf payload")
-        with group_environment(conf.get("group") or {"name": "default", "env": {}}):
-            return execute_campaign(conf["row"], conf.get("mode", "both"))
+        try:
+            with dst_config.apply():
+                with group_environment(conf.get("group") or {"name": "default",
+                                                             "env": {}}):
+                    return execute_campaign(conf["row"], conf.get("mode", "both"))
+        except Exception as e:
+            if ti is not None:
+                try:
+                    ti.xcom_push(key="failure", value=f"{type(e).__name__}: {e}"[:900])
+                except Exception:            # never mask the real error
+                    pass
+            raise
 
-    @task(trigger_rule="all_done")
+    # on_failure_callback is deliberately DISABLED here. This task re-raises to
+    # mark the DAG run failed, which is a bookkeeping act, not new information:
+    # execute_campaign_pipeline has already alerted with the real error. With the
+    # callback inherited from default_args, every single failure posted TWO
+    # near-identical Slack alerts — the fastest way to get an ops channel muted.
+    @task(trigger_rule="all_done", on_failure_callback=None)
     def finalize_run(dag_run=None, ti=None):
         """Always runs. Records every REAL report attempt on the channel the
         universal DST_MODE flag selects (Run Log tab in sheet mode, Kafka event
@@ -90,14 +112,20 @@ def dst_campaign_run():
         # write. An unusable flag falls back to the sheet, which needs no
         # extra infrastructure, and the misconfiguration still surfaces in the
         # log and in the Slack alert from the failed execute task.
-        try:
-            use_mdms = mdms_enabled()
-        except ValueError as e:
-            log.error(f"[finalize] {e} — recording to the Run Log tab instead")
-            use_mdms = False
+        # mdms_enabled(), push_run_event() and send_slack_warning() all read
+        # configuration outside the per-group context, so the whole recording
+        # step runs inside the dst_config environment.
+        with dst_config.apply():
+            try:
+                use_mdms = mdms_enabled()
+            except ValueError as e:
+                log.error(f"[finalize] {e} — recording to the Run Log tab instead")
+                use_mdms = False
 
-        result = record_outcome(conf, dag_run.run_id, marker,
-                                use_mdms, group_environment)
+            result = record_outcome(conf, dag_run.run_id, marker,
+                                    use_mdms, group_environment,
+                                    error_detail=ti.xcom_pull(
+                                        task_ids=EXECUTE_TASK_ID, key="failure") or "")
         log.info(f"[finalize] outcome recorded via {result['recorded']}")
         failed = result["failed"]
 

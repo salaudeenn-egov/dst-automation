@@ -28,6 +28,7 @@ try:
 except ImportError:
     from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 
+from common import dst_config
 from common.alerts import notify_slack_on_failure
 from common.deployment_env import (group_environment, load_deployment_groups,
                                    mdms_enabled)
@@ -36,7 +37,11 @@ from common.slots import find_due_slots
 
 log = logging.getLogger(__name__)
 
-LOOKBACK_MINUTES = int(os.getenv("DST_LOOKBACK_MINUTES", "60"))
+# Read INSIDE the task, never here. The dag-processor re-executes this module's
+# top level every ~30 seconds, long before any Airflow Variable has been
+# applied, so a value supplied via dst_config could never reach a module-level
+# read — it would silently keep this default forever.
+DEFAULT_LOOKBACK_MINUTES = "60"
 
 
 @dag(
@@ -76,31 +81,37 @@ def dst_campaign_scheduler():
         """
         from pipeline import config
 
-        use_mdms = mdms_enabled()
-        with group_environment(group):
-            if use_mdms:
-                from pipeline.mdms import get_active_rows_from_mdms
-                try:
-                    rows = get_active_rows_from_mdms(group)
-                except Exception as e:
-                    log.warning(f"[{group['name']}] MDMS unreachable — falling "
-                                f"back to the sheet for this tick: {e}")
+        # dst_config wraps the WHOLE body: mdms_enabled() is read outside the
+        # per-group context and would otherwise never see Variable-supplied
+        # configuration.
+        with dst_config.apply():
+            lookback = int(os.getenv("DST_LOOKBACK_MINUTES",
+                                     DEFAULT_LOOKBACK_MINUTES))
+            use_mdms = mdms_enabled()
+            with group_environment(group):
+                if use_mdms:
+                    from pipeline.mdms import get_active_rows_from_mdms
+                    try:
+                        rows = get_active_rows_from_mdms(group)
+                    except Exception as e:
+                        log.warning(f"[{group['name']}] MDMS unreachable — falling "
+                                    f"back to the sheet for this tick: {e}")
+                        rows = config.get_active_rows()
+                else:
                     rows = config.get_active_rows()
-            else:
-                rows = config.get_active_rows()
-            # sheet mode: retime guard reads today's Run Log rows (one sheet
-            # read per tick). mdms mode: no guard — zero sheet/DB access on
-            # the scheduling path; run-id dedup still prevents duplicates.
-            guard = None if use_mdms else build_retime_guard()
+                # sheet mode: retime guard reads today's Run Log rows (one sheet
+                # read per tick). mdms mode: no guard — zero sheet/DB access on
+                # the scheduling path; run-id dedup still prevents duplicates.
+                guard = None if use_mdms else build_retime_guard()
 
-        now = datetime.now(timezone.utc)
-        due = find_due_slots(group, rows, now, LOOKBACK_MINUTES,
-                             has_report_since=guard)
-        log.info(f"[{group['name']}] {len(rows)} rows -> {len(due)} due slot(s) "
-                 f"in the last {LOOKBACK_MINUTES} min")
-        for item in due:
-            log.info(f"  due: {item['trigger_run_id']}")
-        return due
+            now = datetime.now(timezone.utc)
+            due = find_due_slots(group, rows, now, lookback,
+                                 has_report_since=guard)
+            log.info(f"[{group['name']}] {len(rows)} rows -> {len(due)} due slot(s) "
+                     f"in the last {lookback} min")
+            for item in due:
+                log.info(f"  due: {item['trigger_run_id']}")
+            return due
 
     @task
     def collect_due_campaigns(per_group_due):

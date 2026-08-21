@@ -8,6 +8,7 @@ No OAuth token required. Grant the service account Editor access to:
 """
 import logging
 import os
+import time
 
 import requests
 from google.oauth2.service_account import Credentials
@@ -150,13 +151,50 @@ def _slack_post(channel, text, token):
 
 # ── shared helper (called by report.py for raw Excel uploads) ──────────────────
 
+# Google's resumable-upload endpoint returns a bare 500 "Internal Error"
+# unpredictably, and in practice it hits the FIRST upload of a run. Because the
+# performance Excel is always uploaded first, it was the file that never arrived:
+# every run on 2026-08-21 logged
+#   upload_file failed (non-fatal): <HttpError 500 ... uploadType=resumable>
+# for performance_dayN.xlsx while the CDD workbook, the Word report and the chart
+# all uploaded fine seconds later. The run reported SUCCESS with the pipeline's
+# primary artifact missing from Drive.
+_UPLOAD_ATTEMPTS = 3
+
+# Titles of artifacts that did NOT reach Drive this run. campaign_runner clears
+# this before a run and reads it after, so a silently missing deliverable becomes
+# a "degraded" outcome that alerts, instead of a green run with nothing to open.
+FAILED_UPLOADS = []
+
+
 def upload_file(path, title, folder_id=None):
-    """Upload any file to Drive. Returns shareable link or empty string on failure."""
-    try:
-        return _upload_to_drive(path, title, folder_id=folder_id)
-    except Exception as e:
-        log.warning(f"[notify] upload_file failed (non-fatal): {e}")
-        return ""
+    """Upload any file to Drive. Returns the shareable link, or "" on failure.
+
+    Retries: Drive 5xx on resumable upload is transient and usually succeeds on
+    the next attempt. Still non-fatal after all attempts — a report that reached
+    Slack is better than no report — but the caller can now tell the difference,
+    and report.py marks the run degraded when a PRIMARY artifact is lost.
+    """
+    last = None
+    for attempt in range(1, _UPLOAD_ATTEMPTS + 1):
+        try:
+            return _upload_to_drive(path, title, folder_id=folder_id)
+        except Exception as e:                                    # noqa: BLE001
+            last = e
+            status = getattr(getattr(e, "resp", None), "status", None)
+            transient = status is None or int(status) >= 500 or int(status) == 429
+            if not transient:
+                log.error(f"[notify] upload of {title!r} rejected by Drive "
+                          f"(status {status}, a retry cannot help): {e}")
+                return ""
+            if attempt < _UPLOAD_ATTEMPTS:
+                log.warning(f"[notify] upload of {title!r} failed (attempt "
+                            f"{attempt}/{_UPLOAD_ATTEMPTS}), retrying: {e}")
+                time.sleep(2 * attempt)
+    log.error(f"[notify] upload of {title!r} FAILED after {_UPLOAD_ATTEMPTS} "
+              f"attempts — this artifact is NOT on Drive: {last}")
+    FAILED_UPLOADS.append(str(title))
+    return ""
 
 
 # ── campaign temp files (checkpoints) ──────────────────────────────────────────
