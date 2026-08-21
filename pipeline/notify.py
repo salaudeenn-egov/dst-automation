@@ -295,7 +295,13 @@ def run(cfg, docx_path, slack_text, partner_docx_path=None, mode="both"):
         try:
             from datetime import datetime as _dt
             title      = f"{cfg['state_name']} Day {cfg['DAY']} Report — {cfg['DATE_LABEL']} {_dt.now().strftime('%H:%M')}"
-            drive_link = _upload_to_drive(docx_path, title, folder_id=fid)
+            # upload_file (not _upload_to_drive): retries, and records a loss in
+            # FAILED_UPLOADS so the run is marked degraded and alerts. The Word
+            # report is THE deliverable — losing it silently is the worst case.
+            drive_link = upload_file(docx_path, title, folder_id=fid)
+            if not drive_link:
+                log.error("[notify] the Word REPORT is not on Drive — the Slack "
+                          "post will go out without a working link")
         except Exception as e:
             log.warning(f"[notify] Drive upload failed (non-fatal): {e}")
 
@@ -328,7 +334,11 @@ def run(cfg, docx_path, slack_text, partner_docx_path=None, mode="both"):
             from datetime import datetime as _dt2
             partner_title = (f"{cfg['state_name']} Day {cfg['DAY']} Report — "
                              f"{cfg['DATE_LABEL']} {_dt2.now().strftime('%H:%M')}")
-            partner_link = _upload_to_drive(partner_docx_path, partner_title, folder_id=fid)
+            partner_link = upload_file(partner_docx_path, partner_title,
+                                       folder_id=fid)
+            if not partner_link:
+                log.error("[notify] the PARTNER report is not on Drive — the "
+                          "partner post will go out without a working link")
         except Exception as e:
             log.warning(f"[notify] Partner Drive upload failed (non-fatal): {e}")
 
