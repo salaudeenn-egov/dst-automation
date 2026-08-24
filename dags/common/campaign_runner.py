@@ -148,6 +148,19 @@ def _run_stage(stage_name, fn, marker):
         raise
 
 
+
+def _name_registry_modules(analyze_mod):
+    """Every module whose NAME_BATCH_FAILURES this run can write to.
+
+    Always includes pipeline.analyze, because the ITN path calls ITS name helpers.
+    """
+    from pipeline import analyze as base_analyze
+    mods = [base_analyze]
+    if (analyze_mod is not base_analyze
+            and hasattr(analyze_mod, "NAME_BATCH_FAILURES")):
+        mods.append(analyze_mod)
+    return mods
+
 def execute_campaign(row, mode="both"):
     """Run analyze -> cdd_sync -> report -> notify for one campaign row.
 
@@ -170,11 +183,19 @@ def execute_campaign(row, mode="both"):
                 "reason": f"outside campaign window "
                           f"({cfg['campaign_start']} to {cfg['campaign_end']})"}
 
-    # Reset before the run: this list is how notify reports artifacts that never
-    # reached Drive (see notify.FAILED_UPLOADS).
-    notify.FAILED_UPLOADS.clear()
-
     analyze_mod, cdd_sync_mod, report_mod = select_pipeline_modules(cfg["drug_type"])
+
+    # Reset before the run: these lists are how the pipeline reports partial
+    # failures it deliberately survives — artifacts that never reached Drive
+    # (notify.FAILED_UPLOADS) and name-resolution batches that failed
+    # (analyze*.NAME_BATCH_FAILURES). Both would otherwise pass silently.
+    notify.FAILED_UPLOADS.clear()
+    # The registry lives in pipeline.analyze, and analyze_itn IMPORTS the two name
+    # helpers from there (analyze_itn.py:90) rather than owning copies — so an ITN
+    # run records its failures into pipeline.analyze's list, not analyze_itn's.
+    # Reading only analyze_mod would make this check dead for every ITN campaign.
+    for _mod in _name_registry_modules(analyze_mod):
+        _mod.NAME_BATCH_FAILURES.clear()
     marker = {"ok": True, "tenant": cfg["tenant"], "state": state,
               "mode": mode, "day": cfg["DAY"], "stages": {},
               "drive_link": "", "drive_folder_url": ""}
@@ -186,6 +207,19 @@ def execute_campaign(row, mode="both"):
         log.info(f"[runner] {state} Day {cfg['DAY']}/{cfg['campaign_days']} mode={mode}")
     try:
         _run_stage("analyze", lambda: analyze_mod.run(cfg), marker)
+
+        # A failed name batch is not a crash — the report still builds — but the
+        # missing-name DQ columns then overstate a data problem that is really a
+        # partial fetch. Say so, rather than reporting a clean run.
+        lost = [f for _mod in _name_registry_modules(analyze_mod)
+                for f in _mod.NAME_BATCH_FAILURES]
+        if lost:
+            marker["stages"]["analyze"] = (
+                f"degraded: {len(lost)} name-resolution batch(es) FAILED, so the "
+                f"missing-name data-quality columns overstate the real gap "
+                f"({'; '.join(lost[:2])})")
+            log.error(f"[runner] {len(lost)} name batch(es) failed — DQ columns "
+                      f"are not trustworthy for this run")
 
         try:
             produced = cdd_sync_mod.run(cfg)

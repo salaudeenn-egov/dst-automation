@@ -62,7 +62,7 @@ def generate_narrative(prompt, max_tokens=300):
         except requests.RequestException as e:
             last = e
             if attempt == 2:
-                log.error(f"Groq unreachable after 3 attempts: {e}")
+                log.error(f"Groq unreachable after 3 attempts: {e}", exc_info=True)
                 return "[Narrative not generated — LLM error]"
             log.warning(f"Groq request failed (attempt {attempt + 1}/3): {e}")
             time.sleep(2 * (attempt + 1))

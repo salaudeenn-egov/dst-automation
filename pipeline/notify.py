@@ -185,7 +185,7 @@ def upload_file(path, title, folder_id=None):
             transient = status is None or int(status) >= 500 or int(status) == 429
             if not transient:
                 log.error(f"[notify] upload of {title!r} rejected by Drive "
-                          f"(status {status}, a retry cannot help): {e}")
+                          f"(status {status}, a retry cannot help): {e}", exc_info=True)
                 return ""
             if attempt < _UPLOAD_ATTEMPTS:
                 log.warning(f"[notify] upload of {title!r} failed (attempt "
@@ -321,7 +321,7 @@ def run(cfg, docx_path, slack_text, partner_docx_path=None, mode="both"):
             _slack_post(channel, message, token)
             log.info(f"[notify] Slack post done -> {channel}")
         except Exception as e:
-            log.error(f"[notify] Slack failed (non-fatal): {e}")
+            log.error(f"[notify] Slack failed (non-fatal): {e}", exc_info=True)
     elif token and do_internal:
         log.warning("[notify] slack_channel not set — skipping main post (partner post still runs)")
 

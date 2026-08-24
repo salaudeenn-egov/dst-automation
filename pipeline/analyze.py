@@ -20,6 +20,23 @@ from pipeline.core.excel import (
 
 log = logging.getLogger(__name__)
 
+# Name resolution runs in parallel batches against the individual, project-
+# beneficiary and household-member indices. A failed batch used to be logged at
+# WARNING and discarded: the run then reported SUCCESS while some children had no
+# resolved name, so the "Missing Child Name" and "Missing HH Name" DQ columns
+# silently overstated a data problem that was really a partial fetch failure.
+# That is the shape of the 2026-07-02 bug where Missing HH Name read 103%.
+#
+# campaign_runner clears this before a run and inspects it after the analyze
+# stage, so a partial fetch marks the run degraded instead of passing quietly.
+NAME_BATCH_FAILURES = []
+
+
+def _record_batch_failure(kind, exc):
+    NAME_BATCH_FAILURES.append(f"{kind}: {type(exc).__name__}: {exc}")
+    log.error(f"  {kind} batch FAILED — names from this batch will be missing, "
+              f"which INFLATES the missing-name DQ columns: {exc}", exc_info=True)
+
 _BATCH = 5000
 _WORKERS = 8
 
@@ -90,7 +107,7 @@ def _fetch_individual_names(cfg, ind_ids):
             try:
                 name_map.update(f.result())
             except Exception as e:
-                log.warning(f"  individual batch error: {e}")
+                _record_batch_failure("individual", e)
     log.info(f"  individual lookup: {len(name_map):,} names resolved")
     return name_map
 
@@ -133,7 +150,7 @@ def _map_beneficiary_refs_to_individual_ids(cfg, pb_refs):
             try:
                 out.update(f.result())
             except Exception as e:
-                log.warning(f"  PB batch error: {e}")
+                _record_batch_failure("PB", e)
     log.info(f"  PB->individual: {len(out):,} beneficiaries resolved")
     return out
 
@@ -181,7 +198,7 @@ def _map_individual_ids_to_household_ids(cfg, ind_ids):
             try:
                 member_map.update(f.result())
             except Exception as e:
-                log.warning(f"  HH member batch error: {e}")
+                _record_batch_failure("HH member", e)
     log.info(f"  HH member map: {len(member_map):,} memberships resolved")
     return member_map
 
@@ -231,7 +248,7 @@ def _map_household_ids_to_head_ids(cfg, hh_clref_ids):
             try:
                 head_map.update(f.result())
             except Exception as e:
-                log.warning(f"  HH head batch error: {e}")
+                _record_batch_failure("HH head", e)
     log.info(f"  HH head map: {len(head_map):,} heads resolved")
     return head_map
 
@@ -247,7 +264,9 @@ def _read_target_sheet_url(url):
 
     m = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", url)
     if not m:
-        log.warning(f"Could not parse sheet ID from target book URL: {url}")
+        log.error(f"Could not parse sheet ID from target book URL: "
+                  f"{url} — TARGETS WILL BE ZERO and every coverage "
+                  f"figure meaningless")
         return None
     sheet_id = m.group(1)
     gid_m = re.search(r"[#&]gid=(\d+)", url)
@@ -272,7 +291,8 @@ def _load_targets(cfg):
     from pipeline.core.drive import resolve_target_book
     csv_path = resolve_target_book(cfg)
     if not csv_path:
-        log.warning("no target book configured — all targets = 0")
+        log.error("no target book configured — all targets = 0, so "
+                  "every coverage figure in this report will be 0% and meaningless — the report should not be shared until the target book is fixed")
         return {}
 
     if csv_path.startswith("https://docs.google.com/spreadsheets/"):
@@ -280,7 +300,8 @@ def _load_targets(cfg):
         if df is None:
             return {}
     elif not os.path.exists(csv_path):
-        log.warning(f"target book not found: {csv_path} — all targets = 0")
+        log.error(f"target book not found: {csv_path} — all targets = 0, so "
+                  f"every coverage figure in this report will be 0% and meaningless — the report should not be shared until the target book is fixed")
         return {}
     else:
         df = pd.read_csv(csv_path)

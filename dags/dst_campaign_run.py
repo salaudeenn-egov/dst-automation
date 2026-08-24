@@ -119,7 +119,7 @@ def dst_campaign_run():
             try:
                 use_mdms = mdms_enabled()
             except ValueError as e:
-                log.error(f"[finalize] {e} — recording to the Run Log tab instead")
+                log.error(f"[finalize] {e} — recording to the Run Log tab instead", exc_info=True)
                 use_mdms = False
 
             result = record_outcome(conf, dag_run.run_id, marker,

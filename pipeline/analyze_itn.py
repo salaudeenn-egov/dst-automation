@@ -663,7 +663,8 @@ def _load_targets_itn(cfg):
     from pipeline.core.drive import resolve_target_book
     csv_path = resolve_target_book(cfg)
     if not csv_path:
-        log.warning("[analyze_itn] no target book configured — all targets = 0")
+        log.error("[analyze_itn] no target book configured — all targets = 0, "
+                  "so every coverage figure in this report will be 0% and meaningless — the report should not be shared until the target book is fixed")
         return {}
     if csv_path.startswith("https://docs.google.com/spreadsheets/"):
         # same Sheets-URL form analyze.py accepts; without this the URL fails
@@ -671,10 +672,14 @@ def _load_targets_itn(cfg):
         from pipeline.analyze import _read_target_sheet_url
         df = _read_target_sheet_url(csv_path)
         if df is None:
-            log.warning(f"[analyze_itn] could not read target sheet {csv_path} — all targets = 0")
+            log.error(f"[analyze_itn] could not read target sheet {csv_path} — ALL "
+                      f"TARGETS = 0, so every coverage figure in this report is "
+                      f"meaningless. Check target_file and DST_TARGET_FOLDER_ID")
             return {}
     elif not os.path.exists(csv_path):
-        log.warning(f"[analyze_itn] target book not found: {csv_path} — all targets = 0")
+        log.error(f"[analyze_itn] target book not found: {csv_path} — all targets "
+                  f"= 0, so every coverage figure in this report is meaningless "
+                  f"— the report should not be shared until it is fixed")
         return {}
     else:
         df = pd.read_csv(csv_path)

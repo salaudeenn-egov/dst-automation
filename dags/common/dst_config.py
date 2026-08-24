@@ -107,7 +107,7 @@ def load(refresh=False):
         parsed = json.loads(raw)
     except ValueError as e:
         log.error(f"Variable '{VARIABLE_NAME}' is not valid JSON — falling back "
-                  f"to dst_groups/process env: {e}")
+                  f"to dst_groups/process env: {e}", exc_info=True)
         _cache = None
         return None
     if not isinstance(parsed, dict):
@@ -182,7 +182,7 @@ def _write_credentials_file(payload):
             payload = json.loads(payload)
         except ValueError:
             log.error("[dst_config] google_credentials_json is a string but not "
-                      "valid JSON — ignoring it")
+                      "valid JSON — ignoring it", exc_info=True)
             return None
     if not isinstance(payload, dict) or not payload.get("private_key"):
         log.error("[dst_config] google_credentials_json is not a service "
