@@ -94,7 +94,8 @@ def find_due_slots(group, rows, now_utc, lookback_minutes, has_report_since=None
     still fires on the first tick after recovery, as long as it is within the
     window. Two guards prevent over-firing:
       - the deterministic trigger_run_id (same slot never fires twice), and
-      - has_report_since(tenant, mode, slot_dt) -> bool, the retime guard: a
+      - has_report_since(tenant, mode, slot_dt, state, campaign_number,
+        cycle_index) -> bool, the retime guard: a
         past-due slot is skipped when the same campaign already produced a
         report at or after that slot's time (e.g. report_times edited from
         05:30 back to 04:50 after the 05:30 run went out).
@@ -130,7 +131,10 @@ def find_due_slots(group, rows, now_utc, lookback_minutes, has_report_since=None
                         continue
                 elif not campaign_window_contains(row, slot_dt.date()):
                     continue
-                if has_report_since and has_report_since(tenant, mode, slot_dt, state):
+                if has_report_since and has_report_since(
+                        tenant, mode, slot_dt, state,
+                        campaign_number=str(row.get("campaign_number", "") or ""),
+                        cycle_index=str(row.get("cycle_index", "") or "")):
                     continue
                 slot_date = slot_dt.date().isoformat()
                 due.append({

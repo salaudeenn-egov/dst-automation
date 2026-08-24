@@ -134,6 +134,13 @@ def fetch_today_runs():
                 # the scheduled slot; legacy rows only recorded the write time
                 "slot_time": cell(row, "Slot Time") or str(stamp)[11:16],
                 "mode": cell(row, "Mode") or "both",
+                # append_run_log has always WRITTEN these two, but nothing read
+                # them back - so the retime guard matched on tenant alone and a
+                # Bauchi SMC success suppressed the Bauchi ITN slot. Legacy rows
+                # have neither, and an empty value must match anything so those
+                # rows keep working.
+                "campaign": cell(row, "Campaign"),
+                "cycle": cell(row, "Cycle"),
             })
         return runs
     except Exception as e:

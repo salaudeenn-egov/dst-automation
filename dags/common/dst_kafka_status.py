@@ -96,9 +96,15 @@ def push_run_event(status, conf, dag_run_id, step_failed="",
     }
     topic = _topic_for(tenant_id)
     try:
-        producer.send(topic, value=event)
-        producer.flush(timeout=10)
-        log.info(f"[kafka] pushed {status} for {tenant_id} -> {topic}")
+        # .get() on the future, NOT just flush(): flush() raises only on
+        # timeout, while per-record failures (unknown topic with auto-create
+        # disabled, authorization, record-too-large) are delivered to the
+        # future. Without this, a rejected event returned True, record_outcome
+        # set recorded="kafka" and SKIPPED the Run Log fallback - so the audit
+        # trail was silently discarded and dst_report_metadata stayed empty.
+        meta = producer.send(topic, value=event).get(timeout=10)
+        log.info(f"[kafka] pushed {status} for {tenant_id} -> {topic} "
+                 f"(partition {meta.partition}, offset {meta.offset})")
         return True
     except Exception:
         log.exception(f"[kafka] failed to push {status} to {topic} (non-fatal)")

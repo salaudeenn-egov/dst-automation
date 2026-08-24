@@ -135,18 +135,73 @@ def _upload_to_drive(file_path, title, folder_id=None):
 
 # ── Slack ──────────────────────────────────────────────────────────────────────
 
+# Channels this run failed to post to. The Slack post IS the deliverable, so a
+# lost post used to be the quietest possible failure: report on Drive, Run Log
+# SUCCESS, empty Error column, nobody told. campaign_runner clears this before a
+# run and reads it after, exactly as it does FAILED_UPLOADS.
+FAILED_POSTS = []
+
+_POST_ATTEMPTS = 3
+
+# Slack errors that a retry cannot fix - the message will never be accepted, so
+# retrying only delays the alert.
+_PERMANENT_SLACK = {"channel_not_found", "not_in_channel", "invalid_auth",
+                    "account_inactive", "token_revoked", "is_archived",
+                    "msg_too_long", "no_text"}
+
+
+class PermanentSlackError(RuntimeError):
+    """Slack will never accept this message - retrying only delays the alert."""
+
+
 def _slack_post(channel, text, token):
-    r = requests.post(
-        "https://slack.com/api/chat.postMessage",
-        headers={"Authorization": f"Bearer {token}"},
-        json={"channel": channel, "text": text},
-        timeout=30,
-    )
-    r.raise_for_status()
-    resp = r.json()
-    if not resp.get("ok"):
-        raise RuntimeError(f"Slack postMessage failed: {resp.get('error')}")
-    return resp
+    """Post to Slack, retrying transient failures.
+
+    Rate limiting is expected here, not exceptional: at 17:00 every campaign in
+    the fleet posts within the same minute, so a 429 is normal load.
+
+    Raises on final failure. The Slack post IS the deliverable, so the caller
+    must not treat a lost post as a successful run - see FAILED_POSTS.
+    """
+    last = None
+    for attempt in range(1, _POST_ATTEMPTS + 1):
+        try:
+            r = requests.post(
+                "https://slack.com/api/chat.postMessage",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"channel": channel, "text": text},
+                timeout=30,
+            )
+            if r.status_code == 429:
+                raise RuntimeError("rate limited by Slack (429), Retry-After="
+                                   f"{r.headers.get('Retry-After', '?')}s")
+            r.raise_for_status()
+            resp = r.json()
+            if resp.get("ok"):
+                return resp
+            err = resp.get("error")
+            if err in _PERMANENT_SLACK:
+                raise PermanentSlackError(
+                    f"Slack rejected the post to {channel}: {err}. A retry "
+                    f"cannot help - fix the channel id, the bot's membership, "
+                    f"or SLACK_TOKEN.")
+            raise RuntimeError(f"Slack postMessage failed: {err}")
+        except PermanentSlackError as e:
+            log.error(f"[notify] {e} The report was NOT delivered to {channel}.")
+            FAILED_POSTS.append(f"{channel} (rejected by Slack)")
+            raise
+        except Exception as e:                                    # noqa: BLE001
+            last = e
+            if attempt < _POST_ATTEMPTS:
+                log.warning(f"[notify] Slack post to {channel} failed (attempt "
+                            f"{attempt}/{_POST_ATTEMPTS}), retrying: {e}")
+                time.sleep(2 * attempt)
+    log.error(f"[notify] Slack post to {channel} FAILED after {_POST_ATTEMPTS} "
+              f"attempts - the report was NOT delivered to this channel: {last}",
+              exc_info=True)
+    FAILED_POSTS.append(str(channel))
+    raise RuntimeError(f"Slack post to {channel} failed after "
+                       f"{_POST_ATTEMPTS} attempts: {last}")
 
 
 # ── shared helper (called by report.py for raw Excel uploads) ──────────────────
@@ -323,7 +378,11 @@ def run(cfg, docx_path, slack_text, partner_docx_path=None, mode="both"):
         except Exception as e:
             log.error(f"[notify] Slack failed (non-fatal): {e}", exc_info=True)
     elif token and do_internal:
-        log.warning("[notify] slack_channel not set — skipping main post (partner post still runs)")
+        log.error("[notify] slack_channel is not set on the sheet row, so the "
+                  "internal report was NOT posted anywhere. The partner post "
+                  "still runs.")
+        if mode == "internal":
+            FAILED_POSTS.append("internal (slack_channel not set)")
 
     # Partner channel — report without DQ sections (if configured)
     partner_channel = cfg.get("slack_channel_partners", "")
@@ -350,6 +409,23 @@ def run(cfg, docx_path, slack_text, partner_docx_path=None, mode="both"):
             log.info(f"[notify] Partner Slack post done -> {partner_channel}")
         except Exception as e:
             log.warning(f"[notify] Partner channel post failed (non-fatal): {e}")
+
+    elif token and do_partner:
+        # Previously this branch did not exist: a partner slot whose report file
+        # was never written, or whose channel cell is blank, silently did nothing
+        # and the run was recorded SUCCESS.
+        if not partner_channel:
+            reason = ("slack_channel_partners is not set on the sheet row")
+        elif not partner_docx_path:
+            reason = ("the report stage produced no partner document "
+                      "(partner_report_times may be set without a partner "
+                      "report being generated)")
+        else:
+            reason = f"the partner document is missing from disk: {partner_docx_path}"
+        log.error(f"[notify] the PARTNER report was NOT posted - {reason}")
+        if mode == "partner":
+            # This slot exists only to serve partners, so nothing was delivered.
+            FAILED_POSTS.append(f"partner ({reason})")
 
     upload_chart(cfg)
     upload_checkpoints(cfg)

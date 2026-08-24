@@ -124,20 +124,30 @@ def select_pipeline_modules(drug_type):
 
 
 def _run_stage(stage_name, fn, marker):
+    """Run one stage with the error classification the DAG relies on.
+
+    marker may be None for stages that run BEFORE it can be built - config
+    parsing needs cfg["tenant"] to exist, and cfg is what config parsing
+    produces. The classification is the point; the bookkeeping is optional.
+    """
+    def _mark(outcome):
+        if marker is not None:
+            marker["stages"][stage_name] = outcome
+
     try:
         result = fn()
-        marker["stages"][stage_name] = "ok"
+        _mark("ok")
         return result
     except TRANSIENT_ERRORS as e:
-        marker["stages"][stage_name] = f"failed: {e}"
+        _mark(f"failed: {e}")
         raise
     except DATA_ERRORS as e:
-        marker["stages"][stage_name] = f"failed: {e}"
+        _mark(f"failed: {e}")
         raise AirflowFailException(
             f"{stage_name} failed on malformed data/config — retry would fail "
             f"identically: {type(e).__name__}: {e}") from e
     except Exception as e:
-        marker["stages"][stage_name] = f"failed: {e}"
+        _mark(f"failed: {e}")
         # Ordering matters: DATA_ERRORS above must win first. Only what is left
         # over gets the HTTP-status test, so a 404/401/403 fails fast while every
         # other network fault stays retryable.
@@ -147,6 +157,23 @@ def _run_stage(stage_name, fn, marker):
                 f"(wrong index name, tenant prefix, or credentials): {e}") from e
         raise
 
+
+
+
+def _degrade(marker, stage, reason):
+    """Record a degradation reason without discarding an earlier one.
+
+    Both the failed-narrative and the failed-upload paths assigned
+    marker["stages"]["report"] directly, so whichever ran second erased the
+    other. Naming only one of two real problems is worse than naming none: the
+    REPORT INCOMPLETE alert told the reader to check Drive links and never
+    mentioned that the body sent to partners was a placeholder.
+    """
+    existing = marker["stages"].get(stage, "")
+    if str(existing).startswith("degraded"):
+        marker["stages"][stage] = f"{existing}  ALSO: {reason}"
+    else:
+        marker["stages"][stage] = f"degraded: {reason}"
 
 
 def _name_registry_modules(analyze_mod):
@@ -170,14 +197,26 @@ def execute_campaign(row, mode="both"):
     """
     from pipeline import config, notify
 
-    cfg = config.build(row)
+    # Cleared BEFORE build, because build is what populates it. Clearing later
+    # (alongside the other registries) silently discarded every correction.
+    config.CONFIG_CORRECTIONS.clear()
+    # Inside _run_stage so a bad sheet cell is classified as a DATA error and
+    # fails IMMEDIATELY. config._validate_row's docstring already promised this
+    # ("the task fails immediately with no retries"), but build() was called
+    # outside the wrapper, so a ValueError propagated as an ordinary failure and
+    # got retries=2 with a 3-minute delay - the sheet-fix alert arrived six
+    # minutes and three identical, ES-free failures later.
+    cfg = _run_stage("config", lambda: config.build(row), None)
     state = cfg["state_name"]
     is_cumulative = mode == CUMULATIVE_MODE
 
     if not cfg["active"]:
         return {"ok": None, "reason": "row inactive"}
     if is_cumulative:
-        apply_cumulative(cfg)
+        # Classified for the same reason as config.build: apply_cumulative's
+        # "mop-up end before campaign_start" check raises ValueError, which is a
+        # sheet error - retrying it twice only delays the alert.
+        _run_stage("cumulative_window", lambda: apply_cumulative(cfg), None)
     elif not cfg["in_campaign_window"]:
         return {"ok": None,
                 "reason": f"outside campaign window "
@@ -190,6 +229,13 @@ def execute_campaign(row, mode="both"):
     # (notify.FAILED_UPLOADS) and name-resolution batches that failed
     # (analyze*.NAME_BATCH_FAILURES). Both would otherwise pass silently.
     notify.FAILED_UPLOADS.clear()
+    notify.FAILED_POSTS.clear()
+    from pipeline import analyze as _base_analyze
+    _base_analyze.RUN_DEGRADATIONS.clear()
+    try:
+        report_mod.TRAJECTORY_FAILURES.clear()
+    except AttributeError:
+        pass          # report_itn has no ES trajectory back-fill
     # The registry lives in pipeline.analyze, and analyze_itn IMPORTS the two name
     # helpers from there (analyze_itn.py:90) rather than owning copies — so an ITN
     # run records its failures into pipeline.analyze's list, not analyze_itn's.
@@ -214,12 +260,20 @@ def execute_campaign(row, mode="both"):
         lost = [f for _mod in _name_registry_modules(analyze_mod)
                 for f in _mod.NAME_BATCH_FAILURES]
         if lost:
-            marker["stages"]["analyze"] = (
-                f"degraded: {len(lost)} name-resolution batch(es) FAILED, so the "
-                f"missing-name data-quality columns overstate the real gap "
-                f"({'; '.join(lost[:2])})")
+            _degrade(marker, "analyze",
+                     f"{len(lost)} name-resolution batch(es) FAILED, so the "
+                     f"missing-name data-quality columns overstate the real gap "
+                     f"({'; '.join(lost[:2])})")
             log.error(f"[runner] {len(lost)} name batch(es) failed — DQ columns "
                       f"are not trustworthy for this run")
+
+        # Conditions the analyze stage survives but that make its numbers
+        # meaningless: zero task documents matched, or all targets are zero.
+        # Both used to publish a complete, green, plausible report.
+        for reason in _base_analyze.RUN_DEGRADATIONS:
+            _degrade(marker, "analyze", reason)
+        for reason in config.CONFIG_CORRECTIONS:
+            _degrade(marker, "config", reason)
 
         try:
             produced = cdd_sync_mod.run(cfg)
@@ -232,20 +286,20 @@ def execute_campaign(row, mode="both"):
                 # project_type_id is blank or zero CDDs match. Marking that "ok"
                 # made the audit row assert a healthy run while the report said
                 # "CDDs synced: 0 of 0" as though it were measured.
-                marker["stages"]["cdd_sync"] = (
-                    "degraded: CDD sync numbers are MISSING from the report — no "
+                _degrade(marker, "cdd_sync", (
+                    "CDD sync numbers are MISSING from the report — no "
                     "CDD or sync records matched this campaign. Check "
                     "campaign_number / project_type_id in the sheet, that field "
                     "staff are registered for this campaign, and that CDD_ROLE "
-                    "matches this tenant's role name")
+                    "matches this tenant's role name"))
                 log.error("[runner] cdd_sync produced no workbook — sync numbers "
                           "will be absent from the report")
             else:
                 marker["stages"]["cdd_sync"] = "ok"
         except Exception as e:
-            marker["stages"]["cdd_sync"] = (
-                f"degraded: CDD sync numbers are MISSING from the report — the "
-                f"sync step errored: {type(e).__name__}: {e}")
+            _degrade(marker, "cdd_sync",
+                     f"CDD sync numbers are MISSING from the report — the sync "
+                     f"step errored: {type(e).__name__}: {e}")
             log.error(f"[runner] cdd_sync failed (non-fatal — report continues "
                       f"without sync data): {e}", exc_info=True)
 
@@ -256,20 +310,28 @@ def execute_campaign(row, mode="both"):
         # placeholder string is posted to partners as the report body while the
         # run reports success. Surface it so the outcome is recorded and alerted.
         if "[Narrative not generated" in str(slack_text):
-            marker["stages"]["report"] = (
-                "degraded: the report body has NO written summary — it carries the "
+            _degrade(marker, "report", (
+                "the report body has NO written summary — it carries the "
                 "placeholder '[Narrative not generated]' because Groq failed after "
                 "3 attempts. Check GROQ_API_KEY and GROQ_MODEL (a decommissioned "
-                "model returns 404) before sharing this with partners")
+                "model returns 404) before sharing this with partners"))
             log.error("[runner] narrative generation failed — the report body "
                       "carries a placeholder")
 
         if notify.FAILED_UPLOADS:
             lost = ", ".join(sorted(set(notify.FAILED_UPLOADS)))
-            marker["stages"]["report"] = (
-                f"degraded: these files are NOT on Google Drive after 3 upload "
-                f"attempts, so links to them will not work: {lost}")
+            _degrade(marker, "report",
+                     f"these files are NOT on Google Drive after 3 upload "
+                     f"attempts, so links to them will not work: {lost}")
             log.error(f"[runner] these artifacts never reached Drive: {lost}")
+
+        missed_days = list(getattr(report_mod, "TRAJECTORY_FAILURES", []))
+        if missed_days:
+            _degrade(marker, "report",
+                     f"{len(missed_days)} campaign day(s) could not be read from "
+                     f"Elasticsearch and were counted as ZERO, so the cumulative "
+                     f"total in the report and the Slack post is UNDERSTATED "
+                     f"({'; '.join(missed_days[:3])})")
 
         drive_link = _run_stage(
             "notify",
@@ -278,6 +340,18 @@ def execute_campaign(row, mode="both"):
                                mode="both" if is_cumulative else mode),
             marker)
         marker["drive_link"] = drive_link or ""
+
+        # The Slack post IS the deliverable. A lost post was previously the
+        # quietest failure in the system: report on Drive, run SUCCESS, empty
+        # Error column, and nobody received anything.
+        if notify.FAILED_POSTS:
+            undelivered = ", ".join(sorted(set(notify.FAILED_POSTS)))
+            _degrade(marker, "notify",
+                     f"the report was NOT DELIVERED to: {undelivered}. The "
+                     f"document is on Drive but no one was notified — send the "
+                     f"link manually, then fix the channel id or the bot's "
+                     f"membership of that channel")
+            log.error(f"[runner] report not delivered to: {undelivered}")
     finally:
         # The campaign folder holds every artifact this run published, so it is
         # what the audit row points at. cfg caches the id, so this is free.

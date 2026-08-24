@@ -93,6 +93,17 @@ def dst_campaign_scheduler():
                     from pipeline.mdms import get_active_rows_from_mdms
                     try:
                         rows = get_active_rows_from_mdms(group)
+                    except ValueError as e:
+                        # A CONFIGURATION error, not an outage. mdms.py raises
+                        # ValueError for "DST_MDMS_ENABLED=true but MDMS_URL is
+                        # not set", and catching it as an outage put the
+                        # deployment in a permanent hybrid state: every tick
+                        # logged one warning and quietly read the sheet, the
+                        # sync DAG no-opped, history fell back to the sheet, and
+                        # the deployment still reported itself as MDMS mode.
+                        # mdms_enabled() refuses to guess for exactly this
+                        # reason; swallowing the error here defeated that.
+                        raise
                     except Exception as e:
                         log.warning(f"[{group['name']}] MDMS unreachable — falling "
                                     f"back to the sheet for this tick: {e}")
@@ -121,7 +132,23 @@ def dst_campaign_scheduler():
     due_per_group = find_due_campaigns.expand(group=groups)
     all_due = collect_due_campaigns(due_per_group)
 
-    TriggerDagRunOperator.partial(
+    # `conf` is a TEMPLATE FIELD on TriggerDagRunOperator, and Airflow renders
+    # template fields recursively through nested dicts - so every Google Sheet
+    # cell reaching conf was evaluated as a Jinja template. Two consequences,
+    # both live: a campaign name containing "{{" raised UndefinedError and killed
+    # the mapped trigger task with a traceback naming no campaign; and a cell
+    # containing "{{ var.value.dst_config }}" rendered the whole Variable -
+    # including secrets and the service-account private key - into dag_run.conf,
+    # which is persisted in RenderedTaskInstanceFields and shown in the UI.
+    # Sheet-edit access must not confer secret-read access.
+    #
+    # render_template_as_native_obj does not help. Emptying template_fields does:
+    # nothing in conf is meant to be templated - it is data, not a template.
+    class _UntemplatedTriggerDagRunOperator(TriggerDagRunOperator):
+        """TriggerDagRunOperator that treats conf as DATA, never as a template."""
+        template_fields = ()
+
+    _UntemplatedTriggerDagRunOperator.partial(
         task_id="trigger_campaign_run",
         trigger_dag_id="dst_campaign_run",
         skip_when_already_exists=True,

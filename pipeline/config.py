@@ -118,12 +118,30 @@ def _pad_cycle(val):
 
 
 # ── in-code feature defaults ───────────────────────────────────────────────────
-# ITN duplicate-distribution matrix (analyze_itn._classify_duplicates): the
-# code-side switch, so no Google Sheet column is needed. Flip to "TRUE" to
-# enable it for every ITN/LLIN row this deployment runs; SMC/AZM rows never
-# read it. A dup_matrix column on the sheet, if one is ever added, overrides
-# this per row (TRUE/FALSE cell beats the default; empty cell falls back here).
-DUP_MATRIX_DEFAULT = "FALSE"
+# ITN duplicate-distribution matrix (analyze_itn._classify_duplicates). SMC/AZM
+# rows never read it.
+#
+# Resolution order, most specific first:
+#   1. a dup_matrix cell on the sheet row   (TRUE/FALSE, per campaign)
+#   2. the DST_DUP_MATRIX environment key   (per deployment)
+#   3. DUP_MATRIX_FALLBACK below            (per checkout)
+#
+# Step 2 exists because step 3 alone was unreachable on the deployment that
+# needs it. The KB records DUP_MATRIX=TRUE as a standing Chad ITN divergence,
+# but the hosted Airflow has no env vars, no file mounts and a read-only
+# git-sync checkout - Admin -> Variables is the only writable surface. So the
+# feature could only be switched on by editing this file, which that deployment
+# cannot do. As an env key it is now settable from the dst_config Variable's
+# "env" block, like every other deployment setting.
+#
+# Unset means unchanged: absent DST_DUP_MATRIX and an empty sheet cell resolve
+# to the same FALSE this constant has always held.
+DUP_MATRIX_FALLBACK = "FALSE"
+
+
+def _dup_matrix_default():
+    return (os.getenv("DST_DUP_MATRIX", "").strip() or DUP_MATRIX_FALLBACK)
+
 
 
 def _date_label(d):
@@ -225,6 +243,12 @@ _TRUE_WORDS = ("TRUE", "YES", "1", "Y", "ON")
 _FALSE_WORDS = ("FALSE", "NO", "0", "N", "OFF")
 
 
+# Configuration problems that were CORRECTED rather than rejected. campaign_runner
+# turns each one into a degraded outcome so a human fixes the sheet, while the
+# report still goes out with the right numbers.
+CONFIG_CORRECTIONS = []
+
+
 def _validate_row(row, campaign_start, campaign_end, campaign_days):
     """Reject contradictory config LOUDLY, naming the field and the value.
 
@@ -295,6 +319,7 @@ def _validate_row(row, campaign_start, campaign_end, campaign_days):
             f"nothing.")
 
 
+
 def build(row):
     """
     Build a fully resolved config dict from a Google Sheet row.
@@ -331,6 +356,34 @@ def build(row):
         campaign_days_cfg = int(float(row.get("campaign_days", 4) or 4))
     except (ValueError, TypeError):
         campaign_days_cfg = 4
+
+    # campaign_days is the DIVISOR for the daily target and the clamp on DAY, so
+    # a value disagreeing with the campaign dates is silently destructive: on a
+    # 5-day campaign left at 4, the daily target is inflated, Day 5 is labelled
+    # "Day 4" and overwrites performance_day4.xlsx, and CAMPAIGN_DATES loses a
+    # day so every CDD loses a sync day. analyze_itn already recomputes the real
+    # length from the dates to route around exactly this.
+    #
+    # Deliberately REPORTED, not corrected. Which field is authoritative is a
+    # product decision, not a code one: campaign_end may legitimately extend past
+    # the last treatment day, in which case deriving campaign_days from the span
+    # would inflate the target the opposite way. And rejecting would stop every
+    # report for the campaign until someone edits the sheet. The actual defect
+    # here was SILENCE - a blank cell became 4 with no signal at all.
+    if campaign_start and campaign_end:
+        span = (campaign_end - campaign_start).days + 1
+        if span > 0 and campaign_days_cfg != span:
+            CONFIG_CORRECTIONS.append(
+                f"campaign_days on the sheet is {campaign_days_cfg}, but "
+                f"campaign_start {campaign_start} to campaign_end "
+                f"{campaign_end} is {span} day(s). The sheet value was used, "
+                f"so if it is wrong then the daily target (total/"
+                f"{campaign_days_cfg}) and the day number in this report are "
+                f"wrong. Fix the campaign_days cell, or campaign_end.")
+            log.error(f"[config] campaign_days={campaign_days_cfg} disagrees "
+                      f"with the campaign dates ({span} days). Keeping the sheet "
+                      f"value — but if the cell is wrong, the daily target and "
+                      f"the day number in this report are wrong too")
 
     _validate_row(row, campaign_start, campaign_end, campaign_days_cfg)
     day = (today - campaign_start).days + 1
@@ -444,9 +497,11 @@ def build(row):
         # ITN only: duplicate-distribution matrix (same/different user x same/different
         # day per household). Off keeps every existing number, query, Word section and
         # Slack post unchanged (the performance Excel only gains six empty trailing
-        # columns). Default lives IN CODE (DUP_MATRIX_DEFAULT above — no sheet column
-        # required); a non-empty dup_matrix sheet cell overrides it per row.
-        "dup_matrix": _bool(str(row.get("dup_matrix", "")).strip() or DUP_MATRIX_DEFAULT),
+        # columns). Default resolves via _dup_matrix_default above — no sheet column
+        # required); a non-empty dup_matrix sheet cell overrides it per row, and
+        # DST_DUP_MATRIX overrides the checkout default per deployment.
+        "dup_matrix": _bool(str(row.get("dup_matrix", "")).strip()
+                            or _dup_matrix_default()),
 
         # secondary product(s) counted alongside the primary drug — empty = disabled.
         # Legacy single string (age 3-59) OR a spec list (see _parse_secondary_products).

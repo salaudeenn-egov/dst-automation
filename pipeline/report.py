@@ -226,6 +226,12 @@ def _load_facility_sync_rates(sync_path):
         return []
 
 
+# Days whose ES back-fill failed this run. Each one silently subtracts from the
+# cumulative total the report leads with, so campaign_runner turns a non-empty
+# list into a degraded outcome instead of publishing an understated number.
+TRAJECTORY_FAILURES = []
+
+
 def _load_daily_totals_from_es(cfg):
     """
     Cumulative trajectory straight from ES: per-day treated + records for EVERY
@@ -277,7 +283,16 @@ def _load_daily_totals_from_es(cfg):
             records = _count([rng, {"terms": {"Data.administrationStatus.keyword": all_status}}])
             treated = _count(treated_f)
         except Exception as e:
-            log.warning(f"[report] day {day_num} ES back-fill failed (non-fatal): {e}")
+            # Recording 0 for a day we simply could not read UNDERSTATES the
+            # cumulative figure that the Slack post leads with, and presents it
+            # as if measured. Keep going (a partial trajectory beats none) but
+            # register it so the run is marked degraded.
+            TRAJECTORY_FAILURES.append(
+                f"day {day_num} ({d.isoformat()}): {type(e).__name__}: {e}")
+            log.error(f"[report] day {day_num} ES back-fill FAILED - that day "
+                      f"counts as 0, so the cumulative total shown in the "
+                      f"report and the Slack post is UNDERSTATED: {e}",
+                      exc_info=True)
             records, treated = 0, 0
         days.append({"day": day_num, "date": d.strftime("%d %b"),
                      "records": records, "treated": treated,
@@ -881,7 +896,6 @@ def _dq_summary_table(doc, g):
         dat(row.cells[0], metric, alt=ri % 2 == 1, align=WD_ALIGN_PARAGRAPH.LEFT)
         dat(row.cells[1], f"{count:,}", alt=ri % 2 == 1)
         dat(row.cells[2], pct, alt=ri % 2 == 1)
-
 
 def _sync_table(doc, sync_rows, cfg, sync_time_stats=None):
     total_cdds  = sum(int(r[2] or 0) for r in sync_rows if len(r) > 2 and r[2])

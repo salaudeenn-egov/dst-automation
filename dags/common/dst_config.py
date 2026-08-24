@@ -20,7 +20,9 @@ Variable name: dst_config    Shape:
         "SLACK_CHANNEL": "C0...",
         "DST_ALERT_CHANNEL": "C0...",
         "DST_MDMS_ENABLED": "false",
-        "DST_LOOKBACK_MINUTES": "60"
+        "DST_LOOKBACK_MINUTES": "60",
+        "CDD_ROLE": "DISTRIBUTOR",        # COMMUNITY_DISTRIBUTOR on Togo
+        "DST_DUP_MATRIX": "FALSE"         # TRUE on the Chad ITN deployment
       },
       "secrets": {                        # credentials ONLY
         "ES_USER": "", "ES_PASS": "",
@@ -98,6 +100,12 @@ def load(refresh=False):
     if _cache_loaded and not refresh:
         return _cache
 
+    # A read FAILURE must not be cached: _cache_loaded was set before the
+    # content was even validated, so one transient failure pinned this process
+    # to "not configured" for its whole life - every later task in that worker
+    # ran unconfigured. An unreadable Variable now propagates (see
+    # deployment_env._get_airflow_variable); only a genuinely absent or
+    # malformed one is cached as None.
     raw = _read_variable(VARIABLE_NAME)
     _cache_loaded = True
     if not (raw or "").strip():
@@ -189,15 +197,31 @@ def _write_credentials_file(payload):
                   "account object (no private_key) — ignoring it")
         return None
 
-    directory = os.path.join(tempfile.gettempdir(), "dst-credentials")
-    os.makedirs(directory, exist_ok=True)
+    # Per-PROCESS path, not a fixed one. This file is deleted in apply()'s
+    # finally, and with max_active_runs=16 two campaign tasks can share a
+    # container: on a fixed path the first task to finish deleted the key out
+    # from under a longer-running one, whose next Drive call then fell back to
+    # the repo-root credential.json (absent on a clean deploy -> FileNotFoundError,
+    # which is a DATA_ERROR, so no retry and the slot's run id already consumed;
+    # or present on a dev box -> silently a DIFFERENT service account).
+    #
+    # mkdtemp also closes two smaller holes: makedirs(exist_ok=True) would have
+    # accepted a pre-existing directory owned by someone else on a shared /tmp,
+    # and it creates with 0700 so there is no window where the parent is
+    # world-traversable.
+    directory = tempfile.mkdtemp(prefix=f"dst-credentials-{os.getpid()}-")
     path = os.path.join(directory, "credential.json")
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle)
+    # O_EXCL + 0600 at CREATE time: open() then chmod() left a window in which
+    # the private key existed at the umask default (often world-readable).
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    fd = os.open(path, flags, stat.S_IRUSR | stat.S_IWUSR)
     try:
-        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
-    except OSError:
-        pass  # Windows/local dev — permissions are not enforceable there
+        handle = os.fdopen(fd, "w", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
+    with handle:
+        json.dump(payload, handle)
     log.info(f"[dst_config] service account materialised from the Variable -> "
              f"{path} (client_email={payload.get('client_email', '?')})")
     return path
@@ -251,8 +275,16 @@ def apply():
             else:
                 os.environ[key] = previous
         if creds_path:
+            # Remove the file AND its private directory. A private key must not
+            # outlive the task that needed it. (On SIGKILL neither runs - that
+            # is why the directory is per-process and 0700, so a leftover is at
+            # least not readable by other users.)
             try:
                 os.remove(creds_path)
+            except OSError:
+                pass
+            try:
+                os.rmdir(os.path.dirname(creds_path))
             except OSError:
                 pass
 

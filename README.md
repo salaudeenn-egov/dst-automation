@@ -460,6 +460,7 @@ read from but cannot be mirrored into.
 | `GROQ_API_KEY`, `GROQ_MODEL`, `GROQ_BASE_URL` | narrative generation |
 | `CDD_ROLE` | field-staff role for SPAQ/AZM (default `DISTRIBUTOR`; Togo uses `COMMUNITY_DISTRIBUTOR`) |
 | `CDD_ROLE_ITN` | field-staff role for ITN/LLIN (default `DISTRIBUTOR_REGISTRAR`) |
+| `DST_DUP_MATRIX` | `TRUE` enables the ITN duplicate-distribution matrix for this deployment (default `FALSE`; a `dup_matrix` sheet cell overrides it per row). Chad ITN runs with this on. |
 | `DST_MDMS_ENABLED` | `false` sheet mode, `true` platform mode |
 | `DST_LOOKBACK_MINUTES` | slot-matching window, default 60 |
 | `DST_LOAD_DOTENV` | force the repo `.env` on or off |

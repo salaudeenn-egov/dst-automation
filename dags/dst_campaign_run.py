@@ -49,8 +49,20 @@ EXECUTE_TASK_ID = "execute_campaign_pipeline"
     start_date=datetime(2026, 1, 1, tzinfo=timezone.utc),
     catchup=False,
     max_active_runs=16,
-    max_consecutive_failed_dag_runs=3,
-    dagrun_timeout=timedelta(minutes=90),
+    # max_consecutive_failed_dag_runs is deliberately NOT set. This is ONE DAG
+    # shared by every tenant, and finalize_run re-raises so each failed campaign
+    # counts as a failed DAG run - so a value of 3 meant that one tenant's bad
+    # campaign_days cell auto-paused reporting for the entire fleet, with no
+    # alert for the pause itself (the channel showed three ordinary failures
+    # from one state) and the scheduler still consuming deterministic run ids
+    # against a paused DAG. Repeated failures already alert per run.
+    #
+    # dagrun_timeout must exceed the task's own worst case, or the DagRun is
+    # killed mid-retry and finalize_run (trigger_rule="all_done") never runs -
+    # losing the Run Log row and the Kafka event, which is the one thing
+    # finalize_run exists to guarantee. Worst case below is
+    # 3 attempts x 60m execution_timeout + 2 x 3m retry_delay = 186m.
+    dagrun_timeout=timedelta(minutes=200),
     tags=["dst", "reporting"],
     default_args={"on_failure_callback": notify_slack_on_failure},
     doc_md=__doc__,
@@ -91,7 +103,14 @@ def dst_campaign_run():
     # execute_campaign_pipeline has already alerted with the real error. With the
     # callback inherited from default_args, every single failure posted TWO
     # near-identical Slack alerts — the fastest way to get an ops channel muted.
-    @task(trigger_rule="all_done", on_failure_callback=None)
+    # retries=0 is load-bearing, not a default. finalize_run ALWAYS raises on a
+    # failed run, and its body is not idempotent: append_run_log appends (it does
+    # not upsert), push_run_event mints a fresh event_id UUID, and the INCOMPLETE
+    # warning posts to Slack. Inheriting a deployment-level default_task_retries=1
+    # - common on managed Airflow - would therefore write TWO FAILED Run Log rows
+    # and two dst_report_metadata rows for every failed campaign, and post the
+    # degraded warning twice.
+    @task(trigger_rule="all_done", on_failure_callback=None, retries=0)
     def finalize_run(dag_run=None, ti=None):
         """Always runs. Records every REAL report attempt on the channel the
         universal DST_MODE flag selects (Run Log tab in sheet mode, Kafka event

@@ -31,6 +31,26 @@ log = logging.getLogger(__name__)
 # stage, so a partial fetch marks the run degraded instead of passing quietly.
 NAME_BATCH_FAILURES = []
 
+# Operator-facing reasons THIS run's numbers cannot be trusted, for conditions
+# the pipeline deliberately survives rather than crashing on. campaign_runner
+# clears this before a run and reads it after the analyze stage, turning each
+# one into a "degraded" outcome that reaches the Run Log and Slack.
+#
+# Before this existed, both conditions below published a complete, plausible,
+# green report: a wrong index prefix or campaign_number matched zero documents,
+# and a missing target book made every coverage figure zero. The code logged
+# "the report should not be shared" and then shared it.
+RUN_DEGRADATIONS = []
+
+
+TARGETS_ZERO = ("targets are ALL ZERO, so every coverage percentage and every facility status band in this report is meaningless. Cause: ")
+
+
+def _degrade_run(reason):
+    RUN_DEGRADATIONS.append(reason)
+    log.error(f"[analyze] RUN DEGRADED - {reason}")
+
+
 
 def _record_batch_failure(kind, exc):
     NAME_BATCH_FAILURES.append(f"{kind}: {type(exc).__name__}: {exc}")
@@ -70,6 +90,7 @@ def _build_campaign_filters(cfg):
         filters.append({"term": {"Data.additionalDetails.cycleIndex.keyword": cfg["cycle_index"]}})
 
     return filters
+
 
 
 def _fetch_individual_names(cfg, ind_ids):
@@ -293,15 +314,22 @@ def _load_targets(cfg):
     if not csv_path:
         log.error("no target book configured — all targets = 0, so "
                   "every coverage figure in this report will be 0% and meaningless — the report should not be shared until the target book is fixed")
+        _degrade_run(TARGETS_ZERO + "no target book is configured. Set "
+                     "target_file on the sheet row, or DST_TARGET_FOLDER_ID "
+                     "for the deployment")
         return {}
 
     if csv_path.startswith("https://docs.google.com/spreadsheets/"):
         df = _read_target_sheet_url(csv_path)
         if df is None:
+            _degrade_run(TARGETS_ZERO + "the target Google Sheet could not be "
+                         "read: " + csv_path)
             return {}
     elif not os.path.exists(csv_path):
         log.error(f"target book not found: {csv_path} — all targets = 0, so "
                   f"every coverage figure in this report will be 0% and meaningless — the report should not be shared until the target book is fixed")
+        _degrade_run(TARGETS_ZERO + "the target book was not found at "
+                     + csv_path)
         return {}
     else:
         df = pd.read_csv(csv_path)
@@ -854,6 +882,19 @@ def render(cfg, rows, secondary):
 def run(cfg):
     log.info(f"[analyze] {cfg['state_name']} Day {cfg['DAY']} — streaming task docs ...")
     rows, secondary, processed = collect(cfg)
+    if not processed:
+        # A green report over zero documents is the most dangerous output this
+        # pipeline can produce: indistinguishable from a real quiet day. It has
+        # happened - a repo .env overriding ES_INDEX_PREFIX put every query on
+        # an index that exists but holds another tenant's data.
+        _degrade_run(
+            f"ZERO task documents matched. Every figure in this report is 0 and "
+            f"is NOT a measurement. Check, in this order: the index actually "
+            f"queried (tenant={cfg.get('tenant')}, ES_INDEX_PREFIX="
+            f"{os.getenv('ES_INDEX_PREFIX', '<unset: tenant-prefixed>')!r}); the "
+            f"date window {cfg.get('GTE')} to {cfg.get('LTE')} on field "
+            f"{cfg.get('task_date_field', 'taskDates')}; and campaign_number / "
+            f"cycle_index if task_campaign_filter is TRUE")
     save_checkpoint(cfg, "analyze", {
         "processed": processed, "rows": rows, "secondary": secondary,
     })

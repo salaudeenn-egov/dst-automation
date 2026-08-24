@@ -48,19 +48,43 @@ def _get_airflow_variable(name):
     task only the Task SDK path works; outside tasks (CLI, dag-processor)
     only the ORM path works. Try both; return "" when unset everywhere.
     """
+    sdk_error = orm_error = None
     try:
         from airflow.sdk import Variable as SdkVariable
         value = SdkVariable.get(name, default=None)
         if value is not None:
             return str(value)
-    except Exception:
-        pass
+    except Exception as e:                                        # noqa: BLE001
+        sdk_error = e
     try:
         from airflow.models import Variable as OrmVariable
         return OrmVariable.get(name, default_var="") or ""
-    except Exception as e:
-        log.warning(f"Airflow Variable '{name}' unreachable via SDK and ORM: {e}")
+    except Exception as e:                                        # noqa: BLE001
+        orm_error = e
+
+    # Outside Airflow altogether - local run.py, the JupyterHub boxes - both
+    # paths error BY DESIGN and the legacy env-driven path is correct. Only
+    # treat a failed read as fatal when Airflow is actually the one running us.
+    under_airflow = any(os.getenv(k) for k in
+                        ("AIRFLOW_CTX_DAG_ID", "AIRFLOW_HOME",
+                         "AIRFLOW__CORE__EXECUTOR"))
+    if not under_airflow:
+        log.info(f"Airflow Variable {name!r} not readable outside Airflow "
+                 f"(expected) - using process environment")
         return ""
+
+    # BOTH paths errored under Airflow. That is NOT the same as "unset", and
+    # conflating them is how a 2-second API-server hiccup silently re-routed a
+    # whole tick: is_configured() went False, the default group's sheet_tab fell
+    # back to "Sheet1", dst_config.apply() became a no-op so GOOGLE_CREDENTIALS_PATH
+    # was never set, and the run completed successfully against a DIFFERENT
+    # deployment. The entire configuration now lives in one Variable, so an
+    # unreachable metadata service must be loud and fatal, not a fallback.
+    raise RuntimeError(
+        f"Airflow Variable {name!r} could not be READ (this is not the same as "
+        f"it being unset). The whole deployment configuration lives in this "
+        f"Variable, so continuing would silently run against default or stale "
+        f"settings. SDK path: {sdk_error}. ORM path: {orm_error}.")
 
 
 def load_deployment_groups():

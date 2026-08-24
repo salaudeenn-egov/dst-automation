@@ -87,7 +87,9 @@ from openpyxl.styles import Font, Alignment
 from openpyxl.utils import get_column_letter
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 
-from pipeline.analyze import _map_household_ids_to_head_ids, _fetch_individual_names
+from pipeline.analyze import (_map_household_ids_to_head_ids,
+                             _fetch_individual_names,
+                             _degrade_run, TARGETS_ZERO)
 from pipeline.core.es import scroll_batches
 from pipeline.core.excel import (
     BANNER_FILL, FLAG_COLOR, HDR_FILL, TOTAL_FILL, WHITE_FILL, style_cell,
@@ -97,7 +99,8 @@ log = logging.getLogger(__name__)
 
 _BATCH = 5000
 
-# Duplicate-distribution matrix bucket keys (opt-in — see config.DUP_MATRIX_DEFAULT).
+# Duplicate-distribution matrix bucket keys (opt-in — see
+# config._dup_matrix_default: dup_matrix sheet cell, then DST_DUP_MATRIX).
 # su/du = same/different user; sd/dd = same/different day, always relative to
 # the household's ORIGINAL (earliest) record. Duplicates with a missing user,
 # date or head name are excluded, never guessed (run() warns when the excluded
@@ -313,6 +316,15 @@ def _fetch_facility_rows(cfg):
         log.warning(f"[analyze_itn] dup matrix: {event_errors:,} records skipped "
                     f"(malformed fields) — matrix will undercount by that many")
     log.info(f"[analyze_itn] {total_processed:,} records processed across {len(fac_data)} facilities")
+    if not total_processed:
+        # Same hazard as the SPAQ path: a complete, green ITN report over no data.
+        _degrade_run(
+            f"ZERO task documents matched. Every net and household figure in "
+            f"this ITN report is 0 and is NOT a measurement. Check the index "
+            f"queried (tenant={cfg.get('tenant')}, ES_INDEX_PREFIX="
+            f"{os.getenv('ES_INDEX_PREFIX', '<unset: tenant-prefixed>')!r}), the "
+            f"window {cfg.get('GTE')} to {cfg.get('LTE')}, and project_type_id / "
+            f"campaign_number for this campaign")
     return [{"facility_code": code, **m} for code, m in fac_data.items()], dup_events
 
 
@@ -665,6 +677,9 @@ def _load_targets_itn(cfg):
     if not csv_path:
         log.error("[analyze_itn] no target book configured — all targets = 0, "
                   "so every coverage figure in this report will be 0% and meaningless — the report should not be shared until the target book is fixed")
+        _degrade_run(TARGETS_ZERO + "no target book is configured for this ITN "
+                     "campaign. Set target_file on the sheet row, or "
+                     "DST_TARGET_FOLDER_ID for the deployment")
         return {}
     if csv_path.startswith("https://docs.google.com/spreadsheets/"):
         # same Sheets-URL form analyze.py accepts; without this the URL fails
@@ -675,11 +690,15 @@ def _load_targets_itn(cfg):
             log.error(f"[analyze_itn] could not read target sheet {csv_path} — ALL "
                       f"TARGETS = 0, so every coverage figure in this report is "
                       f"meaningless. Check target_file and DST_TARGET_FOLDER_ID")
+            _degrade_run(TARGETS_ZERO + "the ITN target Google Sheet could not "
+                         "be read: " + csv_path)
             return {}
     elif not os.path.exists(csv_path):
         log.error(f"[analyze_itn] target book not found: {csv_path} — all targets "
                   f"= 0, so every coverage figure in this report is meaningless "
                   f"— the report should not be shared until it is fixed")
+        _degrade_run(TARGETS_ZERO + "the ITN target book was not found at "
+                     + csv_path)
         return {}
     else:
         df = pd.read_csv(csv_path)

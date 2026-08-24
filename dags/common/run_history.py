@@ -20,15 +20,21 @@ log = logging.getLogger(__name__)
 def build_retime_guard():
     """One sheet read, then a pure closure for find_due_slots.
 
-    has_report_since(tenant, mode, slot_dt) -> True when a SUCCESS row for this
-    tenant already exists today for a slot at or after this one, with a
-    covering mode ("both" covers internal and partner). FAILED runs do not
-    count, so a retimed slot may replace a failed report.
+    has_report_since(tenant, mode, slot_dt, state_name, campaign_number,
+    cycle_index) -> True when a SUCCESS row for this CAMPAIGN already exists
+    today for a slot at or after this one, with a covering mode ("both" covers
+    internal and partner). FAILED runs do not count, so a retimed slot may
+    replace a failed report.
+
+    Scoped by campaign, not just tenant: one tenant runs several campaigns
+    (Bauchi SMC + ITN, Chad's three rows), and tenant-only matching let one
+    campaign's success suppress another's slot.
     """
     today_runs = fetch_today_runs()
     log.info(f"[retime-guard] {len(today_runs)} run(s) recorded today")
 
-    def has_report_since(tenant, mode, slot_dt, state_name=""):
+    def has_report_since(tenant, mode, slot_dt, state_name="",
+                         campaign_number="", cycle_index=""):
         """Keyed on TENANT, which is what find_due_slots passes. It previously
         compared against the Run Log's State column while the caller passed the
         lowercase tenant, so the guard never matched anything and a retimed
@@ -47,9 +53,22 @@ def build_retime_guard():
             # rows written before the Tenant column existed (and every row
             # run.py writes) carry only State — fall back to it rather than
             # treating them as belonging to no campaign at all
-            return r["tenant"] == tenant or (not r["tenant"]
-                                             and state_name
-                                             and r["state"] == state_name)
+            same_tenant = (r["tenant"] == tenant
+                           or (not r["tenant"] and state_name
+                               and r["state"] == state_name))
+            if not same_tenant:
+                return False
+            # One tenant legitimately holds SEVERAL campaigns: Bauchi runs SMC
+            # and ITN together, Chad has three rows. Matching on tenant alone
+            # let an SMC success at 05:30 suppress the ITN 05:00 slot inside the
+            # lookback window - a silently missing report, no failure, no alert.
+            # An empty cell on a legacy row matches anything, so old rows keep
+            # behaving exactly as before.
+            if campaign_number and r.get("campaign")                     and r["campaign"] != campaign_number:
+                return False
+            if cycle_index and r.get("cycle") and r["cycle"] != cycle_index:
+                return False
+            return True
         return any(same_campaign(r) and r["status"] == "SUCCESS"
                    and r["mode"] in covering
                    and normalised(r["slot_time"]) >= slot_hhmm
