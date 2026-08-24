@@ -22,7 +22,9 @@ Entry data shape (top-level fields drive schema uniqueness):
      "row": {...the sheet row verbatim, all values as strings...}}
 
 Env: MDMS_URL (in-cluster base URL, required to enable),
-MDMS_SEARCH_ENDPOINT (/mdms-v2/v2/_search), MDMS_TENANT_ID, MDMS_AUTH_TOKEN
+MDMS_API_PREFIX (/mdms-v2/v2 via the gateway, /egov-mdms-service/v2
+direct — governs BOTH reads and writes), MDMS_SEARCH_ENDPOINT (read path
+override only), MDMS_TENANT_ID, MDMS_AUTH_TOKEN
 (default "" — internal calls need none), DST_MDMS_SCHEMA_CODE, MDMS_LIMIT.
 """
 import logging
@@ -33,6 +35,22 @@ import requests
 log = logging.getLogger(__name__)
 
 DEFAULT_SCHEMA_CODE = "airflow-configs.dst-campaign-report-config"
+
+
+def _api_prefix():
+    """Path prefix for the MDMS v2 API, WITHOUT a trailing slash.
+
+    Two deployment shapes exist:
+      - through the DIGIT gateway:  /mdms-v2/v2          (the default)
+      - direct to the service:      /egov-mdms-service/v2
+    The read path was configurable via MDMS_SEARCH_ENDPOINT while the write path
+    hardcoded "/mdms-v2/v2", so pointing a deployment at a direct service URL
+    fixed searches and left every create/update 404ing. One key governs both.
+
+    Verified live 2026-08-24 against mdms-v2 on :8094 (context path /mdms-v2, v2
+    controller with _create/{schemaCode}), where /mdms-v2/v2 is correct.
+    """
+    return os.getenv("MDMS_API_PREFIX", "/mdms-v2/v2").rstrip("/")
 
 
 def _base_url():
@@ -51,9 +69,25 @@ def _mdms_tenant(group=None):
 
 
 def _request_info():
+    """RequestInfo for an internal service-to-service MDMS call.
+
+    userInfo.uuid is REQUIRED for writes, not optional: MDMS's
+    enrichAuditDetails populates createdBy/lastModifiedBy from it and rejects the
+    request outright without it —
+        NullCheckException: User uuid present inside UserInfo being sent to
+        enrichAuditDetails method must not be null
+    With only {"id": 1} every create and update returned 400. This was invisible
+    until a real MDMS v2 was available to call (2026-08-24); a v1 service has no
+    write API to fail against.
+
+    authToken stays empty by default because internal calls bypass the gateway —
+    the platform's own scheduler does the same.
+    """
+    uuid_value = os.getenv("MDMS_USER_UUID", "dst-automation").strip() or "dst-automation"
     return {"apiId": "dst-automation", "msgId": "dst-config-sync",
             "authToken": os.getenv("MDMS_AUTH_TOKEN", ""),
-            "userInfo": {"id": 1}}
+            "userInfo": {"id": 1, "uuid": uuid_value, "type": "SYSTEM",
+                         "roles": [], "tenantId": _mdms_tenant()}}
 
 
 def row_identity(row):
@@ -196,7 +230,9 @@ def search_entries(group=None):
     """All entries of our schema for the group's MDMS tenant (paginated),
     optionally filtered to the group. Same call shape as the platform's
     fetch_campaigns_from_mdms."""
-    url = _base_url() + os.getenv("MDMS_SEARCH_ENDPOINT", "/mdms-v2/v2/_search")
+    # MDMS_SEARCH_ENDPOINT still wins when set explicitly (existing deployments)
+    url = _base_url() + os.getenv("MDMS_SEARCH_ENDPOINT",
+                                  _api_prefix() + "/_search")
     limit = int(os.getenv("MDMS_LIMIT", "500"))
     entries, offset = [], 0
     while True:
@@ -219,10 +255,17 @@ def search_entries(group=None):
 
 
 def _write(action, body_mdms):
-    url = f"{_base_url()}/mdms-v2/v2/_{action}/{_schema_code()}"
+    url = f"{_base_url()}{_api_prefix()}/_{action}/{_schema_code()}"
     r = requests.post(url, json={"RequestInfo": _request_info(),
                                  "Mdms": body_mdms}, timeout=60)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        # MDMS returns the actual reason in the body (a named validation error,
+        # or which required field is missing). raise_for_status alone gave
+        # "400 Client Error:  for url: ..." and nothing else, so the sync failure
+        # that reached Slack named no cause at all.
+        raise requests.HTTPError(
+            f"MDMS {action} rejected with {r.status_code}: {r.text[:400]}",
+            response=r)
 
 
 def apply_sync(plan, group=None):
