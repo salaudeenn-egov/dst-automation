@@ -157,6 +157,16 @@ def run_campaign(row):
         _slack_error(cfg, state, "cdd_sync", e)
         # non-fatal — continue to report with no sync data
 
+    # OPTIONAL stock stage (pipeline/stock.py) — inert unless DST_STOCK_REPORT
+    # / STOCK_REPORT_DEFAULT enables it; never blocks the report.
+    try:
+        from pipeline import stock
+        stock.run(cfg)
+    except Exception as e:
+        log.error(f"[{state}] stock FAILED (non-fatal — continuing to report "
+                  f"without a stock section): {e}", exc_info=True)
+        _slack_error(cfg, state, "stock", e)
+
     try:
         docx_path, partner_docx_path, slack_text = report_mod.run(cfg)
     except Exception as e:
@@ -253,6 +263,13 @@ def run_cumulative(row, end_date):
         cdd_sync_mod.run(cfg)
     except Exception as e:
         log.error(f"[{state}] cdd_sync FAILED (non-fatal — continuing to report): {e}", exc_info=True)
+
+    # OPTIONAL stock stage — inert unless enabled (see pipeline/stock.py).
+    try:
+        from pipeline import stock
+        stock.run(cfg)
+    except Exception as e:
+        log.error(f"[{state}] stock FAILED (non-fatal — continuing to report): {e}", exc_info=True)
 
     # report.run already uploaded the performance + CDD-sync Excels to Drive and embedded
     # those links inside both docs (no_upload=False); it stashes the links back on cfg.

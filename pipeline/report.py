@@ -1446,10 +1446,29 @@ def _build_doc(cfg, *, g, cov_pct, lga_d, facilities, hfs_active, lgas_total,
                 align = WD_ALIGN_PARAGRAPH.LEFT if ci == 2 else WD_ALIGN_PARAGRAPH.CENTER
                 dat(row6.cells[ci], val, alt=alt, align=align)
 
-    # Section 6 — Conclusion (last section)
+    # Section 6 — Stock & Supply Chain (BOTH internal and partner docs, per
+    # user instruction 2026-09-17). Present only when the optional stock
+    # stage produced data — with the stage off, nothing below changes and
+    # Conclusion stays Section 6.
+    _concl_num = "6"
+    if cfg.get("stock_data"):
+        doc.add_paragraph()
+        from pipeline.stock import build_stock_section
+        build_stock_section(doc, cfg, heading_num="6")
+        _concl_num = "7"
+
+    # Conclusion (last section)
     doc.add_paragraph()
-    add_heading(doc, "6.  Conclusion", 4)
-    add_para(doc, conclusion, size=10)
+    add_heading(doc, f"{_concl_num}.  Conclusion", 4)
+    # Deterministic stock one-liner woven into the same paragraph (both
+    # internal and partner docs, per user instruction 2026-09-17).
+    _concl_text = conclusion
+    if cfg.get("stock_data"):
+        from pipeline.stock import stock_summary_line
+        _stock_line = stock_summary_line(cfg)
+        if _stock_line:
+            _concl_text = f"{conclusion.rstrip()} {_stock_line}"
+    add_para(doc, _concl_text, size=10)
 
     # Disclaimer — page footer (appears on every page)
     from datetime import timezone
@@ -1587,6 +1606,13 @@ def run(cfg):
         max_tokens=400,
     )
     # Final Slack message = deterministic heading, then the LLM summary paragraph.
+    # The deterministic stock one-liner is joined into the SAME paragraph
+    # (Slack is internal-only).
+    if cfg.get("stock_data"):
+        from pipeline.stock import stock_summary_line
+        _stock_line = stock_summary_line(cfg)
+        if _stock_line:
+            _slack_narrative = f"{_slack_narrative.rstrip()} {_stock_line}"
     slack_text = _fmt_slack_heading(cfg) + "\n\n" + _slack_narrative
 
     # Bundle render params — shared between main + partner docs
