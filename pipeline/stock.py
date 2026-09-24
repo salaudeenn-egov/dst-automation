@@ -424,10 +424,8 @@ def _collect_smc_ng(cfg, v1, task):
     rows = []
     # Gross handover volume is no longer a printed column (it restarts the
     # "sent more than received" debate with every reviewer) but the report
-    # metrics (6.1 give-back rate etc.) still need the total. Acceptance is
-    # printed as a PERCENTAGE (never exceeds 100), not a raw counter.
+    # metrics (6.1 give-back rate etc.) still need the total.
     gross_issued = 0
-    gross_accepted = 0
     for key in sorted(all_keys):
         hf, product = key
         vals = {}
@@ -437,31 +435,34 @@ def _collect_smc_ng(cfg, v1, task):
             vals[name] = m(src, key, name)
         con = consumed.get(key, 0)
         red = redose.get(key, 0)
-        # Stock Given = real doses out with CDDs (or used), each counted
-        # once: handovers minus rejected and minus CONFIRMED returns.
-        # Custody rules (user, 2026-09-22 v2):
-        #  - downward in-transit belongs to the LOWER level: stock sent
-        #    HF->CDD counts with the CDDs from the moment it is sent;
-        #  - a REJECTION sends responsibility back UP: stock a CDD rejects
-        #    adds back to Stock Left at HF;
-        #  - a CDD->HF return stays with the CDD until the HF RECEIVES it
-        #    (subtracting the SENT side of returns would make
-        #    return-in-transit doses vanish from both balances).
-        net_given = (vals["iss_sent"] - vals["iss_rej"] - vals["sret_acc"])
-        balance_hf = (vals["state_acc"] + vals["sret_acc"]
+        # Custody rule (user, 2026-09-24 v3): the RECEIVER is accountable
+        # for stock in transit, on every leg —
+        #  - HF->CDD: sent stock counts with the CDDs from dispatch;
+        #  - CDD->HF returns: count at the HF from dispatch;
+        #  - HF->state returns: leave the HF book at dispatch;
+        #  - a REJECTION bounces accountability back to the sender
+        #    (CDD-rejected handovers -> HF; HF-rejected returns -> CDD;
+        #    state-rejected returns -> HF).
+        # Exception: state->HF in-transit sits on no facility balance (the
+        # HF has not confirmed it; it shows only in its own column).
+        # The Chad layout already works this way (sender-side records).
+        ret_in = vals["sret_sent"] - vals["sret_rej"]    # returns on HF book
+        ret_up = vals["hret_sent"] - vals["hret_rej"]    # returns off HF book
+        net_given = (vals["iss_sent"] - vals["iss_rej"] - ret_in)
+        balance_hf = (vals["state_acc"] + ret_in
                       - vals["iss_sent"] + vals["iss_rej"]
-                      - vals["hret_acc"])
+                      - ret_up)
         balance_cdd = net_given - (con + red)
         # Strict stock-journey order: state -> HF -> CDDs -> used -> returns,
         # computed outcomes (net + balances) last. In Transit is the docs'
         # OWN status IN_TRANSIT (this convention records it), not a formula.
         gross_issued += vals["iss_sent"]
-        gross_accepted += vals["iss_acc"]
-        # confirmation RATE, not a dose count — a raw accepted counter reads
-        # above Received (re-issued give-backs confirmed on each trip) and
-        # restarts the impossible-number debate; a percent cannot exceed 100
-        conf_pct = (round(vals["iss_acc"] / vals["iss_sent"] * 100, 1)
-                    if vals["iss_sent"] else 0.0)
+        # "Received by CDD" as REAL DOSES, each counted once (the raw
+        # accepted-handover counter exceeds Received on re-issued give-backs
+        # and a percentage was rejected by the user): confirmed custody =
+        # Stock Given minus what is still on the way. The row self-checks:
+        # Stock Given = Received by CDD + In Transit.
+        cdd_received = net_given - vals["iss_trans"]
         # Every printed column counts REAL doses and stays <= Received (the
         # conservation rule reviewers expect). The raw handover counters
         # (which exceed Received because returned stock goes out again) are
@@ -471,7 +472,7 @@ def _collect_smc_ng(cfg, v1, task):
                      vals["state_sent"], vals["state_acc"], vals["state_rej"],
                      vals["state_trans"],                    # In Transit s->HF
                      net_given,                              # real doses out
-                     conf_pct,                               # CDD confirmation %
+                     cdd_received,                           # confirmed doses
                      vals["iss_rej"], vals["iss_trans"],
                      con, red,
                      vals["sret_sent"], vals["sret_acc"], vals["sret_rej"],
@@ -483,7 +484,7 @@ def _collect_smc_ng(cfg, v1, task):
                "Rejected by HF",
                "In Transit from State to HF (sent, not yet received)",
                "Stock Given to CDDs (each dose counted once)",
-               "Handovers Confirmed by CDDs (%)",
+               "Received by CDD (each dose counted once)",
                "Rejected by CDD",
                "In Transit from HF to CDD (sent, not yet received)",
                "Used by CDD (administered)",
@@ -497,16 +498,16 @@ def _collect_smc_ng(cfg, v1, task):
     totals = {
         "received":  sum(r[4] for r in rows),
         "issued":    gross_issued,
-        # returns RECEIVED by the HF (r[14]), matching net_given — using the
-        # sent side would break the 6.1 reconciliation by return-in-transit
-        "returned":  sum(r[14] for r in rows),
-        "returned_upstream": sum(r[17] for r in rows),
+        # receiver-accountable: returns count from DISPATCH minus rejections
+        # (sent - rejected on each leg), matching net_given/balance_hf so the
+        # 6.1 reconciliation closes exactly
+        "returned":  sum(r[13] - r[15] for r in rows),
+        "returned_upstream": sum(r[16] - r[18] for r in rows),
         "rejected_in":  sum(r[5] for r in rows),
         "rejected_out": sum(r[9] for r in rows),
         "consumed":  sum(r[11] for r in rows),
         "redose":    sum(r[12] for r in rows),
         "damaged": 0, "lost": 0,
-        "accepted": gross_accepted,
         "in_transit_out": sum(r[10] for r in rows),
         "balance_hf":  sum(r[19] for r in rows),
         "balance_cdd": sum(r[20] for r in rows),
@@ -1029,26 +1030,29 @@ _LEDGER_HEADER_NOTES = {
         "Every unique-dose column stays at or below this number."),
     "Stock Given to CDDs": (
         "Real doses out with CDDs or already used, each counted once "
-        "= total handovers - rejected - returns received back. Includes "
-        "stock still on the way to CDDs (once sent, it is the CDDs' "
-        "responsibility); stock a CDD rejects goes back to the HF. With "
-        "complete records this never exceeds Received; if it does, "
-        "handovers were recorded without matching receipts (recording "
-        "gap)."),
-    "Handovers Confirmed": (
-        "Share of this facility's handovers that CDDs confirmed receiving "
-        "in the app. What is not confirmed is either 'Rejected by CDD' or "
-        "'In Transit'. Low % = CDDs not confirming receipts - follow up."),
+        "= total handovers - rejected - returns sent back by CDDs. "
+        "Includes stock still on the way to CDDs (the receiver is "
+        "accountable for stock in transit); a return leaves this number "
+        "the moment the CDD sends it. Stock a CDD rejects goes back to "
+        "the HF. With complete records this never exceeds Received; if it "
+        "does, handovers were recorded without matching receipts "
+        "(recording gap)."),
+    "Received by CDD": (
+        "Real doses CDDs have confirmed receiving (or already used), each "
+        "counted once = Stock Given - In Transit. The row self-checks: "
+        "Stock Given = Received by CDD + In Transit. Never more than "
+        "Received from State when records are complete."),
     "In Transit": (
         "Sent but not yet received (the app's recorded IN_TRANSIT status). "
         "Stock in transit to CDDs is counted with the CDDs (inside 'Stock "
         "Given' and 'Stock Left with CDDs')."),
     "Stock Left at HF": (
-        "Doses at the facility right now = received + returns received "
-        "- handovers + rejected by CDDs - returned to state - damaged "
-        "- lost. Rejected stock comes back to the HF. Negative means the "
-        "facility handed out more than its recorded receipts - a "
-        "recording gap, not real negative stock."),
+        "Doses on the facility's account right now = received + returns "
+        "sent back by CDDs - handovers + rejected by CDDs - returned to "
+        "state - damaged - lost. The receiver is accountable for stock in "
+        "transit, so returns count here from the moment CDDs send them. "
+        "Negative means the facility handed out more than its recorded "
+        "receipts - a recording gap, not real negative stock."),
     "Stock Left with CDDs": (
         "Doses with CDDs right now = stock given - used - redose. "
         "Negative means handovers were not recorded in the app."),
@@ -1153,14 +1157,6 @@ def _render_workbook(cfg, data, path):
     total_row = (["TOTAL"] + [""] * (label_cols - 1)
                  + [sum(r[ci] for r in data["rows"])
                     for ci in range(label_cols, len(data["headers"]))])
-    # percentage columns must not be summed — the TOTAL cell carries the
-    # OVERALL rate instead
-    t = data.get("totals") or {}
-    for ci, h in enumerate(data["headers"]):
-        if str(h).startswith("Handovers Confirmed"):
-            total_row[ci] = (round(t.get("accepted", 0)
-                                   / t["issued"] * 100, 1)
-                             if t.get("issued") else 0.0)
     ws.append(total_row)
     for ci in range(1, len(data["headers"]) + 1):
         _style_cell(ws.cell(row=ws.max_row, column=ci), fill=_TOTAL_FILL,
