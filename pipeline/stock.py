@@ -452,7 +452,12 @@ def _collect_smc_ng(cfg, v1, task):
         balance_hf = (vals["state_acc"] + ret_in
                       - vals["iss_sent"] + vals["iss_rej"]
                       - ret_up)
-        balance_cdd = net_given - (con + red)
+        # Stock Left with CDDs is built on CONFIRMED receipts only (user,
+        # 2026-09-24): in-transit stock sits in its own column — a
+        # goods-in-transit bucket, counted in neither pocket until the CDD
+        # confirms. Conservation: used + redose + Left-with-CDDs + Left-at-HF
+        # + In-Transit(HF->CDD) + confirmed upstream returns = Received.
+        balance_cdd = (net_given - vals["iss_trans"]) - (con + red)
         # Strict stock-journey order: state -> HF -> CDDs -> used -> returns,
         # computed outcomes (net + balances) last. In Transit is the docs'
         # OWN status IN_TRANSIT (this convention records it), not a formula.
@@ -1034,7 +1039,7 @@ _LEDGER_HEADER_NOTES = {
         "- Total Handovers + Rejected by CDD "
         "- (Returned by HF to State - Return Rejected by State)"),
     "Stock Left with CDDs": (
-        "= Stock Given to CDDs - Used by CDD - Redose"),
+        "= Received by CDD - Used by CDD - Redose"),
 }
 
 
@@ -1300,8 +1305,6 @@ def build_stock_section(doc, cfg, heading_num="6"):
     # row carries its formula in the label.
     add_heading(doc, f"{heading_num}.{sub}  Supply at a Glance", 5)
     if data["variant"] == "smc":
-        # in-transit-to-CDD stock counts WITH the CDDs (custody v2), so it
-        # stays inside net_issued / "Still with CDDs" — not subtracted here
         net_issued = v("issued") - v("returned") - v("rejected_out")
         used_net = v("consumed") + (0 if is_azm else v("redose"))
         overview = [
@@ -1310,6 +1313,11 @@ def build_stock_section(doc, cfg, heading_num="6"):
             (f"        Used for children ({unit})", f"{v('consumed'):,.0f}"),
             ("        Repeat doses (redose)", f"{v('redose'):,.0f}"),
         ]
+        if v("in_transit_out"):
+            # in-transit sits in its own bucket (goods-in-transit): counted
+            # with neither the CDDs nor the facility until confirmed
+            overview.append(("        On the way to CDDs (in transit)",
+                             f"{v('in_transit_out'):,.0f}"))
         if v("balance_cdd") >= 0:
             overview.append(("        Still with CDDs",
                              f"{v('balance_cdd'):,.0f}"))
