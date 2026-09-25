@@ -529,9 +529,114 @@ def _collect_smc_ng(cfg, v1, task):
           "received": 4, "issued": 7,
           "consumed": 11, "damaged": None, "lost": None,
           "bal_hf": 20, "bal_cdd": 13}
+    # DAILY FLOW tab (non-fatal): the chronological view that explains the
+    # cumulative numbers — same columns, same formulas, per day.
+    try:
+        daily_rows = _collect_daily_flow(cfg, lga_map)
+    except Exception as e:                                       # noqa: BLE001
+        log.warning(f"  [stock] daily flow collection failed (tab skipped): {e}")
+        daily_rows = []
     return {"variant": "smc", "ng": True, "levels": ["LGA", "Health Facility"],
             "headers": headers, "rows": rows, "totals": totals, "ix": ix,
+            "daily_rows": daily_rows, "daily_headers": ["Date"] + headers,
             "cdd_rows": _collect_cdd_accountability_ng(cfg, v1, task)}
+
+
+# ── DAILY FLOW (the STOCK LEDGER's columns and formulas, per day) ─────────────
+
+def _collect_daily_flow(cfg, lga_map):
+    """DAILY FLOW tab: the STOCK LEDGER's exact columns plus Date, computed
+    with the SAME formulas per day. Movement columns show that day's
+    movements (net of that day's give-backs, so a facility's daily values
+    SUM to its ledger row); the two Stock Left columns are RUNNING balances
+    at the END of that day — a facility's last day equals its ledger row.
+    Day buckets: Data.@timestamp for stock movements, taskDates for
+    consumption (NG convention only)."""
+    v1 = _stock_index(cfg)
+    task = cfg["ES_INDEX_TASK"]
+
+    def _day(ms):
+        return datetime.fromtimestamp(
+            ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+
+    vals = {}
+
+    def collect(ftypes, name_field, sub, label):
+        sources = [
+            {"day": {"date_histogram": {"field": "Data.@timestamp",
+                                        "calendar_interval": "day"}}},
+            {"hf": {"terms": {"field": f"Data.{name_field}.keyword",
+                              "missing_bucket": True}}},
+            {"product": {"terms": {"field": "Data.productName.keyword",
+                                   "missing_bucket": True}}},
+        ]
+        must = _stock_must(cfg) + [
+            {"terms": {"Data.facilityType.keyword": ftypes}}]
+        for b in _composite(cfg, v1, must, sources, sub, label):
+            key = (b["key"].get("hf") or "",
+                   b["key"].get("product") or "", _day(b["key"]["day"]))
+            m = vals.setdefault(key, {})
+            for name in sub:
+                m[name] = m.get(name, 0) + (b[name]["qty"]["value"] or 0)
+
+    collect(["State Facility"], "transactingFacilityName",
+            _entry_triple("ISSUED", "state"), "daily State->HF")
+    collect(["STAFF"], "transactingFacilityName",
+            _entry_triple("RETURNED", "sret"), "daily Staff->HF")
+    hf_sub = {}
+    hf_sub.update(_entry_triple("ISSUED", "iss"))
+    hf_sub.update(_entry_triple("RETURNED", "hret"))
+    collect(["Health Facility", "WAREHOUSE", "Warehouse"], "facilityName",
+            hf_sub, "daily HF legs")
+
+    # daily consumption / redose from the task index (taskDates day grain)
+    tsources = [
+        {"day": {"date_histogram": {"field": "Data.taskDates",
+                                    "calendar_interval": "day"}}},
+        {"hf": {"terms": {
+            "field": "Data.boundaryHierarchy.healthFacility.keyword",
+            "missing_bucket": True}}},
+        {"product": {"terms": {"field": "Data.productName.keyword",
+                               "missing_bucket": True}}},
+    ]
+    for status, agg, name in (
+            ("ADMINISTRATION_SUCCESS", _sum_agg("Data.quantity"), "con"),
+            ("VISITED", {}, "red")):
+        for b in _composite(
+                cfg, task,
+                _task_must(cfg) + [{"term": {
+                    "Data.administrationStatus.keyword": status}}],
+                tsources, agg, f"daily task {status}"):
+            key = (b["key"].get("hf") or "",
+                   b["key"].get("product") or "", _day(b["key"]["day"]))
+            m = vals.setdefault(key, {})
+            val = (b["qty"]["value"] or 0) if "qty" in b else b["doc_count"]
+            m[name] = m.get(name, 0) + val
+
+    rows = []
+    run = {}
+    for hf, product, day in sorted(vals):
+        g = vals[(hf, product, day)].get
+        # SAME formulas as the ledger, applied to that day's movements
+        ret_in = g("sret_sent", 0) - g("sret_rej", 0)
+        ret_up = g("hret_sent", 0) - g("hret_rej", 0)
+        given = g("iss_sent", 0) - g("iss_rej", 0) - ret_in
+        cdd_recv = given - g("iss_trans", 0)
+        con, red = g("con", 0), g("red", 0)
+        r = run.setdefault((hf, product), {"cdd": 0, "hf": 0})
+        r["cdd"] += cdd_recv - con - red
+        r["hf"] += (g("state_acc", 0) + ret_in - g("iss_sent", 0)
+                    + g("iss_rej", 0) - ret_up)
+        rows.append([day, lga_map.get(hf, ""), hf, product,
+                     g("state_sent", 0), g("state_acc", 0), g("state_rej", 0),
+                     g("state_trans", 0),
+                     given, g("iss_rej", 0), g("iss_trans", 0),
+                     cdd_recv, con, red,
+                     r["cdd"],
+                     g("sret_sent", 0), g("sret_acc", 0), g("sret_rej", 0),
+                     g("hret_sent", 0), g("hret_acc", 0), g("hret_rej", 0),
+                     r["hf"]])
+    return rows
 
 
 def _collect_cdd_accountability_ng(cfg, v1, task):
@@ -1131,6 +1236,19 @@ def _render_workbook(cfg, data, path):
                    data["headers"], data["rows"],
                    header_notes=_LEDGER_HEADER_NOTES,
                    tint_headers=("Stock Given to CDDs",))
+        if data.get("daily_rows"):
+            _write_tab(wb.create_sheet("DAILY FLOW"),
+                       f"{cfg['state_name']} — Daily Stock Movements "
+                       f"({period})  |  Same columns and formulas as the "
+                       f"STOCK LEDGER, shown per day: movement columns are "
+                       f"that day's movements, and the two Stock Left "
+                       f"columns are the balance at the END of that day — "
+                       f"a facility's last day matches its STOCK LEDGER "
+                       f"row. Dates are the app's record dates.",
+                       data["daily_headers"], data["daily_rows"],
+                       label_cols=4,
+                       header_notes=_LEDGER_HEADER_NOTES,
+                       tint_headers=("Stock Given to CDDs",))
         if data["cdd_rows"]:
             _write_tab(wb.create_sheet("CDD ACCOUNTABILITY"),
                        f"{cfg['state_name']} — CDD Stock Accountability "
