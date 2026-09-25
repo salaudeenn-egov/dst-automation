@@ -473,55 +473,62 @@ def _collect_smc_ng(cfg, v1, task):
         # (which exceed Received because returned stock goes out again) are
         # NOT printed — removed on feedback 2026-09-21 — but their gross sum
         # still feeds the report metrics via totals["issued"].
+        # Column order rule (user, 2026-09-25): each balance CLOSES its own
+        # block, so the row reads left-to-right with no cross-references —
+        # CDD block: Given - rejected - in transit = Received by CDD, minus
+        # used/redose = Stock Left with CDDs. THEN the return legs and the
+        # facility balance. Returns must never sit between the CDD numbers
+        # and the CDD balance (readers subtract them a second time).
         rows.append([lga_map.get(hf, ""), hf, product,
                      vals["state_sent"], vals["state_acc"], vals["state_rej"],
                      vals["state_trans"],                    # In Transit s->HF
                      net_given,                              # real doses out
-                     cdd_received,                           # confirmed doses
                      vals["iss_rej"], vals["iss_trans"],
+                     cdd_received,                           # confirmed doses
                      con, red,
+                     balance_cdd,
                      vals["sret_sent"], vals["sret_acc"], vals["sret_rej"],
                      vals["hret_sent"], vals["hret_acc"], vals["hret_rej"],
-                     balance_hf, balance_cdd])
+                     balance_hf])
 
     headers = ["LGA", "Health Facility", "Product",
                "Sent by State to HF", "Received by HF from State",
                "Rejected by HF",
                "In Transit from State to HF (sent, not yet received)",
                "Stock Given to CDDs (each dose counted once)",
-               "Received by CDD (each dose counted once)",
                "Rejected by CDD",
                "In Transit from HF to CDD (sent, not yet received)",
+               "Received by CDD (each dose counted once)",
                "Used by CDD (administered)",
                "Redose (repeat dose after the first was spat out/vomited)",
+               "Stock Left with CDDs",
                "Returned by CDD to HF", "Return Received by HF",
                "Return Rejected by HF",
                "Returned by HF to State", "Return Received by State",
                "Return Rejected by State",
-               "Stock Left at HF",
-               "Stock Left with CDDs"]
+               "Stock Left at HF"]
     totals = {
         "received":  sum(r[4] for r in rows),
         "issued":    gross_issued,
         # receiver-accountable: returns count from DISPATCH minus rejections
         # (sent - rejected on each leg), matching net_given/balance_hf so the
         # 6.1 reconciliation closes exactly
-        "returned":  sum(r[13] - r[15] for r in rows),
-        "returned_upstream": sum(r[16] - r[18] for r in rows),
+        "returned":  sum(r[14] - r[16] for r in rows),
+        "returned_upstream": sum(r[17] - r[19] for r in rows),
         "rejected_in":  sum(r[5] for r in rows),
-        "rejected_out": sum(r[9] for r in rows),
+        "rejected_out": sum(r[8] for r in rows),
         "consumed":  sum(r[11] for r in rows),
         "redose":    sum(r[12] for r in rows),
         "damaged": 0, "lost": 0,
-        "in_transit_out": sum(r[10] for r in rows),
-        "balance_hf":  sum(r[19] for r in rows),
-        "balance_cdd": sum(r[20] for r in rows),
+        "in_transit_out": sum(r[9] for r in rows),
+        "balance_hf":  sum(r[20] for r in rows),
+        "balance_cdd": sum(r[13] for r in rows),
     }
     rows.sort(key=lambda r: (r[0], r[1], r[2]))
     ix = {"lga": 0, "hf": 1, "product": 2,
           "received": 4, "issued": 7,
           "consumed": 11, "damaged": None, "lost": None,
-          "bal_hf": 19, "bal_cdd": 20}
+          "bal_hf": 20, "bal_cdd": 13}
     return {"variant": "smc", "ng": True, "levels": ["LGA", "Health Facility"],
             "headers": headers, "rows": rows, "totals": totals, "ix": ix,
             "cdd_rows": _collect_cdd_accountability_ng(cfg, v1, task)}
@@ -738,17 +745,18 @@ def _collect_smc(cfg):
         gross_issued += h2c
         # Every printed column counts REAL doses (see the NG layout comment);
         # the gross handover counter feeds totals["issued"] only.
+        # block-closing order (see NG comment): CDD block then facility block
         rows.append(list(key) + [
             s2h,                                    # Received
             h2c - c2h,                              # real doses out
             c2b, red,
+            cdd_bal,                                # Stock Left with CDDs
             c2h,                                    # Returned by CDDs
             h2s,                                    # Returned to state
             dam, los,
             # canonical balance (agg_stock_summary): damage/loss is real
             # shrinkage, not stock in hand
             (s2h + c2h) - (h2s + h2c) - dam - los,  # Stock at HF
-            cdd_bal,                                # Stock at CDD
         ])
 
     unit = "bottles" if is_azm else "doses"
@@ -757,30 +765,30 @@ def _collect_smc(cfg):
                "Received by HF",
                "Stock Given to CDDs (each dose counted once)",
                f"Used by CDDs ({unit})", "Redose",
+               "Stock Left with CDDs",
                "Returned by CDDs to HF", "Returned by HF to State",
                "Damaged", "Lost",
-               "Stock Left at HF",
-               "Stock Left with CDDs"])
+               "Stock Left at HF"])
     n = len(levels) + 1
     totals = {
         "received":  sum(r[n] for r in rows),
         "issued":    gross_issued,
         "consumed":  sum(r[n + 2] for r in rows),
         "redose":    sum(r[n + 3] for r in rows),
-        "returned":  sum(r[n + 4] for r in rows),
-        "returned_upstream": sum(r[n + 5] for r in rows),
-        "damaged":   sum(r[n + 6] for r in rows),
-        "lost":      sum(r[n + 7] for r in rows),
-        "balance_hf":  sum(r[n + 8] for r in rows),
-        "balance_cdd": sum(r[n + 9] for r in rows),
+        "returned":  sum(r[n + 5] for r in rows),
+        "returned_upstream": sum(r[n + 6] for r in rows),
+        "damaged":   sum(r[n + 7] for r in rows),
+        "lost":      sum(r[n + 8] for r in rows),
+        "balance_hf":  sum(r[n + 9] for r in rows),
+        "balance_cdd": sum(r[n + 4] for r in rows),
     }
     # column index map for the audience-oriented report tables
     ix = {"lga": next((i for i, lvl in enumerate(levels)
                        if lvl.lower() in ("lga", "district")), None),
           "hf": len(levels) - 1, "product": len(levels),
           "received": n, "issued": n + 1,
-          "consumed": n + 2, "damaged": n + 6, "lost": n + 7,
-          "bal_hf": n + 8, "bal_cdd": n + 9}
+          "consumed": n + 2, "damaged": n + 7, "lost": n + 8,
+          "bal_hf": n + 9, "bal_cdd": n + 4}
     return {"variant": "smc", "levels": levels, "headers": headers,
             "rows": rows, "totals": totals, "ix": ix,
             "cdd_rows": _collect_cdd_accountability(cfg, v1, task)}
