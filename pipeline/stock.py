@@ -1021,41 +1021,20 @@ _FLAG_FILL = PatternFill("solid", fgColor="FFC7CE")   # light red
 _FLAG_COLOR = "9C0006"                                # dark red text
 _TINT_FILL = PatternFill("solid", fgColor="DCE6F1")   # light blue — anchor col
 
-# Hover notes on the ledger headers where the 830-vs-600 misreading happens:
-# a reader who sees Sent > Received forms the wrong story before reading any
-# formula, so the explanation must sit ON those cells. Keyed by header prefix.
+# Hover notes on computed ledger headers: FORMULA ONLY (user rule 2026-09-24
+# — no narrative in cell comments). Keyed by header prefix.
 _LEDGER_HEADER_NOTES = {
-    "Received by HF": (
-        "New stock from upstream - the total real stock in the system. "
-        "Every unique-dose column stays at or below this number."),
     "Stock Given to CDDs": (
-        "Real doses out with CDDs or already used, each counted once "
-        "= total handovers - rejected - returns sent back by CDDs. "
-        "Includes stock still on the way to CDDs (the receiver is "
-        "accountable for stock in transit); a return leaves this number "
-        "the moment the CDD sends it. Stock a CDD rejects goes back to "
-        "the HF. With complete records this never exceeds Received; if it "
-        "does, handovers were recorded without matching receipts "
-        "(recording gap)."),
+        "= Total Handovers - Rejected by CDD "
+        "- (Returned by CDD to HF - Return Rejected by HF)"),
     "Received by CDD": (
-        "Real doses CDDs have confirmed receiving (or already used), each "
-        "counted once = Stock Given - In Transit. The row self-checks: "
-        "Stock Given = Received by CDD + In Transit. Never more than "
-        "Received from State when records are complete."),
-    "In Transit": (
-        "Sent but not yet received (the app's recorded IN_TRANSIT status). "
-        "Stock in transit to CDDs is counted with the CDDs (inside 'Stock "
-        "Given' and 'Stock Left with CDDs')."),
+        "= Stock Given to CDDs - In Transit from HF to CDD"),
     "Stock Left at HF": (
-        "Doses on the facility's account right now = received + returns "
-        "sent back by CDDs - handovers + rejected by CDDs - returned to "
-        "state - damaged - lost. The receiver is accountable for stock in "
-        "transit, so returns count here from the moment CDDs send them. "
-        "Negative means the facility handed out more than its recorded "
-        "receipts - a recording gap, not real negative stock."),
+        "= Received by HF + (Returned by CDD to HF - Return Rejected by HF) "
+        "- Total Handovers + Rejected by CDD "
+        "- (Returned by HF to State - Return Rejected by State)"),
     "Stock Left with CDDs": (
-        "Doses with CDDs right now = stock given - used - redose. "
-        "Negative means handovers were not recorded in the app."),
+        "= Stock Given to CDDs - Used by CDD - Redose"),
 }
 
 
