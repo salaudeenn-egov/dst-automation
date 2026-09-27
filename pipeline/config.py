@@ -76,8 +76,10 @@ def _pad_cycle(val):
 # ITN duplicate-distribution matrix (analyze_itn._classify_duplicates): the
 # code-side switch, so no Google Sheet column is needed. Flip to "TRUE" to
 # enable it for every ITN/LLIN row this deployment runs; SMC/AZM rows never
-# read it. A dup_matrix column on the sheet, if one is ever added, overrides
-# this per row (TRUE/FALSE cell beats the default; empty cell falls back here).
+# read it. Precedence (first non-empty wins):
+#   1. dup_matrix cell on the sheet row  (per campaign)
+#   2. DST_DUP_MATRIX environment key    (per deployment/.env — the on/off switch)
+#   3. DUP_MATRIX_DEFAULT below          (in-code fallback)
 DUP_MATRIX_DEFAULT = "FALSE"
 
 
@@ -296,9 +298,11 @@ def build(row):
         # ITN only: duplicate-distribution matrix (same/different user x same/different
         # day per household). Off keeps every existing number, query, Word section and
         # Slack post unchanged (the performance Excel only gains six empty trailing
-        # columns). Default lives IN CODE (DUP_MATRIX_DEFAULT above — no sheet column
-        # required); a non-empty dup_matrix sheet cell overrides it per row.
-        "dup_matrix": _bool(str(row.get("dup_matrix", "")).strip() or DUP_MATRIX_DEFAULT),
+        # columns). Precedence: non-empty dup_matrix sheet cell (per row) beats the
+        # DST_DUP_MATRIX env key (per deployment), which beats DUP_MATRIX_DEFAULT.
+        "dup_matrix": _bool(str(row.get("dup_matrix", "")).strip()
+                            or os.getenv("DST_DUP_MATRIX", "").strip()
+                            or DUP_MATRIX_DEFAULT),
 
         # secondary product(s) counted alongside the primary drug — empty = disabled.
         # Legacy single string (age 3-59) OR a spec list (see _parse_secondary_products).

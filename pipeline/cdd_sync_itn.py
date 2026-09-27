@@ -49,7 +49,7 @@ from pipeline.cdd_sync import _style, _HDR_FILL, _TOTAL_FILL, _LOW_FILL, _NEVER_
 urllib3.disable_warnings()
 log = logging.getLogger(__name__)
 
-CDD_ROLE = "DISTRIBUTOR_REGISTRAR"   # confirmed the real field-CDD role for chad
+CDD_ROLE = "DISTRIBUTOR"   # Borno ITN sync-index role; chad uses DISTRIBUTOR_REGISTRAR
 
 # Per-day Y/N matrix width cap (SMC template on a months-long campaign). The most
 # recent MAX_DAY_COLS elapsed days get a column; older days stay counted in
@@ -65,11 +65,15 @@ MAX_DAY_COLS = 31
 
 
 def _campaign_filter(cfg):
-    """Same scoping field as analyze_itn.py's task-index filter, confirmed
-    present on the sync index too."""
+    """Same dual-location scoping as analyze_itn.py's task-index filter:
+    chad carries the campaign at additionalDetails.projectReferenceId, the NG
+    admin-console tenants at top-level campaignNumber — match EITHER."""
     if not cfg.get("campaign_number"):
         raise ValueError("campaign_number is required for ITN CDD sync reporting")
-    return {"term": {"Data.additionalDetails.projectReferenceId.keyword": cfg["campaign_number"]}}
+    return {"bool": {"minimum_should_match": 1, "should": [
+        {"term": {"Data.campaignNumber.keyword": cfg["campaign_number"]}},
+        {"term": {"Data.additionalDetails.projectReferenceId.keyword": cfg["campaign_number"]}},
+    ]}}
 
 
 def _distinct_cdds_synced(cfg, date_str=None):
@@ -272,9 +276,12 @@ def _fetch_cdd_roster(cfg):
             rows[uid] = {
                 "user_id": uid,
                 "username": src.get("syncedUserName", ""),
-                "province": bh.get("province", ""),
-                "district": bh.get("district", ""),
-                "facility": bh.get("sppSfd", ""),
+                # chad keys first, Nigeria (state/lga) second — same first-match
+                # fallback rule as the facility label below and analyze_itn.py.
+                "province": bh.get("province") or bh.get("state") or "",
+                "district": bh.get("district") or bh.get("lga") or "",
+                "facility": (bh.get("sppSfd") or bh.get("distributionHub")
+                             or bh.get("lga") or bh.get("district") or ""),
                 "records": b["doc_count"],
                 "distinct_days": int(b["distinct_days"]["value"]),
                 "dates": {d["key_as_string"] for d in b["sync_days"]["buckets"]},
