@@ -536,13 +536,18 @@ def _collect_smc_ng(cfg, v1, task):
     except Exception as e:                                       # noqa: BLE001
         log.warning(f"  [stock] daily flow collection failed (tab skipped): {e}")
         daily_rows = []
-    # daily tab = Date + the ledger columns, plus ONE daily-only column:
-    # "Available with CDDs" (yesterday's stock + received today), so a day
-    # where Used exceeds that day's Received reads correctly.
+    # daily tab = Date + the ledger columns, plus ONE daily-only column
+    # ("Available with CDDs"). Two daily-only semantics (user, 2026-09-25:
+    # source of truth, returns explicit): Received by CDD is the app's
+    # RECORDED accepted quantity, and Stock Left with CDDs does NOT net the
+    # day's returns — they are subtracted in the NEXT day's Available.
+    _recv_ix = headers.index("Received by CDD (each dose counted once)")
     daily_headers = ["Date"] + headers
+    daily_headers[_recv_ix + 1] = "Received by CDD (as recorded in the app)"
     daily_headers.insert(
-        daily_headers.index("Received by CDD (each dose counted once)") + 1,
-        "Available with CDDs (yesterday's stock + received today)")
+        _recv_ix + 2,
+        "Available with CDDs (yesterday's stock - yesterday's returns "
+        "+ received today)")
     return {"variant": "smc", "ng": True, "levels": ["LGA", "Health Facility"],
             "headers": headers, "rows": rows, "totals": totals, "ix": ix,
             "daily_rows": daily_rows, "daily_headers": daily_headers,
@@ -624,17 +629,23 @@ def _collect_daily_flow(cfg, lga_map):
     run = {}
     for hf, product, day in sorted(vals):
         g = vals[(hf, product, day)].get
-        # SAME formulas as the ledger, applied to that day's movements
         ret_in = g("sret_sent", 0) - g("sret_rej", 0)
         ret_up = g("hret_sent", 0) - g("hret_rej", 0)
         given = g("iss_sent", 0) - g("iss_rej", 0) - ret_in
-        cdd_recv = given - g("iss_trans", 0)
+        # SOURCE OF TRUTH (user, 2026-09-25): the daily "Received by CDD" is
+        # the app's RECORDED accepted quantity for that day — no netting.
+        cdd_recv = g("iss_acc", 0)
         con, red = g("con", 0), g("red", 0)
-        r = run.setdefault((hf, product), {"cdd": 0, "hf": 0})
-        # the day's stock-card line: yesterday's stock + received today
-        # = available; available - used - redose = left at end of day
-        available = r["cdd"] + cdd_recv
-        r["cdd"] = available - con - red
+        r = run.setdefault((hf, product), {"carry": 0, "hf": 0})
+        # The day's stock-card line, all recorded terms, returns EXPLICIT:
+        #   Available = yesterday's Stock Left - yesterday's Returned
+        #               + Received today
+        #   Stock Left = Available - Used - Redose   (returns NOT hidden in
+        #   it; they show in their own column and are subtracted in the NEXT
+        #   day's Available)
+        available = r["carry"] + cdd_recv
+        left_cdd = available - con - red
+        r["carry"] = left_cdd - ret_in
         r["hf"] += (g("state_acc", 0) + ret_in - g("iss_sent", 0)
                     + g("iss_rej", 0) - ret_up)
         rows.append([day, lga_map.get(hf, ""), hf, product,
@@ -642,7 +653,7 @@ def _collect_daily_flow(cfg, lga_map):
                      g("state_trans", 0),
                      given, g("iss_rej", 0), g("iss_trans", 0),
                      cdd_recv, available, con, red,
-                     r["cdd"],
+                     left_cdd,
                      g("sret_sent", 0), g("sret_acc", 0), g("sret_rej", 0),
                      g("hret_sent", 0), g("hret_acc", 0), g("hret_rej", 0),
                      r["hf"]])
@@ -1155,8 +1166,11 @@ _LEDGER_HEADER_NOTES = {
     "Stock Given to CDDs": (
         "= Total Handovers - Rejected by CDD "
         "- (Returned by CDD to HF - Return Rejected by HF)"),
-    "Received by CDD": (
+    "Received by CDD (each dose": (
         "= Stock Given to CDDs - In Transit from HF to CDD"),
+    "Received by CDD (as recorded": (
+        "The app's recorded accepted quantity for that day (no netting; "
+        "returned stock given again is counted on each trip)."),
     "Stock Left at HF": (
         "= Received by HF + (Returned by CDD to HF - Return Rejected by HF) "
         "- Total Handovers + Rejected by CDD "
@@ -1164,7 +1178,8 @@ _LEDGER_HEADER_NOTES = {
     "Stock Left with CDDs": (
         "= Received by CDD - Used by CDD - Redose"),
     "Available with CDDs": (
-        "= Stock Left with CDDs (yesterday) + Received by CDD (today)"),
+        "= Stock Left with CDDs (yesterday) - Returned by CDD (yesterday) "
+        "+ Received by CDD (today)"),
 }
 
 
