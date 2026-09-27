@@ -536,9 +536,16 @@ def _collect_smc_ng(cfg, v1, task):
     except Exception as e:                                       # noqa: BLE001
         log.warning(f"  [stock] daily flow collection failed (tab skipped): {e}")
         daily_rows = []
+    # daily tab = Date + the ledger columns, plus ONE daily-only column:
+    # "Available with CDDs" (yesterday's stock + received today), so a day
+    # where Used exceeds that day's Received reads correctly.
+    daily_headers = ["Date"] + headers
+    daily_headers.insert(
+        daily_headers.index("Received by CDD (each dose counted once)") + 1,
+        "Available with CDDs (yesterday's stock + received today)")
     return {"variant": "smc", "ng": True, "levels": ["LGA", "Health Facility"],
             "headers": headers, "rows": rows, "totals": totals, "ix": ix,
-            "daily_rows": daily_rows, "daily_headers": ["Date"] + headers,
+            "daily_rows": daily_rows, "daily_headers": daily_headers,
             "cdd_rows": _collect_cdd_accountability_ng(cfg, v1, task)}
 
 
@@ -624,14 +631,17 @@ def _collect_daily_flow(cfg, lga_map):
         cdd_recv = given - g("iss_trans", 0)
         con, red = g("con", 0), g("red", 0)
         r = run.setdefault((hf, product), {"cdd": 0, "hf": 0})
-        r["cdd"] += cdd_recv - con - red
+        # the day's stock-card line: yesterday's stock + received today
+        # = available; available - used - redose = left at end of day
+        available = r["cdd"] + cdd_recv
+        r["cdd"] = available - con - red
         r["hf"] += (g("state_acc", 0) + ret_in - g("iss_sent", 0)
                     + g("iss_rej", 0) - ret_up)
         rows.append([day, lga_map.get(hf, ""), hf, product,
                      g("state_sent", 0), g("state_acc", 0), g("state_rej", 0),
                      g("state_trans", 0),
                      given, g("iss_rej", 0), g("iss_trans", 0),
-                     cdd_recv, con, red,
+                     cdd_recv, available, con, red,
                      r["cdd"],
                      g("sret_sent", 0), g("sret_acc", 0), g("sret_rej", 0),
                      g("hret_sent", 0), g("hret_acc", 0), g("hret_rej", 0),
@@ -1153,6 +1163,8 @@ _LEDGER_HEADER_NOTES = {
         "- (Returned by HF to State - Return Rejected by State)"),
     "Stock Left with CDDs": (
         "= Received by CDD - Used by CDD - Redose"),
+    "Available with CDDs": (
+        "= Stock Left with CDDs (yesterday) + Received by CDD (today)"),
 }
 
 
