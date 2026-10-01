@@ -330,9 +330,10 @@ def build(row):
         #                        columns OFF, stock hub ledger
         #                blank falls back to DST_BEDNET_CODES (code DQ) and
         #                DST_STOCK_ITN_SCANNER (stock) in .env
-        #   cdd_role     the sync-index role of this campaign's CDDs, used as
-        #                typed (chad DISTRIBUTOR_REGISTRAR, Borno DISTRIBUTOR, ...);
-        #                independent of itn_scanner; blank = DISTRIBUTOR
+        #   cdd_role     SMC AND ITN: the role of this campaign's CDDs on sync /
+        #                staff records, used as typed (e.g. DISTRIBUTOR,
+        #                DISTRIBUTOR_REGISTRAR); independent of itn_scanner;
+        #                blank -> CDD_ROLE (SMC) / DISTRIBUTOR (ITN) -> DISTRIBUTOR
         "itn_scanner": _tri_state(row.get("itn_scanner", ""), "itn_scanner"),
         "cdd_role":    str(row.get("cdd_role", "")).strip().upper(),
 
