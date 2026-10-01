@@ -60,7 +60,7 @@ report_itn.py call build_stock_section(doc, cfg, ...) right before their
 Conclusion when cfg["stock_data"] exists. Everything else is internal.
 
 Feature switches (first match wins):
-  1. the sheet cell stock_report / stock_itn_scanner   (per campaign)
+  1. the sheet cell stock_report / itn_scanner         (per campaign)
   2. the DST_STOCK_REPORT / DST_STOCK_ITN_SCANNER env  (per deployment)
   3. STOCK_REPORT_DEFAULT = TRUE, STOCK_ITN_SCANNER_DEFAULT = FALSE below
 Off = stock.run returns None immediately and no report output changes at all.
@@ -137,7 +137,7 @@ log = logging.getLogger(__name__)
 # sheet cell stock_report says FALSE (or DST_STOCK_REPORT=FALSE).
 STOCK_REPORT_DEFAULT = "TRUE"
 # ITN: the NO-SCANNER ledger by default (user, 2026-10-01). A scanner campaign
-# (Chad: bales, scans, codes) sets stock_itn_scanner=TRUE on its sheet row.
+# (Chad: bales, scans, codes) sets itn_scanner=TRUE on its sheet row.
 STOCK_ITN_SCANNER_DEFAULT = "FALSE"
 STOCK_DATE_FIELD_DEFAULT = "createdTime"
 
@@ -1496,18 +1496,19 @@ def _walk_buckets(agg_result, levels):
 #  are reused unchanged, only facility types and column titles differ.
 #
 #  Choice (first match wins):
-#    1. sheet cell stock_itn_scanner      TRUE / FALSE (blank = not set)
+#    1. sheet cell itn_scanner            TRUE / FALSE (blank = not set)
 #    2. env DST_STOCK_ITN_SCANNER         TRUE / FALSE
 #    3. STOCK_ITN_SCANNER_DEFAULT = FALSE -> no-scanner. Chad must set
-#       stock_itn_scanner=TRUE on its row. A mismatch with the data's own
+#       itn_scanner=TRUE on its row. A mismatch with the data's own
 #       convention is logged as a warning (see _itn_scanner_mode).
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _itn_scanner_mode(cfg, v1):
-    choice = cfg.get("stock_itn_scanner")
-    if choice is not None:
-        src = "sheet stock_itn_scanner"
-    else:
+    # ONE sheet column, itn_scanner, drives every scanner/no-scanner choice
+    # (stock model here, bednet code DQ in analyze_itn/report_itn).
+    choice = cfg.get("itn_scanner")
+    src = "sheet itn_scanner"
+    if choice is None:
         raw = os.getenv("DST_STOCK_ITN_SCANNER", "").strip().upper()
         if raw:
             choice, src = raw in ("TRUE", "YES", "1", "Y", "ON"), "DST_STOCK_ITN_SCANNER"
@@ -1529,7 +1530,7 @@ def _itn_scanner_mode(cfg, v1):
                 f"  [stock] ITN {'SCANNER' if choice else 'NO-SCANNER'} model "
                 f"chosen ({src}), but this campaign's stock records look "
                 f"{'Nigeria-style (no scanner)' if ng_convention else 'scanner-style (Chad)'}"
-                f" — set stock_itn_scanner="
+                f" — set itn_scanner="
                 f"{'FALSE' if ng_convention else 'TRUE'} on the sheet row if "
                 f"the stock section comes out empty.")
     return bool(choice)

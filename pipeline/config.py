@@ -322,25 +322,24 @@ def build(row):
                             or DUP_MATRIX_DEFAULT),
 
         # ITN only — scanner vs no-scanner campaign (optional sheet columns):
-        #   itn_scanner  TRUE  = scanner campaign (Chad): bednet code columns +
-        #                        code DQ subsections ON
+        #   itn_scanner  ONE column for every scanner choice:
+        #                TRUE  = scanner campaign (Chad): bednet code columns +
+        #                        code DQ subsections ON, stock scanner model
+        #                        (bales, scans, codes)
         #                FALSE / blank = no-scanner (Borno, the default): code
-        #                        columns OFF; blank falls back to DST_BEDNET_CODES
+        #                        columns OFF, stock hub ledger
+        #                blank falls back to DST_BEDNET_CODES (code DQ) and
+        #                DST_STOCK_ITN_SCANNER (stock) in .env
         #   cdd_role     the sync-index role of this campaign's CDDs, used as
         #                typed (chad DISTRIBUTOR_REGISTRAR, Borno DISTRIBUTOR, ...);
         #                independent of itn_scanner; blank = DISTRIBUTOR
         "itn_scanner": _tri_state(row.get("itn_scanner", ""), "itn_scanner"),
         "cdd_role":    str(row.get("cdd_role", "")).strip().upper(),
 
-        # Optional stock stage (pipeline/stock.py). Both are TRUE / FALSE / blank;
-        # blank = None = the deployment default.
-        #   stock_report       on/off for this campaign (DST_STOCK_REPORT)
-        #   stock_itn_scanner  ITN only: TRUE = scanner model (Chad: bales,
-        #                      scans, codes), FALSE = no-scanner ledger (Borno);
-        #                      blank -> DST_STOCK_ITN_SCANNER, else auto-detect
+        # Optional stock stage (pipeline/stock.py): TRUE / FALSE / blank,
+        # blank = None = the deployment default (DST_STOCK_REPORT). The ITN
+        # stock model follows itn_scanner above.
         "stock_report":      _tri_state(row.get("stock_report", ""), "stock_report"),
-        "stock_itn_scanner": _tri_state(row.get("stock_itn_scanner", ""),
-                                        "stock_itn_scanner"),
 
         # secondary product(s) counted alongside the primary drug — empty = disabled.
         # Legacy single string (age 3-59) OR a spec list (see _parse_secondary_products).
