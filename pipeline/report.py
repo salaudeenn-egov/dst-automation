@@ -1615,6 +1615,15 @@ def run(cfg):
             _slack_narrative = f"{_slack_narrative.rstrip()} {_stock_line}"
     slack_text = _fmt_slack_heading(cfg) + "\n\n" + _slack_narrative
 
+    # eGov platform error-tracer counts — INTERNAL ONLY, so it is hung on cfg for
+    # notify.py's main-channel branch rather than appended to slack_text (the
+    # partner post reuses slack_text verbatim). Flag-gated, non-fatal.
+    try:
+        from pipeline import error_tracer
+        error_tracer.attach(cfg, records=g.get("records"), cum_records=cum_records)
+    except Exception as e:
+        log.warning(f"  error tracer block skipped (non-fatal): {e}")
+
     # Bundle render params — shared between main + partner docs
     _render = dict(
         g=g, cov_pct=cov_pct, lga_d=lga_display, facilities=facilities,
