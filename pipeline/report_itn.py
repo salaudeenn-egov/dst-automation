@@ -1428,6 +1428,18 @@ def run(cfg):
         f"{slack_narrative}"
     )
 
+    # eGov platform error-tracer counts — INTERNAL ONLY, hung on cfg for notify.py's
+    # main-channel branch (the partner post reuses slack_text verbatim). Non-fatal.
+    try:
+        from pipeline import error_tracer
+        # ITN has no cumulative record count; cumulative households visited is
+        # the nearest equivalent denominator (one visit = one submitted record).
+        error_tracer.attach(
+            cfg, records=g.get("records"),
+            cum_records=(_last["cum_hh_visited"] if _last else g.get("hh_visited")))
+    except Exception as e:
+        log.warning(f"[report_itn] error tracer block skipped (non-fatal): {e}")
+
     # Main report (full — includes the Data Quality section).
     doc = _build_doc(cfg, g=g, hh_cov=hh_cov, pop_cov=pop_cov, net_cov=net_cov,
                      lga_d=lga_d, facilities=facilities,

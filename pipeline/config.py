@@ -347,7 +347,12 @@ def build(row):
         "secondary_products": _parse_secondary_products(row),
 
         # targets / counts
-        "target_csv":      str(row.get("target_csv", "")).strip(),
+        # Sheet tabs name this column either way ("Nigeria States" uses
+        # target_file, other tabs target_csv). First non-empty wins — a mismatch
+        # here fails silently: the loader only warns and every target reads 0,
+        # so coverage shows N/A with no other sign anything is wrong.
+        "target_csv":      str(row.get("target_csv", "")
+                               or row.get("target_file", "")).strip(),
         "hfs_total":       int(float(row.get("hfs_total", 0) or 0)),
         "flws_total":      int(float(row.get("flws_total", 0) or 0)),
         "lgas_total":      int(float(row.get("lgas_total", 0) or 0)),
