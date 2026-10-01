@@ -825,36 +825,61 @@ _DUP_HEADERS = [
     "Dup Diff User Same Day", "Dup Diff User Diff Day",
 ]
 
-# Bednet code-entry columns are flag-gated (same DST_BEDNET_CODES key as
-# report_itn.py's code subsections, default FALSE): deployments whose app has no
-# code-capture step get no all-zero code columns. report_itn.py's loader resolves
+# ── scanner vs no-scanner campaign (per campaign, sheet first) ──────────────
+# SCANNER campaign (Chad): bednets carry barcodes the app scans, so the bednet
+# code-entry DQ (Manual / Scanned / % Scanned / Missing Codes columns and the
+# Word code subsections) is meaningful. NO-SCANNER campaign (Borno): the app
+# has no code-capture step, so those columns would read "100% missing" — a
+# phantom DQ failure — and are left out. report_itn.py's loader resolves
 # columns BY HEADER NAME, so both layouts (and older files) read correctly.
+#
+# Resolution, first match wins:
+#   1. sheet cell itn_scanner   TRUE / FALSE        (per campaign)
+#   2. DST_BEDNET_CODES env     TRUE / FALSE        (per deployment, legacy key)
+#   3. BEDNET_CODES_DEFAULT     FALSE -> no-scanner (Borno)
 BEDNET_CODES_DEFAULT = "FALSE"
 
-def _bednet_codes_enabled() -> bool:
+def itn_scanner(cfg=None) -> bool:
+    """True for a scanner campaign (Chad), False for no-scanner (Borno)."""
+    choice = (cfg or {}).get("itn_scanner")
+    if choice is not None:
+        return bool(choice)
     val = (os.getenv("DST_BEDNET_CODES", "").strip() or BEDNET_CODES_DEFAULT)
     return val.upper() != "FALSE"
 
 _CODE_HEADERS = ["Manual Codes", "Scanned Codes", "% Scanned", "Missing Codes"]
-_CODES_ON = _bednet_codes_enabled()
 
-HEADERS = [
+_LGA_BASE_HEADERS = [
     "#", "Province", "LGA", "Facilities",
     "Target Households", "Households Visited", "HH Coverage %",
     "Target Population", "Population Covered", "Pop Coverage %",
     "Target ITNs", "Nets Distributed", "ITN Coverage %",
     "Status", "Records", "Duplicate Records",
     "Missing HH Head", "Missing GPS",
-] + (_CODE_HEADERS if _CODES_ON else []) + _DUP_HEADERS
+]
 
 # Facility-level detail tab has NO target/coverage/status columns — no facility-
 # level target exists (see module docstring), so showing one would be fabricated.
-FACILITY_HEADERS = [
+_FACILITY_BASE_HEADERS = [
     "#", "Province", "LGA", "Health Facility",
     "Records", "Duplicate Records", "Households Visited",
     "Nets Distributed", "Population Covered",
     "Missing HH Head", "Missing GPS",
-] + (_CODE_HEADERS if _CODES_ON else []) + _DUP_HEADERS
+]
+
+
+def lga_headers(codes_on):
+    return _LGA_BASE_HEADERS + (_CODE_HEADERS if codes_on else []) + _DUP_HEADERS
+
+
+def facility_headers(codes_on):
+    return _FACILITY_BASE_HEADERS + (_CODE_HEADERS if codes_on else []) + _DUP_HEADERS
+
+
+# Module-level layouts for readers that only need the column ORDER of the
+# always-present base block (report_itn resolves the rest by header name).
+HEADERS = lga_headers(itn_scanner())
+FACILITY_HEADERS = facility_headers(itn_scanner())
 
 
 def _dm(v):
@@ -881,16 +906,16 @@ def _dup_measured(rows):
     return any(r.get(k) is not None for r in rows for k in _DUP_KEYS)
 
 
-def _code_values(r):
-    """The 4 bednet-code cells — emitted only when the columns exist (_CODES_ON)."""
-    if not _CODES_ON:
+def _code_values(r, codes_on):
+    """The 4 bednet-code cells — emitted only for a scanner campaign."""
+    if not codes_on:
         return []
     total_codes = r["manual_codes"] + r["scanned_codes"]
     pct_scanned = f"{r['scanned_codes']/total_codes*100:.1f}%" if total_codes else "N/A"
     return [r["manual_codes"], r["scanned_codes"], pct_scanned, r["missing_codes"]]
 
 
-def _row_values(r, idx, dup_on=True):
+def _row_values(r, idx, dup_on=True, codes_on=False):
     return [
         idx, r["province"], r["lga"], r["facilities"],
         r["household_target"], r["households_visited"], f"{r['household_cov']:.1f}%",
@@ -898,16 +923,16 @@ def _row_values(r, idx, dup_on=True):
         r["net_target"], r["nets_distributed"], f"{r['net_cov']:.1f}%",
         r["status"], r["records"], r["dup_records"],
         r["missing_hh_head"], r["missing_gps"],
-    ] + _code_values(r) + ([_dm(r.get(k)) for k in _DUP_KEYS] if dup_on else [])
+    ] + _code_values(r, codes_on) + ([_dm(r.get(k)) for k in _DUP_KEYS] if dup_on else [])
 
 
-def _facility_row_values(r, idx, dup_on=True):
+def _facility_row_values(r, idx, dup_on=True, codes_on=False):
     return [
         idx, r["province"], r["lga"], r["facility_name"],
         r["records"], r.get("dup_records", 0), r["households_visited"],
         r["nets_distributed"], r["population_covered"],
         r["missing_hh_head"], r["missing_gps"],
-    ] + _code_values(r) + ([_dm(r.get(k)) for k in _DUP_KEYS] if dup_on else [])
+    ] + _code_values(r, codes_on) + ([_dm(r.get(k)) for k in _DUP_KEYS] if dup_on else [])
 
 
 def _totals_row(rows):
@@ -937,9 +962,10 @@ def _totals_row(rows):
     }
 
 
-def _write_tab(ws, rows, banner_text):
+def _write_tab(ws, rows, banner_text, codes_on=False):
     dup_on = _dup_measured(rows)
-    hdrs = HEADERS if dup_on else HEADERS[:len(HEADERS) - len(_DUP_HEADERS)]
+    all_hdrs = lga_headers(codes_on)
+    hdrs = all_hdrs if dup_on else all_hdrs[:len(all_hdrs) - len(_DUP_HEADERS)]
     ncols = len(hdrs)
     last_col = get_column_letter(ncols)
 
@@ -959,7 +985,7 @@ def _write_tab(ws, rows, banner_text):
     dup_flag_cols = ({hdrs.index(h) + 1: c for h, c in _DUP_FLAG_COLOR.items()}
                      if dup_on else {})
     for ri, r in enumerate(rows, 1):
-        vals = _row_values(r, ri, dup_on)
+        vals = _row_values(r, ri, dup_on, codes_on)
         for ci, val in enumerate(vals, 1):
             cell = ws.cell(row=ri + 2, column=ci, value=val)
             _style_cell(cell, fill=_WHITE_FILL, align="center")
@@ -972,7 +998,7 @@ def _write_tab(ws, rows, banner_text):
     if rows:
         tot = _totals_row(rows)
         tot_row = len(rows) + 3
-        tot_vals = _row_values(tot, "", dup_on)
+        tot_vals = _row_values(tot, "", dup_on, codes_on)
         for ci, val in enumerate(tot_vals, 1):
             cell = ws.cell(row=tot_row, column=ci, value=val)
             _style_cell(cell, fill=_TOTAL_FILL, bold=True, align="center")
@@ -987,10 +1013,11 @@ def _write_tab(ws, rows, banner_text):
         ws.column_dimensions[get_column_letter(ci)].width = 14
 
 
-def _write_facility_tab(ws, rows, banner_text):
+def _write_facility_tab(ws, rows, banner_text, codes_on=False):
     dup_on = _dup_measured(rows)
-    hdrs = (FACILITY_HEADERS if dup_on
-            else FACILITY_HEADERS[:len(FACILITY_HEADERS) - len(_DUP_HEADERS)])
+    all_hdrs = facility_headers(codes_on)
+    hdrs = (all_hdrs if dup_on
+            else all_hdrs[:len(all_hdrs) - len(_DUP_HEADERS)])
     ncols = len(hdrs)
     last_col = get_column_letter(ncols)
 
@@ -1009,7 +1036,7 @@ def _write_facility_tab(ws, rows, banner_text):
     dup_flag_cols = ({hdrs.index(h) + 1: c for h, c in _DUP_FLAG_COLOR.items()}
                      if dup_on else {})
     for ri, r in enumerate(sorted(rows, key=lambda x: x["records"]), 1):
-        vals = _facility_row_values(r, ri, dup_on)
+        vals = _facility_row_values(r, ri, dup_on, codes_on)
         for ci, val in enumerate(vals, 1):
             cell = ws.cell(row=ri + 2, column=ci, value=val)
             _style_cell(cell, fill=_WHITE_FILL, align="center")
@@ -1264,19 +1291,22 @@ def run(cfg):
     else:
         banner_text = "No data"
 
+    codes_on = itn_scanner(cfg)
+    log.info(f"[analyze_itn] {'SCANNER (bednet code columns ON)' if codes_on else 'NO-SCANNER (bednet code columns OFF)'} campaign")
+
     wb = Workbook()
     wb.remove(wb.active)
 
     ws_all = wb.create_sheet("ALL LGAS")
-    _write_tab(ws_all, rows, banner_text)
+    _write_tab(ws_all, rows, banner_text, codes_on)
 
     for band in BANDS:
         band_rows = [r for r in rows if r["status"] == band]
         ws = wb.create_sheet(band)
-        _write_tab(ws, band_rows, banner_text)
+        _write_tab(ws, band_rows, banner_text, codes_on)
 
     ws_fac = wb.create_sheet("FACILITY DETAIL")
-    _write_facility_tab(ws_fac, fac_rows, banner_text)
+    _write_facility_tab(ws_fac, fac_rows, banner_text, codes_on)
 
     # Household-level duplicate trace — one sheet per type (severity order),
     # each written only when it has rows (an empty tab would imply "checked,

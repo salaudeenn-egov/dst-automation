@@ -172,13 +172,14 @@ _DUP_MATRIX_KEYS = ("dup_su_sd", "dup_su_dd", "dup_du_sd", "dup_du_dd")
 # app flow has NO code-capture step (verified for Borno: additionalDetails carries
 # neither field on any doc) would render "100% missing" — a phantom DQ failure,
 # not a field-team problem. Default FALSE = tables replaced by a one-line note.
-# Deployments whose app DOES capture codes (chad) must set DST_BEDNET_CODES=TRUE
-# in their .env to keep the tables.
-BEDNET_CODES_DEFAULT = "FALSE"
+# Per campaign: a SCANNER campaign (Chad — sheet itn_scanner=TRUE, or the legacy
+# DST_BEDNET_CODES=TRUE) keeps the tables; NO-SCANNER (Borno, the default) does
+# not. One resolver for analyze_itn and this module: analyze_itn.itn_scanner.
+from pipeline.analyze_itn import itn_scanner as _itn_scanner
 
-def _bednet_codes_enabled() -> bool:
-    val = (os.getenv("DST_BEDNET_CODES", "").strip() or BEDNET_CODES_DEFAULT)
-    return val.upper() != "FALSE"
+
+def _bednet_codes_enabled(cfg=None) -> bool:
+    return _itn_scanner(cfg)
 
 
 def _dup_matrix_totals(lga_d):
@@ -692,9 +693,8 @@ def _perf_table(doc, lga_d):
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT if ci == 0 else WD_ALIGN_PARAGRAPH.CENTER
 
 
-def _dq_table_itn(doc, lga_d):
+def _dq_table_itn(doc, lga_d, codes_on=False):
     """Per-LGA DQ breakdown — mirrors report.py's _dq_table (3.2 in SPAQ)."""
-    codes_on = _bednet_codes_enabled()
     header = ["LGA", "Duplicates", "Missing HH Head", "Missing GPS"]
     if codes_on:
         header += ["Manual Codes", "Missing Codes"]
@@ -773,7 +773,8 @@ def _sync_section_itn(doc, sec_num, sync_lga_rows, sync_time_stats, sync_note,
                 dat(tr.cells[ci], val, alt=alt)
 
 
-def _dq_summary_table(doc, g, sec_num="3.5", dup_matrix=None, lga_d=None, perf_link=""):
+def _dq_summary_table(doc, g, sec_num="3.5", dup_matrix=None, lga_d=None, perf_link="",
+                      codes_on=False):
     total = g["hh_visited"] or 1
     # The flat "Duplicate Records" row appears only when the matrix wasn't
     # measured — otherwise its four-way breakdown (subsection .3) replaces it.
@@ -801,7 +802,7 @@ def _dq_summary_table(doc, g, sec_num="3.5", dup_matrix=None, lga_d=None, perf_l
     # disabled (DST_BEDNET_CODES=FALSE) the two code subsections are omitted and
     # Duplicate Distribution takes .1 instead of .3.
     sub = 1
-    if _bednet_codes_enabled():
+    if codes_on:
         # ITN-specific addition, no SPAQ/AZM equivalent — mirrors the campaign dashboard's own
         # headline DQ metric: manual code entry is far more error/fraud-prone than barcode scanning.
         total_codes = g["manual_codes"] + g["scanned_codes"]
@@ -1230,7 +1231,7 @@ def _build_doc(cfg, *, g, hh_cov, pop_cov, net_cov, lga_d, facilities,
 
     if not partner:
         add_heading(doc, f"{dist_sec}.{sub}  Data Quality by LGA", 5); sub += 1
-        _dq_table_itn(doc, lga_d)
+        _dq_table_itn(doc, lga_d, codes_on=_bednet_codes_enabled(cfg))
         doc.add_paragraph()
 
     add_heading(doc, f"{dist_sec}.{sub}  Low Activity Facilities", 5); sub += 1
@@ -1250,7 +1251,8 @@ def _build_doc(cfg, *, g, hh_cov, pop_cov, net_cov, lga_d, facilities,
         # replacing the flat Duplicate Records row) and only when the matrix
         # was measured — None keeps the summary's classic shape.
         add_heading(doc, f"{dist_sec}.{sub}  Data Quality Summary", 5)
-        _dq_summary_table(doc, g, sec_num=f"{dist_sec}.{sub}",
+        _dq_summary_table(doc, g, codes_on=_bednet_codes_enabled(cfg),
+                          sec_num=f"{dist_sec}.{sub}",
                           dup_matrix=dup_matrix, lga_d=lga_d, perf_link=perf_link)
         doc.add_paragraph()
     sec += 1

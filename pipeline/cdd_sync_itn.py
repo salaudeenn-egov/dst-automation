@@ -49,7 +49,18 @@ from pipeline.cdd_sync import _style, _HDR_FILL, _TOTAL_FILL, _LOW_FILL, _NEVER_
 urllib3.disable_warnings()
 log = logging.getLogger(__name__)
 
-CDD_ROLE = "DISTRIBUTOR"   # Borno ITN sync-index role; chad uses DISTRIBUTOR_REGISTRAR
+# The CDD role on sync records is named differently per campaign and keeps
+# changing (chad: DISTRIBUTOR_REGISTRAR, Borno: DISTRIBUTOR, ...), so it comes
+# from the Google Sheet — it is NOT tied to scanner / no-scanner:
+#   1. sheet cell cdd_role      used as typed (upper-cased)
+#   2. blank -> DEFAULT_CDD_ROLE
+DEFAULT_CDD_ROLE = "DISTRIBUTOR"
+CDD_ROLE = DEFAULT_CDD_ROLE           # kept for importers; runs use cdd_role(cfg)
+
+
+def cdd_role(cfg):
+    return str((cfg or {}).get("cdd_role") or "").strip().upper() or DEFAULT_CDD_ROLE
+
 
 # Per-day Y/N matrix width cap (SMC template on a months-long campaign). The most
 # recent MAX_DAY_COLS elapsed days get a column; older days stay counted in
@@ -85,7 +96,7 @@ def _distinct_cdds_synced(cfg, date_str=None):
     Returns (count, doc_count) — doc_count included since it's a distinct signal
     from distinct-user count (many sync docs can belong to the same user/day).
     """
-    filters = [_campaign_filter(cfg), {"term": {"Data.role.keyword": CDD_ROLE}}]
+    filters = [_campaign_filter(cfg), {"term": {"Data.role.keyword": cdd_role(cfg)}}]
     if date_str:
         filters.append({"term": {"Data.taskDates": date_str}})
 
@@ -126,7 +137,7 @@ def _count_synced_by_cutoff(cfg, cutoff_hour, cutoff_min=0):
 
     filters = [
         _campaign_filter(cfg),
-        {"term": {"Data.role.keyword": CDD_ROLE}},
+        {"term": {"Data.role.keyword": cdd_role(cfg)}},
         {"term": {"Data.taskDates": today}},
         {"range": {"Data.createdTime": {"lte": cutoff_ms}}},
     ]
@@ -164,7 +175,7 @@ def _get_synced_keys_by_cutoff(cfg, cutoff_hour, cutoff_min=0):
 
     filters = [
         _campaign_filter(cfg),
-        {"term": {"Data.role.keyword": CDD_ROLE}},
+        {"term": {"Data.role.keyword": cdd_role(cfg)}},
         {"term": {"Data.taskDates": today}},
         {"range": {"Data.createdTime": {"lte": cutoff_ms}}},
     ]
@@ -226,7 +237,7 @@ def _fetch_cdd_roster(cfg):
     (province/district/facility) — confirmed present on chad's sync docs this
     session (sample doc carried province=OUADDAI, district=ADRE, sppSfd=CS KATARFA).
     """
-    filters = [_campaign_filter(cfg), {"term": {"Data.role.keyword": CDD_ROLE}}]
+    filters = [_campaign_filter(cfg), {"term": {"Data.role.keyword": cdd_role(cfg)}}]
     rows = {}
     after = None
     while True:
@@ -437,7 +448,8 @@ def run(cfg):
     solved yet. Callers (report_itn.py) must handle None gracefully, not assume
     a coverage percentage exists.
     """
-    log.info(f"[cdd_sync_itn] {cfg['state_name']} — checking CDD sync activity ...")
+    log.info(f"[cdd_sync_itn] {cfg['state_name']} — checking CDD sync activity "
+             f"(role {cdd_role(cfg)}) ...")
 
     today_str = cfg.get("extract_date").isoformat() if cfg.get("extract_date") else None
 
@@ -546,7 +558,7 @@ def run(cfg):
         )
 
     return {
-        "role": CDD_ROLE,
+        "role": cdd_role(cfg),
         "campaign_scoped": True,   # confirmed via additionalDetails.projectReferenceId
         "cumulative_cdds_synced": cumulative_cdds,
         "cumulative_sync_records": cumulative_docs,
