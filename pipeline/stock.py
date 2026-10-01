@@ -2018,8 +2018,9 @@ _DIST_HEADERS = ["LGA", "Ward", "Distribution Hub", "Distributor (user)",
 
 
 def _dist_flagged(row):
-    """ITN: the distributor handed out MORE than recorded as given to them
-    (the red rows) — the only gap that is a problem during the campaign."""
+    """The red rows (ITN distributors AND SMC CDDs): handed out / used MORE
+    than recorded as given to them — the only gap that counts against a
+    clean record. Every accountability builder puts the flag at index 10."""
     return bool(row[10]) if len(row) > 10 else False
 
 
@@ -2571,10 +2572,12 @@ def stock_summary_line(cfg):
     cdd = data.get("cdd_rows") or []
     if cdd:
         users = {r[0] for r in cdd}
-        dirty = {r[0] for r in cdd if _significant_diff(r)}
+        dirty = {r[0] for r in cdd if _dist_flagged(r)}      # red rows only
         clean = len(users) - len(dirty)
-        line += (f" {clean / len(users) * 100:.0f}% of CDDs have clean "
-                 f"stock records.")
+        line += (f" {clean:,} of {len(users):,} CDDs have clean stock "
+                 f"records")
+        line += (f"; {len(dirty)} used more than recorded as received."
+                 if dirty else ".")
     return line
 
 
@@ -2686,8 +2689,11 @@ def build_stock_section(doc, cfg, heading_num="6"):
                 f"{v('returned') / v('issued') * 100:.1f}%"))
         all_cdd = data.get("cdd_rows") or []
         if all_cdd:
+            # "clean" = NOT red (user, 2026-10-01, same rule as ITN): only a
+            # CDD who used MORE than recorded as given counts against them. A
+            # positive gap is stock still in hand, not a recording problem.
             users = {r[0] for r in all_cdd}
-            dirty_users = {r[0] for r in all_cdd if _significant_diff(r)}
+            dirty_users = {r[0] for r in all_cdd if _dist_flagged(r)}
             clean = len(users) - len(dirty_users)
             overview.append((
                 "CDDs with clean stock records",
