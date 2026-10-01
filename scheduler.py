@@ -135,6 +135,13 @@ def _run_campaign(raw_row, mode="both"):
         except Exception as e:
             log.error(f"[{state}] cdd_sync FAILED (non-fatal — continuing to report): {e}", exc_info=True)
 
+        # OPTIONAL stock stage — inert unless enabled (see pipeline/stock.py).
+        try:
+            from pipeline import stock
+            stock.run(cfg)
+        except Exception as e:
+            log.error(f"[{state}] stock FAILED (non-fatal — continuing to report): {e}", exc_info=True)
+
         docx, partner_docx, slack_text = report_mod.run(cfg)
         notify.run(cfg, docx, slack_text, partner_docx_path=partner_docx, mode=mode)
         log.info(f"[{state}] pipeline complete (mode={mode})")

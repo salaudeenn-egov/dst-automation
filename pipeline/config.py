@@ -64,6 +64,23 @@ def _bool(val):
     return str(val).strip().upper() in ("TRUE", "YES", "1", "Y")
 
 
+def _tri_state(val, field=""):
+    """TRUE -> True, FALSE -> False, blank -> None ("use the default").
+
+    Anything else is a typo: logged loudly and treated as blank, so a stray
+    value never silently flips a campaign's behaviour."""
+    s = str(val or "").strip().upper()
+    if not s:
+        return None
+    if s in ("TRUE", "YES", "1", "Y", "ON"):
+        return True
+    if s in ("FALSE", "NO", "0", "N", "OFF"):
+        return False
+    log.error(f"[config] {field or 'flag'} cell is {val!r} - not TRUE/FALSE; "
+              f"using the default instead. Fix the sheet cell.")
+    return None
+
+
 def _pad_cycle(val):
     # Sheets returns a numeric cell as 2 (or 2.0); ES cycleIndex is "02"
     s = str(val).strip()
@@ -76,8 +93,10 @@ def _pad_cycle(val):
 # ITN duplicate-distribution matrix (analyze_itn._classify_duplicates): the
 # code-side switch, so no Google Sheet column is needed. Flip to "TRUE" to
 # enable it for every ITN/LLIN row this deployment runs; SMC/AZM rows never
-# read it. A dup_matrix column on the sheet, if one is ever added, overrides
-# this per row (TRUE/FALSE cell beats the default; empty cell falls back here).
+# read it. Precedence (first non-empty wins):
+#   1. dup_matrix cell on the sheet row  (per campaign)
+#   2. DST_DUP_MATRIX environment key    (per deployment/.env — the on/off switch)
+#   3. DUP_MATRIX_DEFAULT below          (in-code fallback)
 DUP_MATRIX_DEFAULT = "FALSE"
 
 
@@ -296,9 +315,32 @@ def build(row):
         # ITN only: duplicate-distribution matrix (same/different user x same/different
         # day per household). Off keeps every existing number, query, Word section and
         # Slack post unchanged (the performance Excel only gains six empty trailing
-        # columns). Default lives IN CODE (DUP_MATRIX_DEFAULT above — no sheet column
-        # required); a non-empty dup_matrix sheet cell overrides it per row.
-        "dup_matrix": _bool(str(row.get("dup_matrix", "")).strip() or DUP_MATRIX_DEFAULT),
+        # columns). Precedence: non-empty dup_matrix sheet cell (per row) beats the
+        # DST_DUP_MATRIX env key (per deployment), which beats DUP_MATRIX_DEFAULT.
+        "dup_matrix": _bool(str(row.get("dup_matrix", "")).strip()
+                            or os.getenv("DST_DUP_MATRIX", "").strip()
+                            or DUP_MATRIX_DEFAULT),
+
+        # ITN only — scanner vs no-scanner campaign (optional sheet columns):
+        #   itn_scanner  ONE column for every scanner choice:
+        #                TRUE  = scanner campaign (Chad): bednet code columns +
+        #                        code DQ subsections ON, stock scanner model
+        #                        (bales, scans, codes)
+        #                FALSE / blank = no-scanner (Borno, the default): code
+        #                        columns OFF, stock hub ledger
+        #                blank falls back to DST_BEDNET_CODES (code DQ) and
+        #                DST_STOCK_ITN_SCANNER (stock) in .env
+        #   cdd_role     SMC AND ITN: the role of this campaign's CDDs on sync /
+        #                staff records, used as typed (e.g. DISTRIBUTOR,
+        #                DISTRIBUTOR_REGISTRAR); independent of itn_scanner;
+        #                blank -> CDD_ROLE (SMC) / DISTRIBUTOR (ITN) -> DISTRIBUTOR
+        "itn_scanner": _tri_state(row.get("itn_scanner", ""), "itn_scanner"),
+        "cdd_role":    str(row.get("cdd_role", "")).strip().upper(),
+
+        # Optional stock stage (pipeline/stock.py): TRUE / FALSE / blank,
+        # blank = None = the deployment default (DST_STOCK_REPORT). The ITN
+        # stock model follows itn_scanner above.
+        "stock_report":      _tri_state(row.get("stock_report", ""), "stock_report"),
 
         # secondary product(s) counted alongside the primary drug — empty = disabled.
         # Legacy single string (age 3-59) OR a spec list (see _parse_secondary_products).
@@ -306,7 +348,12 @@ def build(row):
         "secondary_products": _parse_secondary_products(row),
 
         # targets / counts
-        "target_csv":      str(row.get("target_csv", "")).strip(),
+        # Sheet tabs name this column either way ("Nigeria States" uses
+        # target_file, other tabs target_csv). First non-empty wins — a mismatch
+        # here fails silently: the loader only warns and every target reads 0,
+        # so coverage shows N/A with no other sign anything is wrong.
+        "target_csv":      str(row.get("target_csv", "")
+                               or row.get("target_file", "")).strip(),
         "hfs_total":       int(float(row.get("hfs_total", 0) or 0)),
         "flws_total":      int(float(row.get("flws_total", 0) or 0)),
         "lgas_total":      int(float(row.get("lgas_total", 0) or 0)),
