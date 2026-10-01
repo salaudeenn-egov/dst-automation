@@ -64,6 +64,23 @@ def _bool(val):
     return str(val).strip().upper() in ("TRUE", "YES", "1", "Y")
 
 
+def _tri_state(val, field=""):
+    """TRUE -> True, FALSE -> False, blank -> None ("use the default").
+
+    Anything else is a typo: logged loudly and treated as blank, so a stray
+    value never silently switches a feature off."""
+    s = str(val or "").strip().upper()
+    if not s:
+        return None
+    if s in ("TRUE", "YES", "1", "Y", "ON"):
+        return True
+    if s in ("FALSE", "NO", "0", "N", "OFF"):
+        return False
+    log.error(f"[config] {field or 'flag'} cell is {val!r} - not TRUE/FALSE; "
+              f"using the deployment default instead. Fix the sheet cell.")
+    return None
+
+
 def _pad_cycle(val):
     # Sheets returns a numeric cell as 2 (or 2.0); ES cycleIndex is "02"
     s = str(val).strip()
@@ -299,6 +316,16 @@ def build(row):
         # columns). Default lives IN CODE (DUP_MATRIX_DEFAULT above — no sheet column
         # required); a non-empty dup_matrix sheet cell overrides it per row.
         "dup_matrix": _bool(str(row.get("dup_matrix", "")).strip() or DUP_MATRIX_DEFAULT),
+
+        # Optional stock stage (pipeline/stock.py). Both are TRUE / FALSE / blank;
+        # blank = None = the deployment default.
+        #   stock_report       on/off for this campaign (DST_STOCK_REPORT)
+        #   stock_itn_scanner  ITN only: TRUE = scanner model (Chad: bales,
+        #                      scans, codes), FALSE = no-scanner ledger (Borno);
+        #                      blank -> DST_STOCK_ITN_SCANNER, else auto-detect
+        "stock_report":      _tri_state(row.get("stock_report", ""), "stock_report"),
+        "stock_itn_scanner": _tri_state(row.get("stock_itn_scanner", ""),
+                                        "stock_itn_scanner"),
 
         # secondary product(s) counted alongside the primary drug — empty = disabled.
         # Legacy single string (age 3-59) OR a spec list (see _parse_secondary_products).
