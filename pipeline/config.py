@@ -332,6 +332,16 @@ def build(row):
         "itn_scanner": _tri_state(row.get("itn_scanner", ""), "itn_scanner"),
         "cdd_role":    str(row.get("cdd_role", "")).strip().upper(),
 
+        # Optional stock stage (pipeline/stock.py). Both are TRUE / FALSE / blank;
+        # blank = None = the deployment default.
+        #   stock_report       on/off for this campaign (DST_STOCK_REPORT)
+        #   stock_itn_scanner  ITN only: TRUE = scanner model (Chad: bales,
+        #                      scans, codes), FALSE = no-scanner ledger (Borno);
+        #                      blank -> DST_STOCK_ITN_SCANNER, else auto-detect
+        "stock_report":      _tri_state(row.get("stock_report", ""), "stock_report"),
+        "stock_itn_scanner": _tri_state(row.get("stock_itn_scanner", ""),
+                                        "stock_itn_scanner"),
+
         # secondary product(s) counted alongside the primary drug — empty = disabled.
         # Legacy single string (age 3-59) OR a spec list (see _parse_secondary_products).
         "secondary_product":  str(row.get("secondary_product", "")).strip(),
