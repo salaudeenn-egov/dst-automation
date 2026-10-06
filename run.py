@@ -167,6 +167,17 @@ def run_campaign(row):
                   f"without a stock section): {e}", exc_info=True)
         _slack_error(cfg, state, "stock", e)
 
+    # OPTIONAL cohort stage (pipeline/cohort.py) — inert unless
+    # DST_COHORT_REPORT / COHORT_REPORT_DEFAULT enables it; never blocks
+    # the report.
+    try:
+        from pipeline import cohort
+        cohort.run(cfg)
+    except Exception as e:
+        log.error(f"[{state}] cohort FAILED (non-fatal — continuing to "
+                  f"report): {e}", exc_info=True)
+        _slack_error(cfg, state, "cohort", e)
+
     try:
         docx_path, partner_docx_path, slack_text = report_mod.run(cfg)
     except Exception as e:
@@ -270,6 +281,13 @@ def run_cumulative(row, end_date):
         stock.run(cfg)
     except Exception as e:
         log.error(f"[{state}] stock FAILED (non-fatal — continuing to report): {e}", exc_info=True)
+
+    # OPTIONAL cohort stage — inert unless enabled (see pipeline/cohort.py).
+    try:
+        from pipeline import cohort
+        cohort.run(cfg)
+    except Exception as e:
+        log.error(f"[{state}] cohort FAILED (non-fatal — continuing to report): {e}", exc_info=True)
 
     # report.run already uploaded the performance + CDD-sync Excels to Drive and embedded
     # those links inside both docs (no_upload=False); it stashes the links back on cfg.

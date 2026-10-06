@@ -142,6 +142,13 @@ def _run_campaign(raw_row, mode="both"):
         except Exception as e:
             log.error(f"[{state}] stock FAILED (non-fatal — continuing to report): {e}", exc_info=True)
 
+        # OPTIONAL cohort stage — inert unless enabled (see pipeline/cohort.py).
+        try:
+            from pipeline import cohort
+            cohort.run(cfg)
+        except Exception as e:
+            log.error(f"[{state}] cohort FAILED (non-fatal — continuing to report): {e}", exc_info=True)
+
         docx, partner_docx, slack_text = report_mod.run(cfg)
         notify.run(cfg, docx, slack_text, partner_docx_path=partner_docx, mode=mode)
         log.info(f"[{state}] pipeline complete (mode={mode})")
