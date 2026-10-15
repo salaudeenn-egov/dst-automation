@@ -104,12 +104,20 @@ def _upload_to_drive(file_path, title, folder_id=None):
         upload_mime = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         target_mime = "application/vnd.google-apps.spreadsheet"
         url_tmpl    = "https://docs.google.com/spreadsheets/d/{}/edit"
+    elif ext == ".csv":
+        # raw CSV, NOT converted: a cohort CSV is ~1M rows, past the Docs
+        # import limit (413 uploadTooLarge) and Sheets' 10M-cell cap
+        upload_mime = "text/csv"
+        target_mime = None
+        url_tmpl    = "https://drive.google.com/file/d/{}/view"
     else:
         upload_mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         target_mime = "application/vnd.google-apps.document"
         url_tmpl    = "https://docs.google.com/document/d/{}/edit"
 
-    metadata = {"name": title, "mimeType": target_mime}
+    metadata = {"name": title}
+    if target_mime:
+        metadata["mimeType"] = target_mime
     if folder_id:
         metadata["parents"] = [folder_id]
 

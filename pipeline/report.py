@@ -1457,6 +1457,15 @@ def _build_doc(cfg, *, g, cov_pct, lga_d, facilities, hfs_active, lgas_total,
         build_stock_section(doc, cfg, heading_num="6")
         _concl_num = "7"
 
+    # Cohort section — BOTH docs. Partner gets the aggregate sub-sections
+    # only; the per-child CSV link (child names + IDs) and DQ counts are
+    # internal. Present only when the optional cohort stage produced data.
+    if cfg.get("cohort_data"):
+        doc.add_paragraph()
+        from pipeline.cohort import build_cohort_section
+        build_cohort_section(doc, cfg, heading_num=_concl_num, partner=partner)
+        _concl_num = str(int(_concl_num) + 1)
+
     # Conclusion (last section)
     doc.add_paragraph()
     add_heading(doc, f"{_concl_num}.  Conclusion", 4)
