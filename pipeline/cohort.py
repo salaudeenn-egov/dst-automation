@@ -567,10 +567,13 @@ def _table(doc, headers, rows, bold_rows=(), left_cols=(0,), widths_cm=None):
     return tbl
 
 
-def _colour_status(tbl, pct_col, st_col, skip_rows=1):
+def _colour_status(tbl, pct_col, st_col):
+    """Colour % and Status by band; rows without a band (Total) stay as they are."""
     from pipeline.report import GREY_RGB, STATUS_COLOR
-    for r in tbl.rows[1 + skip_rows:]:
+    for r in tbl.rows[1:]:
         st = r.cells[st_col].text.strip()
+        if st not in STATUS_COLOR:
+            continue
         for cell in (r.cells[pct_col], r.cells[st_col]):
             for run in cell.paragraphs[0].runs:
                 run.font.bold = True
@@ -585,8 +588,8 @@ def _picture(doc, path):
 
 def build_cohort_section(doc, cfg, heading_num="7", partner=False):
     """ONE section, TWO sub-sections, each a table first then its chart.
-    Aggregate counts only (partner-safe, both docs); the internal doc adds one
-    grey line with the source index. No-op when the stage produced nothing."""
+    Aggregate counts only, identical in both docs (partner is kept for the
+    caller's signature). No-op when the stage produced nothing."""
     data = cfg.get("cohort_data")
     if not data:
         return
@@ -671,18 +674,19 @@ def build_cohort_section(doc, cfg, heading_num="7", partner=False):
                       f"Status compares each {area} with the state ({state:.1f}%).",
                  size=9, color=GREY_RGB)
         ev = tr[done - 1]["every"]
-        rows = [["Total"] + [f"{r['treated']:,}" for r in tr]
-                + [f"{ev:,}", _pct(ev, c1), "-"]]
+        rows = []
         for name, e in sorted(data["by_area"].items(),
                               key=lambda kv: (_full(kv[1], done)[2], kv[0])):
             a1, aev, ap = _full(e, done)
             rows.append([name] + [f"{r['treated']:,}" for r in e["rows"]]
                         + [f"{aev:,}", f"{ap:.1f}%", _band(ap, state)])
+        rows.append(["Total"] + [f"{r['treated']:,}" for r in tr]       # last row
+                    + [f"{ev:,}", _pct(ev, c1), "-"])
         cyc_w = max(1.4, min(2.0, 9.0 / n))
         tbl = _table(doc, [area] + [f"Cycle {k}" + (" (to date)" if k == cur else "")
                                     for k in range(1, n + 1)]
                      + [f"Every cycle (1-{done})", "% every cycle", "Status"],
-                     rows, bold_rows=(0,),
+                     rows, bold_rows=(len(rows) - 1,),
                      widths_cm=[2.8] + [cyc_w] * n + [2.0, 1.7, 2.4])
         _colour_status(tbl, n + 2, n + 3)
         formula(f"Cycle columns = children treated in that cycle   |   Every cycle = "
@@ -698,9 +702,6 @@ def build_cohort_section(doc, cfg, heading_num="7", partner=False):
               "Cohort Data", cfg.get("cohort_drive_link"), (cfg.get("cohort_files") or [""])[0])
     doc.add_paragraph()
 
-    if not partner:
-        add_para(doc, f"Internal: source {data['index']} ({data['docs']:,} children "
-                      f"treated in any cycle).", size=8, color=GREY_RGB)
     doc.add_paragraph()
 
 
